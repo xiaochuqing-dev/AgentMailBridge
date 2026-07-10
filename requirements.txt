@@ -1,0 +1,19 @@
+# Agent Mail Bridge 依赖
+# 本阶段优先使用 Python 标准库，第三方依赖极少
+
+# 读取 .env 配置文件
+python-dotenv>=1.0.0
+
+# SOCKS5 代理支持（Gmail IMAP 网络适配层，remote DNS）
+PySocks>=1.7.1
+
+# Gmail API 收件后端（走 HTTPS 443，绕过 IMAP 993 端口限制）
+google-api-python-client>=2.0.0
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.0.0
+
+# 后续可用于系统密钥环存储（本阶段仅预留接口，未强制使用）
+keyring>=24.0.0
+
+# 测试用（可选）
+pytest>=7.4.0

@@ -1,0 +1,56 @@
+# --- 真实密钥，禁止提交 ---
+.env
+.env.local
+*.env
+
+# --- Gmail API OAuth 凭证，禁止提交 ---
+credentials.json
+token.json
+secrets/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+.pytest_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# --- 虚拟环境 ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- 本地数据（默认不提交） ---
+AgentMailBridgeData/
+agent_mail_bridge.db
+agent_mail_bridge.db-journal
+agent_mail_bridge.db-wal
+agent_mail_bridge.db-shm
+
+# --- 系统 ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- ZCode 工具目录 ---
+.zcode/

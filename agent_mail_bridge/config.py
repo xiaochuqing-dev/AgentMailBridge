@@ -1,0 +1,446 @@
+"""配置加载模块。
+
+职责：
+1. 读取项目根目录下 `.env` 文件（若不存在则使用 `.env.example` 的默认值占位）。
+2. 把环境变量解析为强类型的 AppConfig 对象。
+3. 提供安全校验：缺少关键配置时给出明确错误提示。
+4. 不允许真实密钥进入代码库；日志中不打印完整密码 / 授权码。
+
+后续 GUI / MCP 只需调用 load_config() 即可拿到配置。
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+
+try:
+    # python-dotenv 为可选依赖，缺失时回退到纯环境变量
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover - 仅在未安装时触发
+    load_dotenv = None  # type: ignore[assignment]
+
+
+# 项目根目录：本文件位于 agent_mail_bridge/config.py，根目录是其上两层
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _as_bool(value: str | None, default: bool = False) -> bool:
+    """把字符串解析为布尔值。"""
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _as_int(value: str | None, default: int) -> int:
+    """把字符串解析为整数，失败时返回默认值。"""
+    if value is None or value.strip() == "":
+        return default
+    try:
+        return int(value.strip())
+    except ValueError:
+        return default
+
+
+# 网络模式允许值
+_VALID_NETWORK_MODES = {"direct", "socks5", "auto"}
+
+# Gmail 收件后端允许值
+_VALID_RECEIVE_BACKENDS = {"imap", "gmail_api", "auto"}
+
+# Gmail API 默认 scope（只读）
+_DEFAULT_GMAIL_API_SCOPES = "https://www.googleapis.com/auth/gmail.readonly"
+
+
+def _parse_network_mode(value: str | None, field: str, default: str) -> str:
+    """解析网络模式，非法值直接报错（不静默回退）。"""
+    raw = (value if value is not None else default).strip().lower()
+    if raw not in _VALID_NETWORK_MODES:
+        raise ConfigError(
+            f"{field} 取值非法：{value!r}，允许值：{sorted(_VALID_NETWORK_MODES)}。"
+        )
+    return raw
+
+
+def _parse_port_strict(value: str | None, field: str) -> int:
+    """严格解析端口，非整数或越界直接报错。"""
+    raw = (value or "").strip()
+    if not raw:
+        return 0
+    try:
+        port = int(raw)
+    except ValueError:
+        raise ConfigError(f"{field} 必须是整数，当前值：{value!r}。") from None
+    if port <= 0 or port > 65535:
+        raise ConfigError(f"{field} 必须在 1-65535 范围内，当前值：{port}。")
+    return port
+
+
+def _parse_receive_backend(value: str | None, default: str) -> str:
+    """解析 Gmail 收件后端，非法值直接报错（不静默回退）。"""
+    raw = (value if value is not None else default).strip().lower()
+    if raw not in _VALID_RECEIVE_BACKENDS:
+        raise ConfigError(
+            f"GMAIL_RECEIVE_BACKEND 取值非法：{value!r}，"
+            f"允许值：{sorted(_VALID_RECEIVE_BACKENDS)}。"
+        )
+    return raw
+
+
+def _as_positive_int(value: str | None, field: str, default: int) -> int:
+    """解析正整数，非正数或非整数直接报错。"""
+    raw = (value or "").strip()
+    if not raw:
+        return default
+    try:
+        n = int(raw)
+    except ValueError:
+        raise ConfigError(f"{field} 必须是正整数，当前值：{value!r}。") from None
+    if n <= 0:
+        raise ConfigError(f"{field} 必须是正整数，当前值：{n}。")
+    return n
+
+
+def _resolve_path(raw: str, default: str) -> Path:
+    """把配置中的路径解析为绝对路径：相对路径基于项目根目录。"""
+    text = (raw or default).strip()
+    p = Path(text)
+    if not p.is_absolute():
+        p = (PROJECT_ROOT / p).resolve()
+    return p
+
+
+@dataclass
+class AppConfig:
+    """应用配置。所有字段均可由 .env 覆盖。"""
+
+    # --- Gmail 收件 ---
+    gmail_address: str = ""
+    gmail_app_password: str = ""
+    gmail_imap_host: str = "imap.gmail.com"
+    gmail_imap_port: int = 993
+    # 网络适配层：direct / socks5 / auto
+    gmail_network_mode: str = "auto"
+    gmail_connect_timeout: int = 20
+    gmail_socks5_host: str = "127.0.0.1"
+    gmail_socks5_port: int = 10808
+    gmail_socks5_remote_dns: bool = True
+
+    # --- Gmail 收件后端切换 ---
+    # imap      = 通过 IMAP 993 收件（需应用专用密码）
+    # gmail_api = 通过 Gmail API over HTTPS 443 收件（需 OAuth）
+    # auto      = 优先 gmail_api（已配置），否则回退 imap
+    gmail_receive_backend: str = "auto"
+    # Gmail API OAuth 文件（相对路径基于项目根目录）
+    gmail_api_credentials_path: Path = field(
+        default_factory=lambda: PROJECT_ROOT / "secrets" / "credentials.json"
+    )
+    gmail_api_token_path: Path = field(
+        default_factory=lambda: PROJECT_ROOT / "secrets" / "token.json"
+    )
+    # Gmail API scope（默认只读）
+    gmail_api_scopes: list[str] = field(
+        default_factory=lambda: [_DEFAULT_GMAIL_API_SCOPES]
+    )
+    # Gmail API 查询设置
+    gmail_api_max_results: int = 20
+    gmail_api_query: str = "in:inbox"
+
+    # --- QQ 发件 ---
+    qq_email: str = ""
+    qq_auth_code: str = ""
+    qq_smtp_host: str = "smtp.qq.com"
+    qq_smtp_port: int = 465
+    # QQ SMTP 默认 direct，本阶段仅预留 socks5 配置键，不实现连接
+    qq_smtp_network_mode: str = "direct"
+    qq_smtp_connect_timeout: int = 20
+    qq_smtp_socks5_host: str = ""
+    qq_smtp_socks5_port: int = 0
+    qq_smtp_socks5_remote_dns: bool = False
+
+    # --- 固定收件人 ---
+    owner_gmail: str = ""
+
+    # --- 本地数据目录 ---
+    data_root: Path = field(default_factory=lambda: PROJECT_ROOT / "AgentMailBridgeData")
+
+    # --- 收件规则 ---
+    auto_receive_only_self_mail: bool = True
+    max_fetch_limit: int = 30
+    receive_unseen_only: bool = False
+    receive_mark_seen: bool = False
+
+    # --- 大小限制 (MB) ---
+    max_attachment_mb: int = 25
+    max_send_file_mb: int = 25
+
+    # --- 日志 ---
+    log_level: str = "INFO"
+
+    @property
+    def data_root_path(self) -> Path:
+        """数据根目录的绝对路径。"""
+        return Path(self.data_root)
+
+    # ---- 各子目录绝对路径 ----
+    @property
+    def received_dir(self) -> Path:
+        return self.data_root_path / "received"
+
+    @property
+    def send_dir(self) -> Path:
+        return self.data_root_path / "send"
+
+    @property
+    def sent_dir(self) -> Path:
+        return self.data_root_path / "sent"
+
+    @property
+    def logs_dir(self) -> Path:
+        return self.data_root_path / "logs"
+
+    @property
+    def db_path(self) -> Path:
+        return self.data_root_path / "agent_mail_bridge.db"
+
+    @property
+    def max_attachment_bytes(self) -> int:
+        return self.max_attachment_mb * 1024 * 1024
+
+    @property
+    def max_send_file_bytes(self) -> int:
+        return self.max_send_file_mb * 1024 * 1024
+
+    @property
+    def gmail_api_scopes_str(self) -> str:
+        """Gmail API scopes 的字符串表示（逗号分隔），便于诊断输出。"""
+        return ",".join(self.gmail_api_scopes)
+
+    @property
+    def gmail_api_configured(self) -> bool:
+        """Gmail API 是否已配置（credentials.json 存在即视为已配置）。
+
+        auto 模式据此判断是否优先走 gmail_api。
+        """
+        return self.gmail_api_credentials_path.exists()
+
+    def mask(self) -> dict:
+        """返回脱敏后的配置摘要，供 show-config / 日志使用。"""
+        return {
+            "gmail_address": self.gmail_address,
+            "gmail_app_password": _mask_secret(self.gmail_app_password),
+            "gmail_imap_host": self.gmail_imap_host,
+            "gmail_imap_port": self.gmail_imap_port,
+            "gmail_network_mode": self.gmail_network_mode,
+            "gmail_connect_timeout": self.gmail_connect_timeout,
+            "gmail_socks5_host": self.gmail_socks5_host,
+            "gmail_socks5_port": self.gmail_socks5_port,
+            "gmail_socks5_remote_dns": self.gmail_socks5_remote_dns,
+            "gmail_receive_backend": self.gmail_receive_backend,
+            "gmail_api_credentials_path": str(self.gmail_api_credentials_path),
+            "gmail_api_token_path": str(self.gmail_api_token_path),
+            "gmail_api_scopes": self.gmail_api_scopes_str,
+            "gmail_api_max_results": self.gmail_api_max_results,
+            "gmail_api_query": self.gmail_api_query,
+            "gmail_api_configured": self.gmail_api_configured,
+            "qq_email": self.qq_email,
+            "qq_auth_code": _mask_secret(self.qq_auth_code),
+            "qq_smtp_host": self.qq_smtp_host,
+            "qq_smtp_port": self.qq_smtp_port,
+            "qq_smtp_network_mode": self.qq_smtp_network_mode,
+            "qq_smtp_connect_timeout": self.qq_smtp_connect_timeout,
+            "owner_gmail": self.owner_gmail,
+            "data_root": str(self.data_root_path),
+            "auto_receive_only_self_mail": self.auto_receive_only_self_mail,
+            "max_fetch_limit": self.max_fetch_limit,
+            "receive_unseen_only": self.receive_unseen_only,
+            "receive_mark_seen": self.receive_mark_seen,
+            "max_attachment_mb": self.max_attachment_mb,
+            "max_send_file_mb": self.max_send_file_mb,
+            "log_level": self.log_level,
+        }
+
+
+def _mask_secret(secret: str) -> str:
+    """对密钥脱敏：只保留首尾各 1 位，中间用星号代替。"""
+    if not secret:
+        return ""
+    if len(secret) <= 2:
+        return "*" * len(secret)
+    return f"{secret[0]}{'*' * (len(secret) - 2)}{secret[-1]}"
+
+
+# ---- 配置缺失错误 ----
+class ConfigError(Exception):
+    """配置缺失或不合法时抛出。"""
+
+
+def load_config(env_path: Path | str | None = None) -> AppConfig:
+    """加载配置。
+
+    Args:
+        env_path: 自定义 .env 路径；默认使用项目根目录下的 .env。
+
+    Returns:
+        AppConfig 实例。
+
+    注意：本函数只负责读取，不强制要求所有字段都填写。
+    收 / 发件时再按需校验。
+    """
+    if load_dotenv is not None:
+        env_file = Path(env_path) if env_path else PROJECT_ROOT / ".env"
+        if env_file.exists():
+            load_dotenv(env_file, override=False)
+
+    data_root_raw = os.getenv("DATA_ROOT", "./AgentMailBridgeData").strip()
+    data_root = Path(data_root_raw)
+    if not data_root.is_absolute():
+        data_root = (PROJECT_ROOT / data_root).resolve()
+
+    cfg = AppConfig(
+        gmail_address=os.getenv("GMAIL_ADDRESS", "").strip(),
+        gmail_app_password=os.getenv("GMAIL_APP_PASSWORD", "").strip(),
+        gmail_imap_host=os.getenv("GMAIL_IMAP_HOST", "imap.gmail.com").strip(),
+        gmail_imap_port=_as_int(os.getenv("GMAIL_IMAP_PORT"), 993),
+        gmail_network_mode=_parse_network_mode(
+            os.getenv("GMAIL_NETWORK_MODE"), "GMAIL_NETWORK_MODE", "auto"
+        ),
+        gmail_connect_timeout=_as_int(os.getenv("GMAIL_CONNECT_TIMEOUT"), 20),
+        gmail_socks5_host=os.getenv("GMAIL_SOCKS5_HOST", "127.0.0.1").strip(),
+        gmail_socks5_port=_parse_port_strict(
+            os.getenv("GMAIL_SOCKS5_PORT"), "GMAIL_SOCKS5_PORT"
+        ) if os.getenv("GMAIL_SOCKS5_PORT") else 10808,
+        gmail_socks5_remote_dns=_as_bool(
+            os.getenv("GMAIL_SOCKS5_REMOTE_DNS"), True
+        ),
+        gmail_receive_backend=_parse_receive_backend(
+            os.getenv("GMAIL_RECEIVE_BACKEND"), "auto"
+        ),
+        gmail_api_credentials_path=_resolve_path(
+            os.getenv("GMAIL_API_CREDENTIALS_PATH", ""), "secrets/credentials.json"
+        ),
+        gmail_api_token_path=_resolve_path(
+            os.getenv("GMAIL_API_TOKEN_PATH", ""), "secrets/token.json"
+        ),
+        gmail_api_scopes=[
+            s.strip()
+            for s in (os.getenv("GMAIL_API_SCOPES")
+                      or _DEFAULT_GMAIL_API_SCOPES).split(",")
+            if s.strip()
+        ],
+        gmail_api_max_results=_as_positive_int(
+            os.getenv("GMAIL_API_MAX_RESULTS"), "GMAIL_API_MAX_RESULTS", 20
+        ),
+        gmail_api_query=os.getenv("GMAIL_API_QUERY", "in:inbox").strip(),
+        qq_email=os.getenv("QQ_EMAIL", "").strip(),
+        qq_auth_code=os.getenv("QQ_AUTH_CODE", "").strip(),
+        qq_smtp_host=os.getenv("QQ_SMTP_HOST", "smtp.qq.com").strip(),
+        qq_smtp_port=_as_int(os.getenv("QQ_SMTP_PORT"), 465),
+        qq_smtp_network_mode=_parse_network_mode(
+            os.getenv("QQ_SMTP_NETWORK_MODE"), "QQ_SMTP_NETWORK_MODE", "direct"
+        ),
+        qq_smtp_connect_timeout=_as_int(os.getenv("QQ_SMTP_CONNECT_TIMEOUT"), 20),
+        qq_smtp_socks5_host=os.getenv("QQ_SMTP_SOCKS5_HOST", "").strip(),
+        qq_smtp_socks5_port=_parse_port_strict(
+            os.getenv("QQ_SMTP_SOCKS5_PORT"), "QQ_SMTP_SOCKS5_PORT"
+        ) if os.getenv("QQ_SMTP_SOCKS5_PORT") else 0,
+        qq_smtp_socks5_remote_dns=_as_bool(
+            os.getenv("QQ_SMTP_SOCKS5_REMOTE_DNS"), False
+        ),
+        owner_gmail=os.getenv("OWNER_GMAIL", "").strip(),
+        data_root=data_root,
+        auto_receive_only_self_mail=_as_bool(
+            os.getenv("AUTO_RECEIVE_ONLY_SELF_MAIL"), True
+        ),
+        max_fetch_limit=_as_int(os.getenv("MAX_FETCH_LIMIT"), 30),
+        receive_unseen_only=_as_bool(os.getenv("RECEIVE_UNSEEN_ONLY"), False),
+        receive_mark_seen=_as_bool(os.getenv("RECEIVE_MARK_SEEN"), False),
+        max_attachment_mb=_as_int(os.getenv("MAX_ATTACHMENT_MB"), 25),
+        max_send_file_mb=_as_int(os.getenv("MAX_SEND_FILE_MB"), 25),
+        log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
+    )
+    return cfg
+
+
+def require_receive_config(cfg: AppConfig) -> None:
+    """收件前校验必需配置，缺失时给出明确错误。
+
+    根据 gmail_receive_backend 分支：
+    - imap: 需要 GMAIL_ADDRESS + GMAIL_APP_PASSWORD
+    - gmail_api: 需要 GMAIL_ADDRESS + credentials.json（不要求应用专用密码）
+    - auto: 解析实际后端后再校验
+    """
+    backend = _effective_receive_backend(cfg)
+    if backend == "gmail_api":
+        missing: list[str] = []
+        if not cfg.gmail_address:
+            missing.append("GMAIL_ADDRESS")
+        if not cfg.gmail_api_credentials_path.exists():
+            missing.append(
+                f"GMAIL_API_CREDENTIALS_PATH({cfg.gmail_api_credentials_path})"
+            )
+        if missing:
+            raise ConfigError(
+                "Gmail API 收件缺少必需配置：" + ", ".join(missing)
+                + "。请在 .env 中填写（参考 .env.example）。"
+            )
+        return
+
+    # imap 模式
+    missing = []
+    if not cfg.gmail_address:
+        missing.append("GMAIL_ADDRESS")
+    if not cfg.gmail_app_password:
+        missing.append("GMAIL_APP_PASSWORD")
+    if missing:
+        raise ConfigError(
+            "IMAP 收件缺少必需配置：" + ", ".join(missing)
+            + "。请在 .env 中填写（参考 .env.example）。"
+        )
+
+
+def _effective_receive_backend(cfg: AppConfig) -> str:
+    """解析 auto 模式实际使用的后端。
+
+    auto: 优先 gmail_api（credentials.json 存在），否则回退 imap。
+    imap / gmail_api: 原样返回。
+    """
+    backend = cfg.gmail_receive_backend
+    if backend == "auto":
+        return "gmail_api" if cfg.gmail_api_configured else "imap"
+    return backend
+
+
+def require_send_config(cfg: AppConfig) -> None:
+    """发件前校验必需配置，缺失时给出明确错误。"""
+    missing: list[str] = []
+    if not cfg.qq_email:
+        missing.append("QQ_EMAIL")
+    if not cfg.qq_auth_code:
+        missing.append("QQ_AUTH_CODE")
+    if not cfg.owner_gmail:
+        missing.append("OWNER_GMAIL")
+    if missing:
+        raise ConfigError(
+            "发件缺少必需配置：" + ", ".join(missing)
+            + "。请在 .env 中填写（参考 .env.example）。"
+        )
+
+
+def require_gmail_network_config(cfg: AppConfig) -> None:
+    """Gmail 网络模式校验：socks5 模式下必须有可用 host/port。"""
+    mode = cfg.gmail_network_mode
+    if mode in ("socks5", "auto"):
+        # auto 在没配 socks5 时可只用 direct，故仅在 socks5 模式强制
+        if mode == "socks5":
+            if not cfg.gmail_socks5_host:
+                raise ConfigError(
+                    "GMAIL_NETWORK_MODE=socks5 但未配置 GMAIL_SOCKS5_HOST。"
+                    "请填写本地代理 SOCKS5 地址（如 127.0.0.1）。"
+                )
+            if not cfg.gmail_socks5_port or cfg.gmail_socks5_port <= 0:
+                raise ConfigError(
+                    "GMAIL_NETWORK_MODE=socks5 但 GMAIL_SOCKS5_PORT 非法。"
+                    "请填写本地代理 SOCKS5 端口（如 10808）。"
+                )
