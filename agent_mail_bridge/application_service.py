@@ -18,10 +18,14 @@ from agent_mail_bridge.config import (
 )
 from agent_mail_bridge.database import (
     init_db,
+    insert_mcp_call,
+    log_event,
+    query_recent_mcp_calls,
     query_recent_events,
     query_recent_received_messages,
     query_recent_sent_files,
     query_sent_files_by_date,
+    update_mcp_call,
 )
 from agent_mail_bridge.file_index import list_received_files_for_date, scan_file_status
 from agent_mail_bridge.gmail_api_auth import get_oauth_state
@@ -169,6 +173,103 @@ class ApplicationService:
             message=raw.get("error", "发送完成"),
             details={"previous_status": raw.get("previous_status")},
         )
+
+    def submit_result(
+        self,
+        file_path: str | Path,
+        *,
+        title: str | None = None,
+        request_id: str | None = None,
+    ) -> SendResult:
+        """供 MCP 调用的受控结果提交入口。"""
+        self.initialize()
+        stable_request_id = request_id or str(uuid.uuid4())
+        path_text = str(file_path)
+        call_id = insert_mcp_call(
+            self.cfg.db_path,
+            request_id=stable_request_id,
+            file_path=path_text,
+            title=title,
+        )
+        try:
+            result = self.send_file(
+                file_path,
+                subject=title,
+                request_id=stable_request_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            result = SendResult(
+                OperationStatus.FAILED,
+                request_id=stable_request_id,
+                send_status="failed",
+                source_path=path_text,
+                error_code="internal_error",
+                message=str(exc),
+            )
+
+        audit_status = _mcp_audit_status(result)
+        update_mcp_call(
+            self.cfg.db_path,
+            call_id,
+            status=audit_status,
+            error_code=result.error_code,
+            message=result.message,
+        )
+        log_event(
+            self.cfg.db_path,
+            "SUCCESS" if result.ok else "ERROR",
+            "mcp",
+            f"MCP 提交完成：request_id={stable_request_id}，状态={audit_status}",
+        )
+        result.details = {**result.details, "mcp_call_id": call_id}
+        return result
+
+    def get_mcp_history(self, limit: int = 100) -> ServiceResult:
+        """返回安全边界内的 MCP 调用审计记录。"""
+        self.initialize()
+        rows = _sanitize_history_paths(
+            query_recent_mcp_calls(self.cfg.db_path, max(1, limit)),
+            ("file_path",),
+            self.cfg.effective_allowed_send_roots,
+        )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            details={"calls": rows},
+        )
+
+    def record_mcp_rejection(
+        self,
+        *,
+        file_path: str = "",
+        title: str | None = None,
+        request_id: str | None = None,
+        error_code: str,
+        message: str,
+    ) -> tuple[str, int]:
+        """记录协议校验或频率限制导致的 MCP 拒绝。"""
+        self.initialize()
+        stable_request_id = request_id or str(uuid.uuid4())
+        call_id = insert_mcp_call(
+            self.cfg.db_path,
+            request_id=stable_request_id,
+            file_path=file_path,
+            title=title,
+            status=error_code,
+        )
+        update_mcp_call(
+            self.cfg.db_path,
+            call_id,
+            status=error_code,
+            error_code=error_code,
+            message=message,
+        )
+        log_event(
+            self.cfg.db_path,
+            "WARNING",
+            "mcp",
+            f"MCP 提交被拒绝：request_id={stable_request_id}，状态={error_code}",
+        )
+        return stable_request_id, call_id
 
     def get_oauth_status(self) -> ServiceResult:
         """获取 Gmail API 授权状态，不刷新也不打开浏览器。"""
@@ -341,6 +442,22 @@ def _classify_receive_error(message: str) -> str:
         if any(keyword in lowered for keyword in keywords):
             return code
     return "receive_failed"
+
+
+def _mcp_audit_status(result: SendResult) -> str:
+    """把发送结果映射为稳定的 MCP 审计状态。"""
+    validation_codes = {
+        "configuration_error",
+        "file_not_found",
+        "path_not_allowed",
+        "file_type_not_allowed",
+        "file_too_large",
+    }
+    if result.error_code in validation_codes:
+        return result.error_code
+    if result.send_status in {"sent", "sent_archive_failed", "duplicate", "failed"}:
+        return result.send_status
+    return result.status.value
 
 
 def _sanitize_history_paths(

@@ -43,7 +43,9 @@ def test_formal_gui_uses_reference_three_column_layout(bridge_window):
     assert bridge_window.sidebar.width() == 230
     assert bridge_window.right_panel.width() == 306
     assert bridge_window.central_panel.width() >= 620
-    assert set(bridge_window.pages) == {"basic", "inbox", "send", "advanced", "history", "logs"}
+    assert set(bridge_window.pages) == {
+        "basic", "inbox", "send", "advanced", "history", "logs", "agent"
+    }
     assert set(bridge_window.tab_buttons) == {"basic", "inbox", "send", "advanced"}
     assert all(
         row.value_label.minimumWidth() >= 126
@@ -58,6 +60,18 @@ def test_navigation_switches_real_pages(bridge_window):
     bridge_window.select_page("logs")
     assert bridge_window.page_stack.currentWidget() is bridge_window.pages["logs"]
     assert bridge_window.nav_buttons["logs"].isChecked()
+    bridge_window.select_page("agent")
+    assert bridge_window.page_stack.currentWidget() is bridge_window.pages["agent"]
+    assert bridge_window.nav_buttons["agent"].isChecked()
+
+
+def test_agent_page_exposes_safe_stdio_configuration(bridge_window):
+    text = bridge_window.mcp_command_text.toPlainText()
+    assert "python -m agent_mail_bridge.mcp_server" in text
+    assert "recipient" not in text.lower()
+    assert bridge_window.service.cfg.qq_auth_code not in text
+    bridge_window._copy_mcp_config("codex")
+    assert "codex mcp add agent-mail-bridge" in QApplication.clipboard().text()
 
 
 def test_auto_receive_interval_uses_minutes(bridge_window):

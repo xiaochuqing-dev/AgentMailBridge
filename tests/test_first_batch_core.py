@@ -213,7 +213,7 @@ def test_send_rejects_path_outside_allowed_roots(tmp_cfg, tmp_path):
     outside.write_text("outside", encoding="utf-8")
     result = ApplicationService(tmp_cfg).send_file(outside, request_id="outside")
     assert result.status == OperationStatus.FAILED
-    assert result.error_code == "file_validation_failed"
+    assert result.error_code == "path_not_allowed"
 
 
 def test_history_does_not_return_legacy_path_outside_data_root(tmp_cfg, tmp_path):

@@ -22,7 +22,7 @@ from email.utils import formatdate
 from pathlib import Path
 from typing import Any
 
-from agent_mail_bridge.config import AppConfig, require_send_config
+from agent_mail_bridge.config import AppConfig, ConfigError, require_send_config
 from agent_mail_bridge.database import (
     create_or_retry_send_attempt,
     insert_sent_file,
@@ -313,19 +313,22 @@ def send_file_with_request(
     """按 request_id 幂等发送，并准确区分 SMTP 与归档状态。"""
     try:
         require_send_config(cfg)
+    except ConfigError as exc:
+        return _send_error_result(request_id, "configuration_error", str(exc))
+    try:
         source_path = assert_within_allowed_roots(
             Path(file_path), cfg.effective_allowed_send_roots
         )
-    except (SecurityError, Exception) as exc:
-        return _send_error_result(request_id, "file_validation_failed", str(exc))
+    except SecurityError as exc:
+        return _send_error_result(request_id, "path_not_allowed", str(exc))
 
     if not source_path.exists() or not source_path.is_file():
-        return _send_error_result(request_id, "file_validation_failed", "待发送文件不存在")
+        return _send_error_result(request_id, "file_not_found", "待发送文件不存在")
     if is_dangerous(source_path.name):
-        return _send_error_result(request_id, "file_validation_failed", "危险扩展名文件禁止发送")
+        return _send_error_result(request_id, "file_type_not_allowed", "危险扩展名文件禁止发送")
     size_bytes = source_path.stat().st_size
     if not check_size_ok(size_bytes, cfg.max_send_file_bytes):
-        return _send_error_result(request_id, "file_validation_failed", "文件超过发送大小限制")
+        return _send_error_result(request_id, "file_too_large", "文件超过发送大小限制")
 
     sha = sha256_of_file(source_path)
     actual_subject = subject or f"Agent执行结果 - {source_path.name}"
@@ -427,7 +430,14 @@ def _send_error_result(request_id: str, error_code: str, message: str) -> dict[s
     """构造未发送或发送失败结果。"""
     send_status = (
         "not_sent"
-        if error_code in {"file_validation_failed", "file_copy_failed"}
+        if error_code in {
+            "configuration_error",
+            "path_not_allowed",
+            "file_not_found",
+            "file_type_not_allowed",
+            "file_too_large",
+            "file_copy_failed",
+        }
         else "failed"
     )
     return {

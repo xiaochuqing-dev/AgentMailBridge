@@ -219,6 +219,7 @@ class BridgeWindow(QMainWindow):
         self.file_rows: list[dict] = []
         self.log_rows: list[dict] = []
         self.history_rows: dict[str, list[dict]] = {"received": [], "sent": []}
+        self.mcp_rows: list[dict] = []
         self.selected_send_path = ""
         self.status_var = _ValueSink(lambda value: self.show_message(value, "working"))
         self.error_var = _ValueSink(lambda value: self.show_message(value, "error"))
@@ -306,6 +307,7 @@ class BridgeWindow(QMainWindow):
             ("send", "▷", "发邮件"),
             ("history", "○", "历史记录"),
             ("logs", "≡", "日志"),
+            ("agent", "◇", "Agent 接口"),
         )
         for key, icon, text in nav_items:
             button = NavButton(icon, text)
@@ -362,6 +364,7 @@ class BridgeWindow(QMainWindow):
             "advanced": self._build_advanced_page(),
             "history": self._build_history_page(),
             "logs": self._build_logs_page(),
+            "agent": self._build_agent_page(),
         }
         for page in self.pages.values():
             self.page_stack.addWidget(page)
@@ -440,7 +443,11 @@ class BridgeWindow(QMainWindow):
         save_button = self._button("□  保存配置", self.save_basic_config)
         self.receive_button = self._button("↓  手动收取", self.receive)
         self.send_button = self._button("▷  手动选择发送", self.choose_and_send)
-        mcp_button = self._button("◇  Agent 提交结果（MCP）", self._show_mcp_notice, outline=True)
+        mcp_button = self._button(
+            "◇  Agent 提交结果（MCP）",
+            lambda: self.select_page("agent"),
+            outline=True,
+        )
         self.task_buttons.extend((test_button, self.receive_button, self.send_button))
         for button in (test_button, save_button, self.receive_button, self.send_button, mcp_button):
             actions.addWidget(button)
@@ -625,6 +632,72 @@ class BridgeWindow(QMainWindow):
         self.full_logs_table = DataTable(["时间", "级别", "事件", "消息"])
         self._configure_log_table(self.full_logs_table, full=True)
         layout.addWidget(self.full_logs_table, 1)
+        return page
+
+    def _build_agent_page(self) -> QWidget:
+        page, layout = self._standard_page(
+            "Agent 接口",
+            "本机 stdio MCP 只允许提交白名单目录内的结果文件，收件人固定。",
+        )
+        status_card = QFrame()
+        status_card.setObjectName("card")
+        status_grid = QGridLayout(status_card)
+        status_grid.setContentsMargins(18, 14, 18, 14)
+        status_grid.setHorizontalSpacing(18)
+        status_grid.setVerticalSpacing(8)
+        status_grid.addWidget(QLabel("MCP 状态"), 0, 0)
+        self.mcp_status_label = QLabel("可用 · stdio · 仅本机")
+        self.mcp_status_label.setStyleSheet(f"color: {SUCCESS}; font-weight: 700;")
+        status_grid.addWidget(self.mcp_status_label, 0, 1)
+        status_grid.addWidget(QLabel("固定 Gmail"), 1, 0)
+        self.mcp_recipient_label = QLabel(self.service.cfg.owner_gmail or "未配置")
+        status_grid.addWidget(self.mcp_recipient_label, 1, 1)
+        status_grid.addWidget(QLabel("允许目录"), 2, 0)
+        self.mcp_roots_label = QLabel(
+            "；".join(str(path) for path in self.service.cfg.effective_allowed_send_roots)
+        )
+        self.mcp_roots_label.setWordWrap(True)
+        status_grid.addWidget(self.mcp_roots_label, 2, 1)
+        layout.addWidget(status_card)
+
+        command_title = QLabel("本地启动与 Agent 配置")
+        command_title.setObjectName("sectionTitle")
+        layout.addWidget(command_title)
+        self.mcp_command_text = QTextEdit()
+        self.mcp_command_text.setReadOnly(True)
+        self.mcp_command_text.setFixedHeight(104)
+        self.mcp_command_text.setPlainText(
+            "启动命令：python -m agent_mail_bridge.mcp_server\n\n"
+            "Codex：codex mcp add agent-mail-bridge -- python -m agent_mail_bridge.mcp_server\n"
+            "Claude Code：claude mcp add agent-mail-bridge -- python -m agent_mail_bridge.mcp_server"
+        )
+        layout.addWidget(self.mcp_command_text)
+        actions = QHBoxLayout()
+        actions.addWidget(self._button("复制 Codex 配置", lambda: self._copy_mcp_config("codex")))
+        actions.addWidget(self._button("复制 Claude Code 配置", lambda: self._copy_mcp_config("claude")))
+        actions.addWidget(self._button("刷新调用记录", self.refresh, primary=True))
+        actions.addStretch(1)
+        layout.addLayout(actions)
+
+        calls_title = QLabel("最近 MCP 调用")
+        calls_title.setObjectName("sectionTitle")
+        layout.addWidget(calls_title)
+        self.mcp_table = DataTable(
+            ["调用时间", "request_id", "文件路径", "发送状态", "错误代码"]
+        )
+        header = self.mcp_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(self.mcp_table, 1)
+        security = QLabel(
+            "安全边界：Agent 不能指定收件人、读取凭据、修改邮箱配置、删除文件或扫描任意目录。"
+        )
+        security.setObjectName("hint")
+        security.setWordWrap(True)
+        layout.addWidget(security)
         return page
 
     def _build_right_panel(self) -> QWidget:
@@ -894,6 +967,7 @@ class BridgeWindow(QMainWindow):
             self.file_rows = self.service.get_today_files().details.get("files", [])
             self.log_rows = self.service.get_recent_logs(100).details.get("events", [])
             self.history_rows = self.service.get_history(100).details
+            self.mcp_rows = self.service.get_mcp_history(100).details.get("calls", [])
         except Exception as exc:
             self.show_message(f"刷新界面失败：{exc}", "error")
             return
@@ -904,6 +978,7 @@ class BridgeWindow(QMainWindow):
         self._populate_full_logs()
         self._populate_sent_history()
         self._populate_history()
+        self._populate_mcp_history()
         self._update_right_panel(status)
         self.show_message("状态已刷新", "normal")
 
@@ -1036,6 +1111,26 @@ class BridgeWindow(QMainWindow):
             values = [direction, title, self._short_time(time_value, include_date=True), str(row.get("status") or "—"), path]
             for column, value in enumerate(values):
                 self.history_table.setItem(index, column, QTableWidgetItem(value))
+
+    def _populate_mcp_history(self) -> None:
+        if not hasattr(self, "mcp_table"):
+            return
+        self.mcp_recipient_label.setText(self.service.cfg.owner_gmail or "未配置")
+        self.mcp_roots_label.setText(
+            "；".join(str(path) for path in self.service.cfg.effective_allowed_send_roots)
+        )
+        self.mcp_table.setRowCount(0)
+        for index, row in enumerate(self.mcp_rows):
+            self.mcp_table.insertRow(index)
+            values = [
+                self._short_time(row.get("created_at"), include_date=True),
+                str(row.get("request_id") or "—"),
+                str(row.get("file_path") or "已隐藏越界路径"),
+                str(row.get("status") or "—"),
+                str(row.get("error_code") or "—"),
+            ]
+            for column, value in enumerate(values):
+                self.mcp_table.setItem(index, column, QTableWidgetItem(value))
 
     def _filter_inbox(self, text: str) -> None:
         keyword = text.strip().lower()
@@ -1250,7 +1345,20 @@ class BridgeWindow(QMainWindow):
             self.show_message(f"定位文件失败：{exc}", "error")
 
     def _show_mcp_notice(self) -> None:
-        self.show_message("MCP 提交接口不在第二批次范围内，当前按钮仅保留入口位置")
+        self.select_page("agent")
+        self.show_message("Agent 接口页已打开")
+
+    def _copy_mcp_config(self, target: str) -> None:
+        commands = {
+            "codex": "codex mcp add agent-mail-bridge -- python -m agent_mail_bridge.mcp_server",
+            "claude": "claude mcp add agent-mail-bridge -- python -m agent_mail_bridge.mcp_server",
+        }
+        command = commands.get(target)
+        if command is None:
+            self.show_message("未知的 Agent 配置类型", "error")
+            return
+        QApplication.clipboard().setText(command)
+        self.show_message("MCP 配置命令已复制", "success")
 
     def _show_help(self) -> None:
         QMessageBox.information(self, "帮助", "详细配置、诊断和安全说明请查看项目 README.md。")

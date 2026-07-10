@@ -13,6 +13,9 @@ from agent_mail_bridge.database import (
     query_all_received_files,
     insert_sent_file,
     query_sent_files_by_date,
+    insert_mcp_call,
+    update_mcp_call,
+    query_recent_mcp_calls,
     log_event,
     query_recent_events,
 )
@@ -143,6 +146,28 @@ class TestSentFiles:
     def test_query_no_match(self, tmp_cfg):
         rows = query_sent_files_by_date(tmp_cfg.db_path, "2026-01-01")
         assert rows == []
+
+
+class TestMcpCalls:
+    def test_insert_update_and_query(self, tmp_cfg):
+        call_id = insert_mcp_call(
+            tmp_cfg.db_path,
+            request_id="mcp-request-001",
+            file_path=str(tmp_cfg.data_root_path / "result.md"),
+            title="测试结果",
+        )
+        update_mcp_call(
+            tmp_cfg.db_path,
+            call_id,
+            status="sent",
+            message="发送成功",
+        )
+
+        rows = query_recent_mcp_calls(tmp_cfg.db_path, 10)
+        assert len(rows) == 1
+        assert rows[0]["request_id"] == "mcp-request-001"
+        assert rows[0]["status"] == "sent"
+        assert rows[0]["error_code"] is None
 
 
 class TestAppEvents:

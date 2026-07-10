@@ -1,7 +1,7 @@
 """SQLite 数据库模块。
 
 职责：
-1. 初始化 4 张表：received_messages / received_files / sent_files / app_events。
+1. 初始化 5 张表：received_messages / received_files / sent_files / mcp_calls / app_events。
 2. 提供线程安全的连接管理（每线程一个连接）。
 3. 提供增 / 改 / 查函数，供收件 / 发件 / 文件扫描 / GUI 调用。
 
@@ -86,6 +86,18 @@ CREATE TABLE IF NOT EXISTS app_events (
     created_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS mcp_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    title TEXT,
+    status TEXT NOT NULL,
+    error_code TEXT,
+    message TEXT,
+    created_at TEXT,
+    updated_at TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_received_messages_saved_date
     ON received_messages(saved_date);
 CREATE INDEX IF NOT EXISTS idx_received_files_saved_date
@@ -96,6 +108,10 @@ CREATE INDEX IF NOT EXISTS idx_sent_files_sent_date
     ON sent_files(sent_at);
 CREATE INDEX IF NOT EXISTS idx_app_events_created
     ON app_events(created_at);
+CREATE INDEX IF NOT EXISTS idx_mcp_calls_created
+    ON mcp_calls(created_at);
+CREATE INDEX IF NOT EXISTS idx_mcp_calls_request_id
+    ON mcp_calls(request_id);
 """
 
 
@@ -695,6 +711,65 @@ def query_recent_sent_files(
     with _get_conn(db_path) as conn:
         rows = conn.execute(
             "SELECT * FROM sent_files ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+# ============================================================
+# mcp_calls
+# ============================================================
+
+def insert_mcp_call(
+    db_path: Path | str,
+    *,
+    request_id: str,
+    file_path: str,
+    title: str | None,
+    status: str = "attempt_created",
+) -> int:
+    """登记一次 MCP 调用，所有成功和失败都可审计。"""
+    now = _now()
+    with _get_conn(db_path) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO mcp_calls
+                (request_id, file_path, title, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (request_id, file_path, title, status, now, now),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def update_mcp_call(
+    db_path: Path | str,
+    call_id: int,
+    *,
+    status: str,
+    error_code: str | None = None,
+    message: str | None = None,
+) -> None:
+    """写入 MCP 调用最终状态。"""
+    with _get_conn(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE mcp_calls
+            SET status = ?, error_code = ?, message = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (status, error_code, message, _now(), call_id),
+        )
+        conn.commit()
+
+
+def query_recent_mcp_calls(
+    db_path: Path | str, limit: int = 100
+) -> list[dict[str, Any]]:
+    """查询最近 MCP 调用，按新到旧返回。"""
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM mcp_calls ORDER BY id DESC LIMIT ?", (max(1, limit),)
         ).fetchall()
         return [dict(row) for row in rows]
 
