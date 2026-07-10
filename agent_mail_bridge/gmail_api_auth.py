@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,16 @@ from agent_mail_bridge.config import AppConfig
 from agent_mail_bridge.logging_setup import get_logger
 
 logger = get_logger("gmail_api_auth")
+_oauth_lock = threading.RLock()
+
+
+def _serialized_oauth(func):
+    """串行化 token 读取、刷新和保存。"""
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        with _oauth_lock:
+            return func(*args, **kwargs)
+    return wrapped
 
 # Gmail API 客户端库（必装依赖）。提到模块级以便单元测试 mock，
 # 同时用 try/except 防御：未安装时仍可导入本模块，调用时给出友好错误。
@@ -49,6 +61,7 @@ class TokenScopeMismatchError(GmailApiAuthError):
     """token scope 与当前配置 scope 不一致，需重新授权。"""
 
 
+@_serialized_oauth
 def get_gmail_api_service(cfg: AppConfig, *, interactive: bool = True) -> Any:
     """获取已授权的 Gmail API service。
 
@@ -68,6 +81,8 @@ def get_gmail_api_service(cfg: AppConfig, *, interactive: bool = True) -> Any:
         TokenScopeMismatchError: token scope 与当前配置不一致。
         GmailApiAuthError: 其它授权失败（含无 token 且非交互）。
     """
+    from agent_mail_bridge.config import require_readonly_gmail_scope
+    require_readonly_gmail_scope(cfg)
     if Credentials is None:
         raise GmailApiAuthError(
             "Gmail API 依赖未安装。请运行：pip install -r requirements.txt"
@@ -217,6 +232,31 @@ def describe_token_status(cfg: AppConfig) -> dict[str, Any]:
     else:
         result["error"] = result["error"] or "token 无效（建议删除后重新授权）"
     return result
+
+
+def get_oauth_state(cfg: AppConfig) -> dict[str, Any]:
+    """返回 GUI 可直接消费的 OAuth 明确状态。"""
+    from agent_mail_bridge.config import ConfigError, require_readonly_gmail_scope
+
+    if not Path(cfg.gmail_api_credentials_path).exists():
+        return {"state": "CREDENTIALS_MISSING", "message": "缺少 credentials.json"}
+    try:
+        require_readonly_gmail_scope(cfg)
+    except ConfigError as exc:
+        return {"state": "SCOPE_MISMATCH", "message": str(exc)}
+    status = describe_token_status(cfg)
+    if not status["exists"]:
+        return {"state": "AUTH_REQUIRED", "message": "尚未完成 Gmail API 授权"}
+    if not status["scopes_match"]:
+        return {"state": "SCOPE_MISMATCH", "message": status["error"] or "权限不匹配"}
+    if status["valid"]:
+        return {"state": "READY", "message": "Gmail API 已授权"}
+    if status["expired"] and status["refreshable"]:
+        return {
+            "state": "TOKEN_EXPIRED_REFRESHABLE",
+            "message": "token 已过期，可自动刷新",
+        }
+    return {"state": "TOKEN_INVALID", "message": status["error"] or "token 无效"}
 
 
 def validate_credentials_file(cfg: AppConfig) -> dict[str, Any]:

@@ -18,6 +18,23 @@ from agent_mail_bridge.logging_setup import setup_logging
 from agent_mail_bridge.storage import ensure_data_dirs
 
 
+@pytest.fixture(autouse=True)
+def isolate_local_secrets(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """所有测试禁用真实 .env、OAuth 文件和用户数据目录。"""
+    sensitive_names = (
+        "GMAIL_ADDRESS", "GMAIL_APP_PASSWORD", "QQ_EMAIL", "QQ_AUTH_CODE",
+        "OWNER_GMAIL", "GMAIL_API_SCOPES", "ALLOWED_SEND_ROOTS",
+    )
+    for name in sensitive_names:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AGENT_MAIL_BRIDGE_DISABLE_DOTENV", "1")
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path / "isolated_data"))
+    monkeypatch.setenv(
+        "GMAIL_API_CREDENTIALS_PATH", str(tmp_path / "credentials.json")
+    )
+    monkeypatch.setenv("GMAIL_API_TOKEN_PATH", str(tmp_path / "token.json"))
+
+
 @pytest.fixture()
 def tmp_cfg(tmp_path: Path) -> AppConfig:
     """提供一个指向临时目录的 AppConfig，并完成初始化。"""

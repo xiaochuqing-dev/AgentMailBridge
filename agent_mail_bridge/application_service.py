@@ -1,0 +1,363 @@
+"""CLI、GUI 与未来 MCP 共用的应用服务入口。"""
+
+from __future__ import annotations
+
+import smtplib
+import ssl
+import threading
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from agent_mail_bridge.config import (
+    AppConfig,
+    ConfigError,
+    _effective_receive_backend,
+    require_receive_config,
+)
+from agent_mail_bridge.database import (
+    init_db,
+    query_recent_events,
+    query_recent_received_messages,
+    query_recent_sent_files,
+    query_sent_files_by_date,
+)
+from agent_mail_bridge.file_index import list_received_files_for_date, scan_file_status
+from agent_mail_bridge.gmail_api_auth import get_oauth_state
+from agent_mail_bridge.logging_setup import setup_logging
+from agent_mail_bridge.mail_receive import receive_mails
+from agent_mail_bridge.mail_send import send_file_with_request
+from agent_mail_bridge.models import OperationStatus, ReceiveResult, SendResult, ServiceResult
+from agent_mail_bridge.security import SecurityError, assert_within_allowed_roots
+from agent_mail_bridge.storage import ensure_data_dirs
+from agent_mail_bridge.utils import fmt_date
+
+
+class ApplicationService:
+    """本地单用户应用的稳定业务入口。"""
+
+    def __init__(self, cfg: AppConfig):
+        self.cfg = cfg
+        self._receive_lock = threading.Lock()
+        self._setup_lock = threading.Lock()
+        self._ready = False
+
+    def initialize(self) -> ServiceResult:
+        """初始化安全目录、数据库和日志。"""
+        with self._setup_lock:
+            if not self._ready:
+                ensure_data_dirs(self.cfg)
+                init_db(self.cfg.db_path)
+                setup_logging(self.cfg.logs_dir, self.cfg.log_level)
+                self._ready = True
+        return ServiceResult(OperationStatus.SUCCESS, message="初始化完成")
+
+    def receive(
+        self,
+        *,
+        limit: int | None = None,
+        unseen_only: bool | None = None,
+        mark_seen: bool | None = None,
+    ) -> ReceiveResult:
+        """执行一次互斥收件，普通收件绝不启动浏览器授权。"""
+        self.initialize()
+        backend = _effective_receive_backend(self.cfg)
+        if limit is not None and limit <= 0:
+            return ReceiveResult(
+                OperationStatus.FAILED, backend=backend,
+                error_code="invalid_limit", message="收件数量必须大于 0",
+            )
+        if not self._receive_lock.acquire(blocking=False):
+            return ReceiveResult(
+                OperationStatus.CANCELLED, backend=backend,
+                error_code="receive_busy", message="已有收件任务正在运行",
+            )
+        try:
+            if backend == "gmail_api":
+                oauth = get_oauth_state(self.cfg)
+                if oauth["state"] not in {"READY", "TOKEN_EXPIRED_REFRESHABLE"}:
+                    return ReceiveResult(
+                        OperationStatus.AUTH_REQUIRED,
+                        backend=backend,
+                        error_code=oauth["state"].lower(),
+                        message=oauth["message"],
+                        needs_auth=True,
+                    )
+            try:
+                require_receive_config(self.cfg)
+                raw = receive_mails(
+                    self.cfg, limit=limit,
+                    unseen_only=unseen_only, mark_seen=mark_seen,
+                )
+            except ConfigError as exc:
+                return ReceiveResult(
+                    OperationStatus.FAILED, backend=backend,
+                    error_code="config_error", message=str(exc),
+                )
+            except Exception as exc:  # noqa: BLE001
+                return ReceiveResult(
+                    OperationStatus.FAILED, backend=backend,
+                    error_code="receive_failed", message=str(exc), failed=1,
+                    errors=[str(exc)],
+                )
+            failures = int(raw.get("failed", len(raw.get("errors", []))))
+            saved = int(raw.get("saved", 0))
+            errors = list(raw.get("errors", []))
+            if failures and saved:
+                status = OperationStatus.PARTIAL
+            elif failures or not raw.get("ok", True):
+                status = OperationStatus.FAILED
+            else:
+                status = OperationStatus.SUCCESS
+            return ReceiveResult(
+                status,
+                backend=backend,
+                scanned=int(raw.get("fetched", 0)),
+                accepted=int(raw.get("accepted", saved)),
+                saved=saved,
+                skipped=int(raw.get("skipped", 0)),
+                duplicates=int(raw.get("duplicates", 0)),
+                failed=failures,
+                attachments=int(raw.get("attachments", 0)),
+                saved_files=list(raw.get("saved_files", [])),
+                errors=errors,
+                error_code=(
+                    "partial_receive" if status == OperationStatus.PARTIAL
+                    else _classify_receive_error(errors[0]) if errors else None
+                ),
+                message=(
+                    "收件完成" if status == OperationStatus.SUCCESS
+                    else errors[0] if errors else "收件存在错误"
+                ),
+            )
+        finally:
+            self._receive_lock.release()
+
+    def send_file(
+        self,
+        file_path: str | Path,
+        *,
+        subject: str | None = None,
+        request_id: str | None = None,
+    ) -> SendResult:
+        """发送白名单目录内文件，request_id 用于安全重试。"""
+        self.initialize()
+        stable_request_id = request_id or str(uuid.uuid4())
+        raw = send_file_with_request(
+            file_path, request_id=stable_request_id,
+            subject=subject, cfg=self.cfg,
+        )
+        status_map = {
+            "success": OperationStatus.SUCCESS,
+            "partial": OperationStatus.PARTIAL,
+            "duplicate": OperationStatus.DUPLICATE,
+            "failed": OperationStatus.FAILED,
+        }
+        status = status_map.get(raw.get("status", "failed"), OperationStatus.FAILED)
+        return SendResult(
+            status,
+            request_id=stable_request_id,
+            send_status=raw.get("send_status", "not_sent"),
+            source_path=raw.get("source_path", ""),
+            send_copy_path=raw.get("send_copy_path", ""),
+            sent_copy_path=raw.get("sent_copy_path", ""),
+            subject=raw.get("subject", subject or ""),
+            to_email=raw.get("to", self.cfg.owner_gmail),
+            sent_at=raw.get("sent_at", ""),
+            error_code=raw.get("error_code"),
+            message=raw.get("error", "发送完成"),
+            details={"previous_status": raw.get("previous_status")},
+        )
+
+    def get_oauth_status(self) -> ServiceResult:
+        """获取 Gmail API 授权状态，不刷新也不打开浏览器。"""
+        state = get_oauth_state(self.cfg)
+        status = (
+            OperationStatus.SUCCESS
+            if state["state"] in {"READY", "TOKEN_EXPIRED_REFRESHABLE"}
+            else OperationStatus.AUTH_REQUIRED
+        )
+        return ServiceResult(
+            status, message=state["message"],
+            needs_auth=status == OperationStatus.AUTH_REQUIRED,
+            details=state,
+        )
+
+    def authorize_gmail_api(self) -> ServiceResult:
+        """显式执行浏览器 OAuth 授权。"""
+        self.initialize()
+        try:
+            from agent_mail_bridge.gmail_api_auth import get_gmail_api_service
+            service = get_gmail_api_service(self.cfg, interactive=True)
+            profile = service.users().getProfile(userId="me").execute()
+            return ServiceResult(
+                OperationStatus.SUCCESS,
+                message="Gmail API 授权成功",
+                details={"email": profile.get("emailAddress", "")},
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="oauth_failed", message=str(exc), needs_auth=True,
+            )
+
+    def get_today_files(self) -> ServiceResult:
+        self.initialize()
+        rows = list_received_files_for_date(self.cfg, fmt_date(datetime.now()))
+        return ServiceResult(
+            OperationStatus.SUCCESS, message=f"共 {len(rows)} 个文件",
+            details={"files": rows},
+        )
+
+    def get_received_files(self, date_str: str) -> ServiceResult:
+        """按日期获取安全边界内的收件文件。"""
+        self.initialize()
+        rows = list_received_files_for_date(self.cfg, date_str)
+        return ServiceResult(OperationStatus.SUCCESS, details={"files": rows})
+
+    def get_sent_files(self, date_str: str) -> ServiceResult:
+        """按日期获取发送记录。"""
+        self.initialize()
+        rows = _sanitize_history_paths(
+            query_sent_files_by_date(self.cfg.db_path, date_str),
+            ("source_path", "send_copy_path", "sent_copy_path"),
+            self.cfg.effective_allowed_send_roots,
+        )
+        return ServiceResult(OperationStatus.SUCCESS, details={"files": rows})
+
+    def get_history(self, limit: int = 100) -> ServiceResult:
+        self.initialize()
+        if limit <= 0:
+            return ServiceResult(
+                OperationStatus.FAILED, error_code="invalid_limit",
+                message="历史记录数量必须大于 0",
+            )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            details={
+                "received": _sanitize_history_paths(
+                    query_recent_received_messages(self.cfg.db_path, limit),
+                    ("body_file_path",), [self.cfg.data_root_path],
+                ),
+                "sent": _sanitize_history_paths(
+                    query_recent_sent_files(self.cfg.db_path, limit),
+                    ("source_path", "send_copy_path", "sent_copy_path"),
+                    self.cfg.effective_allowed_send_roots,
+                ),
+            },
+        )
+
+    def get_recent_logs(self, limit: int = 50) -> ServiceResult:
+        self.initialize()
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            details={"events": query_recent_events(self.cfg.db_path, max(1, limit))},
+        )
+
+    def scan_file_status(self) -> ServiceResult:
+        self.initialize()
+        changes = scan_file_status(self.cfg)
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            message=f"发现 {len(changes)} 项变化",
+            details={"changes": changes},
+        )
+
+    def get_config_and_connection_status(self) -> ServiceResult:
+        """返回脱敏配置及三个连接面的可见状态。"""
+        backend = _effective_receive_backend(self.cfg)
+        oauth = get_oauth_state(self.cfg)
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            details={
+                "config": self.cfg.mask(),
+                "receive_backend": backend,
+                "imap": "configured" if self.cfg.gmail_address and self.cfg.gmail_app_password else "not_configured",
+                "gmail_api": oauth,
+                "qq_smtp": "configured" if self.cfg.qq_email and self.cfg.qq_auth_code else "not_configured",
+            },
+        )
+
+    def diagnose_imap(self) -> ServiceResult:
+        try:
+            from agent_mail_bridge.mail_receive import _connect_imap
+            connection = _connect_imap(self.cfg)
+            connection.logout()
+            return ServiceResult(OperationStatus.SUCCESS, message="Gmail IMAP 连接正常")
+        except Exception as exc:  # noqa: BLE001
+            return ServiceResult(
+                OperationStatus.FAILED, error_code="imap_diagnose_failed", message=str(exc)
+            )
+
+    def diagnose_gmail_api(self) -> ServiceResult:
+        try:
+            from agent_mail_bridge.gmail_api_auth import get_gmail_api_service
+            service = get_gmail_api_service(self.cfg, interactive=False)
+            profile = service.users().getProfile(userId="me").execute()
+            return ServiceResult(
+                OperationStatus.SUCCESS, message="Gmail API 连接正常",
+                details={"email": profile.get("emailAddress", "")},
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ServiceResult(
+                OperationStatus.FAILED, error_code="gmail_api_diagnose_failed",
+                message=str(exc), needs_auth=True,
+            )
+
+    def diagnose_qq_smtp(self) -> ServiceResult:
+        """连接并认证 QQ SMTP，不发送邮件。"""
+        try:
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL(
+                self.cfg.qq_smtp_host, self.cfg.qq_smtp_port,
+                timeout=self.cfg.qq_smtp_connect_timeout, context=context,
+            ) as server:
+                server.login(self.cfg.qq_email, self.cfg.qq_auth_code)
+            return ServiceResult(OperationStatus.SUCCESS, message="QQ SMTP 连接正常")
+        except Exception as exc:  # noqa: BLE001
+            return ServiceResult(
+                OperationStatus.FAILED, error_code="qq_smtp_diagnose_failed",
+                message=str(exc),
+            )
+
+
+def _classify_receive_error(message: str) -> str:
+    """把后端异常文案归入稳定错误代码。"""
+    lowered = message.lower()
+    rules = (
+        (("配置", "config"), "config_error"),
+        (("socks5", "代理"), "socks5_error"),
+        (("tls", "ssl"), "tls_error"),
+        (("scope", "权限不匹配"), "scope_mismatch"),
+        (("oauth", "授权"), "oauth_error"),
+        (("认证", "auth"), "gmail_auth_error"),
+        (("database", "sqlite", "数据库"), "database_error"),
+        (("文件", "附件"), "file_save_error"),
+        (("gmail api",), "gmail_api_error"),
+        (("网络", "连接"), "network_error"),
+    )
+    for keywords, code in rules:
+        if any(keyword in lowered for keyword in keywords):
+            return code
+    return "receive_failed"
+
+
+def _sanitize_history_paths(
+    rows: list[dict[str, Any]], path_fields: tuple[str, ...], roots: list[Path]
+) -> list[dict[str, Any]]:
+    """旧数据库中的越界路径不得由应用服务返回。"""
+    safe_rows: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        for field in path_fields:
+            value = item.get(field)
+            if not value:
+                continue
+            try:
+                assert_within_allowed_roots(Path(value), roots)
+            except SecurityError:
+                item[field] = ""
+                item[f"{field}_status"] = "unsafe_path"
+        safe_rows.append(item)
+    return safe_rows

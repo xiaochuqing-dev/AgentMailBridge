@@ -15,7 +15,7 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from agent_mail_bridge.utils import fmt_datetime, now_local
 
@@ -62,6 +62,8 @@ CREATE TABLE IF NOT EXISTS received_files (
 
 CREATE TABLE IF NOT EXISTS sent_files (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 1,
     source_path TEXT,
     send_copy_path TEXT,
     sent_copy_path TEXT,
@@ -106,6 +108,11 @@ _RECEIVED_MESSAGES_NEW_COLUMNS = {
     "backend": "TEXT",
 }
 
+_SENT_FILES_NEW_COLUMNS = {
+    "request_id": "TEXT",
+    "attempt_count": "INTEGER NOT NULL DEFAULT 1",
+}
+
 
 def init_db(db_path: Path | str) -> None:
     """初始化数据库文件及所有表。目录不存在会自动创建。
@@ -118,6 +125,8 @@ def init_db(db_path: Path | str) -> None:
     with _get_conn(db_path) as conn:
         conn.executescript(SCHEMA_SQL)
         _migrate_received_messages(conn)
+        _migrate_sent_files(conn)
+        _ensure_unique_indexes(conn)
         conn.commit()
 
 
@@ -135,6 +144,32 @@ def _migrate_received_messages(conn: sqlite3.Connection) -> None:
             conn.execute(
                 f"ALTER TABLE received_messages ADD COLUMN {col} {col_type}"
             )
+
+
+def _migrate_sent_files(conn: sqlite3.Connection) -> None:
+    """为旧数据库补充发送幂等字段。"""
+    existing = {
+        row["name"] for row in conn.execute("PRAGMA table_info(sent_files)").fetchall()
+    }
+    for col, col_type in _SENT_FILES_NEW_COLUMNS.items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE sent_files ADD COLUMN {col} {col_type}")
+
+
+def _ensure_unique_indexes(conn: sqlite3.Connection) -> None:
+    """数据库层阻止跨后端重复邮件和重复发送请求。"""
+    try:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_received_message_id_nocase "
+            "ON received_messages(message_id COLLATE NOCASE)"
+        )
+    except sqlite3.IntegrityError:
+        # 旧库若已有仅大小写不同的历史记录，不破坏启动；新写入仍使用归一化键。
+        pass
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_sent_request_id "
+        "ON sent_files(request_id) WHERE request_id IS NOT NULL"
+    )
 
 
 def get_connection(db_path: Path | str) -> sqlite3.Connection:
@@ -157,10 +192,13 @@ def get_connection(db_path: Path | str) -> sqlite3.Connection:
 
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    new_conn = sqlite3.connect(str(db_path))
+    # 5 秒 busy timeout：覆盖桌面端短时并发写入，不隐藏长期锁故障。
+    new_conn = sqlite3.connect(str(db_path), timeout=5.0, isolation_level=None)
     new_conn.row_factory = sqlite3.Row
-    # 开启外键约束
+    # WAL 允许读取与短写事务并行；busy_timeout 单位为毫秒。
     new_conn.execute("PRAGMA foreign_keys = ON;")
+    new_conn.execute("PRAGMA busy_timeout = 5000;")
+    new_conn.execute("PRAGMA journal_mode = WAL;")
     _local.conn = new_conn
     _local.key = key
     return new_conn
@@ -249,11 +287,97 @@ def insert_received_message(
 def message_id_exists(db_path: Path | str, message_id: str) -> bool:
     """判断某 message_id 是否已记录过（用于去重）。"""
     with _get_conn(db_path) as conn:
+        if message_id.startswith("gmail_api:"):
+            gmail_message_id = message_id.split(":", 1)[1]
+            row = conn.execute(
+                "SELECT 1 FROM received_messages WHERE gmail_message_id = ? LIMIT 1",
+                (gmail_message_id,),
+            ).fetchone()
+            return row is not None
         row = conn.execute(
             "SELECT 1 FROM received_messages WHERE message_id = ? LIMIT 1",
             (message_id,),
         ).fetchone()
         return row is not None
+
+
+def store_received_message_atomically(
+    db_path: Path | str,
+    message: dict[str, Any],
+    write_files: Callable[[], list[dict[str, Any]]],
+) -> tuple[bool, list[dict[str, Any]]]:
+    """在短写事务中完成去重、文件写入和数据库登记。
+
+    返回 False 表示数据库唯一约束判定为重复。写入失败会回滚数据库，
+    确定性文件名使下一次重试复用同一路径，不产生第二套文件。
+    """
+    now = _now()
+    with _get_conn(db_path) as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                """
+                INSERT INTO received_messages
+                    (message_id, gmail_uid, subject, from_email, to_email,
+                     received_at, saved_date, body_file_path, body_sha256,
+                     has_attachments, status, created_at, updated_at,
+                     source, gmail_message_id, gmail_thread_id, backend)
+                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, 'processing',
+                        ?, ?, ?, ?, ?, ?)
+                ON CONFLICT DO NOTHING
+                """,
+                (
+                    message["message_id"], message.get("gmail_uid"),
+                    message.get("subject", ""), message.get("from_email", ""),
+                    message.get("to_email", ""), message.get("received_at"),
+                    message["saved_date"], 1 if message.get("has_attachments") else 0,
+                    now, now, message.get("source"),
+                    message.get("gmail_message_id"), message.get("gmail_thread_id"),
+                    message.get("backend"),
+                ),
+            )
+            if cur.rowcount == 0:
+                conn.rollback()
+                return False, []
+
+            files = write_files()
+            for item in files:
+                conn.execute(
+                    """
+                    INSERT INTO received_files
+                        (message_id, file_type, original_filename, saved_filename,
+                         saved_path, sha256, size_bytes, mime_type, saved_date,
+                         status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        message["message_id"], item["file_type"],
+                        item["original_filename"], item["saved_filename"],
+                        item["saved_path"], item.get("sha256"), item["size_bytes"],
+                        item.get("mime_type"), message["saved_date"],
+                        item.get("status", "normal"), now, now,
+                    ),
+                )
+
+            body = next((item for item in files if item["file_type"] == "body"), None)
+            conn.execute(
+                """
+                UPDATE received_messages
+                SET body_file_path = ?, body_sha256 = ?, status = 'saved', updated_at = ?
+                WHERE message_id = ?
+                """,
+                (
+                    body["saved_path"] if body else None,
+                    body.get("sha256") if body else None,
+                    now,
+                    message["message_id"],
+                ),
+            )
+            conn.commit()
+            return True, files
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def update_received_message_status(
@@ -304,6 +428,17 @@ def query_received_messages_by_date(
             (saved_date,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def query_recent_received_messages(
+    db_path: Path | str, limit: int = 100
+) -> list[dict[str, Any]]:
+    """查询最近收件记录，供应用服务历史页使用。"""
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM received_messages ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(row) for row in rows]
 
 
 # ============================================================
@@ -422,6 +557,8 @@ def insert_sent_file(
     sent_at: str | None,
     status: str = "sent",
     error_message: str | None = None,
+    request_id: str | None = None,
+    attempt_count: int = 1,
 ) -> int:
     """插入一条发送记录（成功或失败均可记录）。"""
     now = _now()
@@ -429,19 +566,109 @@ def insert_sent_file(
         cur = conn.execute(
             """
             INSERT INTO sent_files
-                (source_path, send_copy_path, sent_copy_path, sha256,
+                (request_id, attempt_count, source_path, send_copy_path, sent_copy_path, sha256,
                  subject, from_email, to_email, sent_at, status,
                  error_message, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                source_path, send_copy_path, sent_copy_path, sha256,
+                request_id, attempt_count, source_path, send_copy_path, sent_copy_path, sha256,
                 subject, from_email, to_email, sent_at, status,
                 error_message, now, now,
             ),
         )
         conn.commit()
         return cur.lastrowid
+
+
+def get_send_by_request_id(
+    db_path: Path | str, request_id: str
+) -> dict[str, Any] | None:
+    """按幂等请求标识查询发送记录。"""
+    with _get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM sent_files WHERE request_id = ? LIMIT 1", (request_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def create_or_retry_send_attempt(
+    db_path: Path | str,
+    *,
+    request_id: str,
+    source_path: str,
+    sha256: str,
+    subject: str,
+    from_email: str,
+    to_email: str,
+) -> tuple[str, dict[str, Any]]:
+    """创建发送尝试；失败记录可重试，已发送记录按重复返回。"""
+    now = _now()
+    with _get_conn(db_path) as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM sent_files WHERE request_id = ?", (request_id,)
+            ).fetchone()
+            if row is not None:
+                current = dict(row)
+                if current["status"] in {"sent", "sent_archive_failed", "attempt_created"}:
+                    conn.rollback()
+                    return "duplicate", current
+                conn.execute(
+                    """
+                    UPDATE sent_files
+                    SET status = 'attempt_created', error_message = NULL,
+                        attempt_count = attempt_count + 1, updated_at = ?
+                    WHERE request_id = ?
+                    """,
+                    (now, request_id),
+                )
+                conn.commit()
+                return "retry", get_send_by_request_id(db_path, request_id) or current
+
+            conn.execute(
+                """
+                INSERT INTO sent_files
+                    (request_id, attempt_count, source_path, sha256, subject,
+                     from_email, to_email, status, created_at, updated_at)
+                VALUES (?, 1, ?, ?, ?, ?, ?, 'attempt_created', ?, ?)
+                """,
+                (request_id, source_path, sha256, subject, from_email, to_email, now, now),
+            )
+            conn.commit()
+            return "created", get_send_by_request_id(db_path, request_id) or {}
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def update_send_attempt(
+    db_path: Path | str,
+    request_id: str,
+    *,
+    status: str,
+    send_copy_path: str | None = None,
+    sent_copy_path: str | None = None,
+    sent_at: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    """更新一次发送尝试的准确最终状态。"""
+    with _get_conn(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE sent_files
+            SET status = ?, send_copy_path = COALESCE(?, send_copy_path),
+                sent_copy_path = COALESCE(?, sent_copy_path),
+                sent_at = COALESCE(?, sent_at), error_message = ?, updated_at = ?
+            WHERE request_id = ?
+            """,
+            (
+                status, send_copy_path, sent_copy_path, sent_at,
+                error_message, _now(), request_id,
+            ),
+        )
+        conn.commit()
 
 
 def query_sent_files_by_date(
@@ -459,6 +686,17 @@ def query_sent_files_by_date(
             (prefix,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def query_recent_sent_files(
+    db_path: Path | str, limit: int = 100
+) -> list[dict[str, Any]]:
+    """查询最近发送记录。"""
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM sent_files ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(row) for row in rows]
 
 
 # ============================================================

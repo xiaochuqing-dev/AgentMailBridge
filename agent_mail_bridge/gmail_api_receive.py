@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import base64
 import re
-from email.utils import parseaddr
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +28,12 @@ from agent_mail_bridge.database import (
     message_id_exists,
 )
 from agent_mail_bridge.logging_setup import get_logger
+from agent_mail_bridge.mail_common import (
+    AttachmentData,
+    NormalizedMail,
+    attachment_security_status,
+)
+from agent_mail_bridge.mail_processing import process_normalized_mail
 from agent_mail_bridge.security import (
     check_size_ok,
     is_dangerous,
@@ -90,6 +96,10 @@ def receive_gmail_api_messages(
         "saved": 0,
         "skipped": 0,
         "attachments": 0,
+        "accepted": 0,
+        "duplicates": 0,
+        "failed": 0,
+        "saved_files": [],
         "errors": [],
     }
 
@@ -134,9 +144,8 @@ def receive_gmail_api_messages(
         gmail_message_id = item.get("id", "")
         gmail_thread_id = item.get("threadId", "")
         try:
-            _process_one(
-                service, cfg, gmail_addr,
-                gmail_message_id, gmail_thread_id, result,
+            _process_one_unified(
+                service, cfg, gmail_message_id, gmail_thread_id, result,
             )
         except Exception as exc:  # noqa: BLE001
             err = f"处理 Gmail API 邮件 id={gmail_message_id} 失败：{exc}"
@@ -144,6 +153,7 @@ def receive_gmail_api_messages(
             logger.error(err)
             log_event(cfg.db_path, "ERROR", "receive", err)
             result["errors"].append(err)
+            result["failed"] += 1
 
     log_event(
         cfg.db_path,
@@ -163,7 +173,8 @@ def receive_gmail_api_messages(
 def _build_service(cfg: AppConfig) -> Any:
     """委托 gmail_api_auth 创建 service。"""
     from agent_mail_bridge.gmail_api_auth import get_gmail_api_service
-    return get_gmail_api_service(cfg)
+    # 普通收件不得突然打开浏览器，授权必须由显式授权操作触发。
+    return get_gmail_api_service(cfg, interactive=False)
 
 
 # ============================================================
@@ -302,6 +313,122 @@ def _process_one(
         f"已保存邮件（Gmail API）：{subject or '(无标题)'} | 附件 {len(attachments)} 个",
     )
     logger.info("已保存邮件（Gmail API）：%s（附件 %d 个）", subject, len(attachments))
+
+
+def _process_one_unified(
+    service: Any,
+    cfg: AppConfig,
+    gmail_message_id: str,
+    gmail_thread_id: str,
+    result: dict[str, Any],
+) -> None:
+    """把 Gmail API payload 转换后交给统一业务流程。"""
+    msg = service.users().messages().get(
+        userId="me", id=gmail_message_id, format="full"
+    ).execute()
+    payload = msg.get("payload") or {}
+    headers = _headers_to_dict(payload.get("headers") or [])
+    received_dt = _api_message_datetime(headers, msg.get("internalDate"))
+    body_text, attachments = _extract_payload_unified(
+        payload, cfg, service, gmail_message_id
+    )
+    normalized = NormalizedMail(
+        backend="gmail_api",
+        message_id=_find_header(headers, ("Message-ID",)),
+        backend_message_id=gmail_message_id,
+        thread_id=gmail_thread_id,
+        uid="",
+        from_raw=_find_header(headers, ("From",)),
+        to_raw=_find_header(headers, ("To",)),
+        cc_raw=_find_header(headers, ("Cc",)),
+        subject=decode_mime_header(_find_header(headers, ("Subject",))),
+        received_at=fmt_datetime(received_dt),
+        saved_date=received_dt.strftime("%Y-%m-%d"),
+        body_text=body_text,
+        attachments=attachments,
+    )
+    single = process_normalized_mail(cfg, normalized)
+    status = single["status"]
+    if status == "saved":
+        result["accepted"] += 1
+        result["saved"] += 1
+        result["attachments"] += single.get("attachments", 0)
+        result["saved_files"].extend(single.get("saved_files", []))
+    elif status == "duplicate":
+        result["duplicates"] += 1
+        result["skipped"] += 1
+    else:
+        result["skipped"] += 1
+
+
+def _api_message_datetime(headers: dict[str, str], internal_date: Any):
+    """优先使用标准 Date 头，确保两个后端得到相同时间。"""
+    raw_date = _find_header(headers, ("Date",))
+    if raw_date:
+        try:
+            parsed = parsedate_to_datetime(raw_date)
+            if parsed is not None:
+                if parsed.tzinfo is not None:
+                    return parsed.astimezone().replace(tzinfo=None)
+                return parsed
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return _parse_internal_date(internal_date)
+
+
+def _extract_payload_unified(
+    payload: dict[str, Any],
+    cfg: AppConfig,
+    service: Any,
+    gmail_message_id: str,
+) -> tuple[str, list[AttachmentData]]:
+    """递归提取正文和内联/普通附件，附件失败时整封标记失败。"""
+    plain_parts: list[str] = []
+    html_parts: list[str] = []
+    attachments: list[AttachmentData] = []
+
+    def walk(part: dict[str, Any]) -> None:
+        mime_type = part.get("mimeType", "application/octet-stream")
+        filename = decode_mime_header(part.get("filename", ""))
+        body = part.get("body") or {}
+        if filename:
+            safe_name = sanitize_filename(filename, max_len=120)
+            if body.get("attachmentId"):
+                response = service.users().messages().attachments().get(
+                    userId="me", messageId=gmail_message_id,
+                    id=body["attachmentId"],
+                ).execute()
+                encoded = response.get("data", "")
+            else:
+                encoded = body.get("data", "")
+            if not encoded:
+                raise RuntimeError(f"附件下载失败：{safe_name}")
+            content = decode_base64url(encoded)
+            if check_size_ok(len(content), cfg.max_attachment_bytes):
+                attachments.append(AttachmentData(
+                    filename=safe_name,
+                    content=content,
+                    mime_type=mime_type,
+                    security_status=attachment_security_status(safe_name),
+                ))
+            return
+        encoded = body.get("data")
+        if mime_type == "text/plain" and encoded is not None:
+            text = _decode_base64url_text(encoded)
+            if text:
+                plain_parts.append(text)
+        elif mime_type == "text/html" and encoded is not None:
+            text = _decode_base64url_text(encoded)
+            if text:
+                html_parts.append(text)
+        for child in part.get("parts") or []:
+            walk(child)
+
+    walk(payload)
+    body = "\n\n".join(plain_parts).strip()
+    if not body:
+        body = _html_to_text("\n".join(html_parts))
+    return body, attachments
 
 
 # ============================================================

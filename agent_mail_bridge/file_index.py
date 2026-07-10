@@ -24,6 +24,7 @@ from agent_mail_bridge.database import (
     query_received_files_by_date,
     update_received_file_status,
 )
+from agent_mail_bridge.security import SecurityError, assert_within_root
 from agent_mail_bridge.utils import sha256_of_file
 
 
@@ -41,6 +42,19 @@ def list_received_files_for_date(
     result: list[dict[str, Any]] = []
     for row in rows:
         p = Path(row["saved_path"]) if row["saved_path"] else None
+        if p is not None:
+            try:
+                assert_within_root(p, cfg.data_root_path)
+            except SecurityError:
+                item = dict(row)
+                item.update({
+                    "exists_now": False,
+                    "size_now": None,
+                    "path_display": "",
+                    "status": "unsafe_path",
+                })
+                result.append(item)
+                continue
         exists_now = p is not None and p.exists()
         size_now = p.stat().st_size if exists_now and p else None
         item = dict(row)
@@ -78,6 +92,19 @@ def scan_file_status(cfg: AppConfig) -> list[dict[str, Any]]:
             continue
 
         recorded_path = Path(recorded_path_str)
+        try:
+            assert_within_root(recorded_path, cfg.data_root_path)
+        except SecurityError:
+            if old_status != "unsafe_path":
+                update_received_file_status(cfg.db_path, file_id, "unsafe_path")
+                changes.append({
+                    "id": file_id,
+                    "original_filename": row["original_filename"],
+                    "old_status": old_status,
+                    "new_status": "unsafe_path",
+                    "new_path": None,
+                })
+            continue
 
         # --- 文件不存在 ---
         if not recorded_path.exists():
@@ -136,7 +163,9 @@ def scan_file_status(cfg: AppConfig) -> list[dict[str, Any]]:
                 continue
 
         # --- 文件正常且 hash 一致 ---
-        if old_status not in ("normal", "renamed"):
+        if old_status not in (
+            "normal", "renamed", "allowed", "dangerous", "unknown_type"
+        ):
             update_received_file_status(cfg.db_path, file_id, "normal")
             changes.append({
                 "id": file_id,

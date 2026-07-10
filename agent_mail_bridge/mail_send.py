@@ -23,9 +23,19 @@ from pathlib import Path
 from typing import Any
 
 from agent_mail_bridge.config import AppConfig, require_send_config
-from agent_mail_bridge.database import insert_sent_file, log_event
+from agent_mail_bridge.database import (
+    create_or_retry_send_attempt,
+    insert_sent_file,
+    log_event,
+    update_send_attempt,
+)
 from agent_mail_bridge.logging_setup import get_logger
-from agent_mail_bridge.security import check_size_ok, is_dangerous
+from agent_mail_bridge.security import (
+    SecurityError,
+    assert_within_allowed_roots,
+    check_size_ok,
+    is_dangerous,
+)
 from agent_mail_bridge.storage import (
     build_send_copy_path,
     build_sent_copy_path,
@@ -39,6 +49,14 @@ from agent_mail_bridge.utils import (
 )
 
 logger = get_logger("mail_send")
+
+
+class SmtpStageError(Exception):
+    """标记 SMTP 连接、认证或发送阶段错误。"""
+
+    def __init__(self, stage: str, message: str):
+        super().__init__(message)
+        self.stage = stage
 
 
 def send_file_to_owner_gmail(
@@ -247,10 +265,179 @@ def _build_email(
 def _smtp_send(cfg: AppConfig, msg: EmailMessage) -> None:
     """使用 QQ SMTP SSL 发送邮件。"""
     ctx = ssl.create_default_context()
-    with smtplib.SMTP_SSL(cfg.qq_smtp_host, cfg.qq_smtp_port, context=ctx) as server:
+    # 连接超时直接传给底层 SMTP_SSL，单位为秒。
+    with smtplib.SMTP_SSL(
+        cfg.qq_smtp_host,
+        cfg.qq_smtp_port,
+        timeout=cfg.qq_smtp_connect_timeout,
+        context=ctx,
+    ) as server:
         server.login(cfg.qq_email, cfg.qq_auth_code)
         server.send_message(msg)
     logger.info("SMTP 发送完成")
+
+
+def _smtp_send_with_stage(cfg: AppConfig, msg: EmailMessage) -> None:
+    """分阶段执行 SMTP，便于 GUI 给出准确错误。"""
+    context = ssl.create_default_context()
+    try:
+        server = smtplib.SMTP_SSL(
+            cfg.qq_smtp_host, cfg.qq_smtp_port,
+            timeout=cfg.qq_smtp_connect_timeout, context=context,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise SmtpStageError("connect", f"QQ SMTP 连接失败：{exc}") from exc
+    try:
+        try:
+            server.login(cfg.qq_email, cfg.qq_auth_code)
+        except Exception as exc:  # noqa: BLE001
+            raise SmtpStageError("auth", f"QQ SMTP 认证失败：{exc}") from exc
+        try:
+            server.send_message(msg)
+        except Exception as exc:  # noqa: BLE001
+            raise SmtpStageError("send", f"QQ SMTP 发送失败：{exc}") from exc
+    finally:
+        try:
+            server.quit()
+        except Exception:
+            pass
+
+
+def send_file_with_request(
+    file_path: str | Path,
+    *,
+    request_id: str,
+    subject: str | None,
+    cfg: AppConfig,
+) -> dict[str, Any]:
+    """按 request_id 幂等发送，并准确区分 SMTP 与归档状态。"""
+    try:
+        require_send_config(cfg)
+        source_path = assert_within_allowed_roots(
+            Path(file_path), cfg.effective_allowed_send_roots
+        )
+    except (SecurityError, Exception) as exc:
+        return _send_error_result(request_id, "file_validation_failed", str(exc))
+
+    if not source_path.exists() or not source_path.is_file():
+        return _send_error_result(request_id, "file_validation_failed", "待发送文件不存在")
+    if is_dangerous(source_path.name):
+        return _send_error_result(request_id, "file_validation_failed", "危险扩展名文件禁止发送")
+    size_bytes = source_path.stat().st_size
+    if not check_size_ok(size_bytes, cfg.max_send_file_bytes):
+        return _send_error_result(request_id, "file_validation_failed", "文件超过发送大小限制")
+
+    sha = sha256_of_file(source_path)
+    actual_subject = subject or f"Agent执行结果 - {source_path.name}"
+    attempt_state, previous = create_or_retry_send_attempt(
+        cfg.db_path,
+        request_id=request_id,
+        source_path=str(source_path),
+        sha256=sha,
+        subject=actual_subject,
+        from_email=cfg.qq_email,
+        to_email=cfg.owner_gmail,
+    )
+    if attempt_state == "duplicate":
+        return {
+            "ok": False,
+            "status": "duplicate",
+            "send_status": "duplicate",
+            "request_id": request_id,
+            "error_code": "duplicate_request",
+            "error": "相同发送请求已执行或正在执行，未重复发信",
+            "previous_status": previous.get("status"),
+        }
+
+    now = now_local()
+    try:
+        send_copy_path = build_send_copy_path(cfg, source_path, now)
+        copy_file(source_path, send_copy_path)
+    except Exception as exc:  # noqa: BLE001
+        error = f"创建 send 副本失败：{exc}"
+        update_send_attempt(
+            cfg.db_path, request_id, status="failed", error_message=error
+        )
+        return _send_error_result(request_id, "file_copy_failed", error)
+
+    try:
+        message = _build_email(
+            cfg=cfg,
+            subject=actual_subject,
+            file_path=send_copy_path,
+            source_name=source_path.name,
+        )
+        _smtp_send_with_stage(cfg, message)
+    except SmtpStageError as exc:
+        error = str(exc)
+        update_send_attempt(
+            cfg.db_path, request_id, status="failed",
+            send_copy_path=str(send_copy_path), error_message=error,
+        )
+        return _send_error_result(request_id, f"smtp_{exc.stage}_failed", error)
+
+    sent_at = fmt_datetime(now_local())
+    update_send_attempt(
+        cfg.db_path, request_id, status="sent",
+        send_copy_path=str(send_copy_path), sent_at=sent_at,
+    )
+    try:
+        sent_copy_path = build_sent_copy_path(cfg, source_path, now)
+        copy_file(send_copy_path, sent_copy_path)
+    except Exception as exc:  # noqa: BLE001
+        error = f"SMTP 已发送，但本地 sent 归档失败：{exc}"
+        update_send_attempt(
+            cfg.db_path, request_id, status="sent_archive_failed",
+            sent_at=sent_at, error_message=error,
+        )
+        return {
+            "ok": True,
+            "status": "partial",
+            "send_status": "sent_archive_failed",
+            "request_id": request_id,
+            "error_code": "sent_archive_failed",
+            "error": error,
+            "source_path": str(source_path),
+            "send_copy_path": str(send_copy_path),
+            "sent_copy_path": "",
+            "subject": actual_subject,
+            "to": cfg.owner_gmail,
+            "sent_at": sent_at,
+        }
+
+    update_send_attempt(
+        cfg.db_path, request_id, status="sent",
+        sent_copy_path=str(sent_copy_path), sent_at=sent_at,
+    )
+    return {
+        "ok": True,
+        "status": "success",
+        "send_status": "sent",
+        "request_id": request_id,
+        "source_path": str(source_path),
+        "send_copy_path": str(send_copy_path),
+        "sent_copy_path": str(sent_copy_path),
+        "subject": actual_subject,
+        "to": cfg.owner_gmail,
+        "sent_at": sent_at,
+    }
+
+
+def _send_error_result(request_id: str, error_code: str, message: str) -> dict[str, Any]:
+    """构造未发送或发送失败结果。"""
+    send_status = (
+        "not_sent"
+        if error_code in {"file_validation_failed", "file_copy_failed"}
+        else "failed"
+    )
+    return {
+        "ok": False,
+        "status": "failed",
+        "send_status": send_status,
+        "request_id": request_id,
+        "error_code": error_code,
+        "error": message,
+    }
 
 
 def _record_failure(

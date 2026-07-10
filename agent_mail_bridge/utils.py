@@ -19,6 +19,11 @@ from pathlib import Path
 _INVALID_FILENAME_CHARS = r'<>:"/\\|?*\x00'
 # 文件名最大长度（含扩展名），超出截断
 MAX_FILENAME_LEN = 80
+_WINDOWS_RESERVED_NAMES = {
+    "con", "prn", "aux", "nul",
+    *(f"com{number}" for number in range(1, 10)),
+    *(f"lpt{number}" for number in range(1, 10)),
+}
 
 
 def now_local() -> datetime:
@@ -68,6 +73,8 @@ def sanitize_filename(name: str, max_len: int = MAX_FILENAME_LEN) -> str:
         cleaned = cleaned[:max_len].rstrip()
     if not cleaned:
         cleaned = "untitled"
+    if Path(cleaned).stem.lower() in _WINDOWS_RESERVED_NAMES:
+        cleaned = f"_{cleaned}"
     return cleaned
 
 

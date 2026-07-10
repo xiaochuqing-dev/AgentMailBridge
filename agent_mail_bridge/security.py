@@ -10,12 +10,21 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 # 危险扩展名：仅给出 warning，不自动执行 / 不删除
 DANGEROUS_EXTENSIONS = {
     ".exe", ".bat", ".cmd", ".ps1", ".sh", ".msi",
     ".com", ".scr", ".vbs", ".js", ".jar", ".wsf", ".cpl",
 }
+
+WINDOWS_RESERVED_NAMES = {
+    "con", "prn", "aux", "nul",
+    *(f"com{number}" for number in range(1, 10)),
+    *(f"lpt{number}" for number in range(1, 10)),
+}
+
+_INVALID_WINDOWS_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 # 收件允许保存的附件扩展名白名单
 ALLOWED_ATTACHMENT_EXTENSIONS = {
@@ -53,6 +62,17 @@ def is_sendable(filename: str) -> bool:
     return not is_dangerous(filename)
 
 
+def validate_local_filename(filename: str) -> None:
+    """拒绝路径分隔符、Windows 保留名和非法字符。"""
+    value = filename.strip().rstrip(". ")
+    if not value or value in {".", ".."}:
+        raise SecurityError("文件名为空或非法")
+    if _INVALID_WINDOWS_CHARS.search(value):
+        raise SecurityError(f"文件名包含非法字符：{filename}")
+    if Path(value).stem.lower() in WINDOWS_RESERVED_NAMES:
+        raise SecurityError(f"Windows 保留文件名不可使用：{filename}")
+
+
 def assert_within_root(path: Path, root: Path) -> None:
     """断言 path 解析后的绝对路径位于 root 之内，防止路径越权。"""
     try:
@@ -66,6 +86,19 @@ def assert_within_root(path: Path, root: Path) -> None:
         raise SecurityError(
             f"路径越权：{path_resolved} 不在根目录 {root_resolved} 之内"
         ) from exc
+
+
+def assert_within_allowed_roots(path: Path, roots: list[Path]) -> Path:
+    """验证路径位于任一明确白名单目录并返回解析后的路径。"""
+    resolved = Path(path).resolve()
+    for root in roots:
+        try:
+            resolved.relative_to(Path(root).resolve())
+            return resolved
+        except ValueError:
+            continue
+    allowed = "、".join(str(Path(root).resolve()) for root in roots)
+    raise SecurityError(f"路径越权：{resolved} 不在允许目录 {allowed} 内")
 
 
 def check_size_ok(size_bytes: int, max_bytes: int) -> bool:

@@ -20,6 +20,8 @@ dist/
 *.egg
 .eggs/
 .pytest_cache/
+test-output/
+*.log
 .tox/
 .coverage
 .coverage.*

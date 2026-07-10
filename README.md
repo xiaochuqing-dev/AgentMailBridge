@@ -3,7 +3,7 @@
 面向 AI Agent 工作流的本地邮箱桥接工具。
 
 本仓库已完成：
-- **第一阶段**：核心业务逻辑 + 命令行 CLI（不含 GUI、不含 MCP）。
+- **第一批次收口**：统一应用服务 + 命令行 CLI + 最小 GUI 骨架（不含 MCP 与最终视觉设计）。
 - **第二阶段**：Gmail IMAP 网络适配层（direct / socks5 / auto）+ 连接诊断命令，解决国内复杂网络环境下的 Gmail IMAP 连接问题。
 
 ---
@@ -554,3 +554,30 @@ agent_mail_bridge/
 - [ ] ProjectFlow 集成
 - [ ] 系统密钥环（keyring）存储密钥，替代 `.env`
 - [ ] QQ SMTP SOCKS5 适配（当前仅预留配置键）
+
+## 十七、第一批次核心收口说明
+
+AgentMailBridge 是本地优先、单用户、Windows 优先的桌面邮箱桥接工具。它不是多用户 SaaS、通用邮箱客户端或 ChatGPT Work 的竞品。邮箱凭据与 OAuth token 只由本地工具管理，Agent 通过受控应用服务处理本地文件，不直接持有邮箱权限。
+
+当前收件后端包括 Gmail IMAP 与 Gmail API。IMAP 适合 993 端口可用且已配置应用专用密码的环境；Gmail API 通过 HTTPS 443 和只读 OAuth 工作，适合 IMAP 端口不可达的环境。Gmail API 模式不要求应用专用密码，IMAP 模式不要求 credentials.json 或 token.json。
+
+CLI 和最小 GUI 均调用 `ApplicationService`。两个收件后端只负责读取并转换邮件，之后共同使用地址判断、Message-ID 归一化、MIME 结果保存、SQLite 去重和结构化结果流程。SQLite 使用 WAL、5 秒 busy timeout、短事务及唯一约束。QQ SMTP 使用 request_id 防止重复发送，并区分 sent、failed、sent_archive_failed 和 duplicate。
+
+最小 GUI 只验证接入方式，提供连接状态、手动收件、选择文件发送、今日文件、最近日志、任务状态和错误显示。长任务在后台线程执行，运行期间禁止重复点击。最终界面将在后续批次按设计图实现。
+
+启动命令：
+
+```bash
+python -m agent_mail_bridge init
+python -m agent_mail_bridge receive
+python -m agent_mail_bridge send --file AgentMailBridgeData/send/result.txt --request-id example-001
+python -m agent_mail_bridge diagnose-gmail
+python -m agent_mail_bridge diagnose-gmail-api
+python -m agent_mail_bridge diagnose-qq-smtp
+python -m agent_mail_bridge.gui
+python -m pytest -q
+```
+
+安全边界：`.env`、`credentials.json`、`token.json`、`secrets/`、日志和用户数据目录均被 Git 忽略。发送文件必须位于 DATA_ROOT 或 ALLOWED_SEND_ROOTS 明确列出的目录。危险附件只保存并标记，不自动执行、打开或解压。自动化测试强制禁用项目 `.env`，OAuth 文件和数据目录均指向 pytest 临时目录。
+
+当前限制：仅支持本地单用户；收件人固定为绑定 Gmail；不支持多租户、MCP、后台自动收件、托盘、系统通知、开机启动和正式安装包；最小 GUI 不是最终 UI。

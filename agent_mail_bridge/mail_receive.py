@@ -19,6 +19,7 @@ import imaplib
 import mimetypes
 import re
 from email.message import Message
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,12 @@ from agent_mail_bridge.database import (
     message_id_exists,
 )
 from agent_mail_bridge.logging_setup import get_logger
+from agent_mail_bridge.mail_common import (
+    AttachmentData,
+    NormalizedMail,
+    attachment_security_status,
+)
+from agent_mail_bridge.mail_processing import process_normalized_mail
 from agent_mail_bridge.security import (
     is_attachment_allowed,
     is_dangerous,
@@ -154,6 +161,10 @@ def _receive_via_imap(
         "saved": 0,
         "skipped": 0,
         "attachments": 0,
+        "accepted": 0,
+        "duplicates": 0,
+        "failed": 0,
+        "saved_files": [],
         "errors": [],
     }
 
@@ -209,13 +220,14 @@ def _receive_via_imap(
 
         for uid in uids:
             try:
-                _process_one(conn, uid, cfg, gmail_addr, mark_seen, result)
+                _process_one_unified(conn, uid, cfg, mark_seen, result)
             except Exception as exc:  # noqa: BLE001
                 err = f"处理邮件 uid={uid.decode(errors='replace')} 失败：{exc}"
                 logger.exception("处理邮件失败")
                 logger.error(err)
                 log_event(cfg.db_path, "ERROR", "receive", err)
                 result["errors"].append(err)
+                result["failed"] += 1
 
         log_event(
             cfg.db_path,
@@ -392,6 +404,102 @@ def _process_one(
         f"已保存邮件：{subject or '(无标题)'} | 附件 {len(attachments)} 个",
     )
     logger.info("已保存邮件：%s（附件 %d 个）", subject, len(attachments))
+
+
+def _process_one_unified(
+    conn: imaplib.IMAP4_SSL,
+    uid: bytes,
+    cfg: AppConfig,
+    mark_seen: bool,
+    result: dict[str, Any],
+) -> None:
+    """把 IMAP 原始邮件转换后交给统一业务流程。"""
+    fetch_typ, fetch_data = conn.fetch(uid, "(RFC822)")
+    if fetch_typ != "OK" or not fetch_data or not fetch_data[0]:
+        raise RuntimeError("IMAP 未返回邮件原文")
+    raw = fetch_data[0][1]
+    msg = email.message_from_bytes(raw)
+    received_dt = _message_datetime(msg)
+    body_text, attachments = _extract_message_content(msg, cfg)
+    normalized = NormalizedMail(
+        backend="imap",
+        message_id=msg.get("Message-ID", ""),
+        backend_message_id="",
+        thread_id="",
+        uid=uid.decode(errors="replace"),
+        from_raw=", ".join(msg.get_all("From", [])),
+        to_raw=", ".join(msg.get_all("To", [])),
+        cc_raw=", ".join(msg.get_all("Cc", [])),
+        subject=decode_mime_header(msg.get("Subject", "")),
+        received_at=fmt_datetime(received_dt),
+        saved_date=received_dt.strftime("%Y-%m-%d"),
+        body_text=body_text,
+        attachments=attachments,
+    )
+    single = process_normalized_mail(cfg, normalized)
+    status = single["status"]
+    if status == "saved":
+        result["accepted"] += 1
+        result["saved"] += 1
+        result["attachments"] += single.get("attachments", 0)
+        result["saved_files"].extend(single.get("saved_files", []))
+    elif status == "duplicate":
+        result["duplicates"] += 1
+        result["skipped"] += 1
+    else:
+        result["skipped"] += 1
+    if mark_seen and status in {"saved", "duplicate"}:
+        conn.store(uid, "+FLAGS", "\\Seen")
+
+
+def _message_datetime(msg: Message):
+    """优先使用邮件 Date，解析失败时使用本地当前时间。"""
+    try:
+        parsed = parsedate_to_datetime(msg.get("Date", ""))
+        if parsed is None:
+            return now_local()
+        if parsed.tzinfo is not None:
+            return parsed.astimezone().replace(tzinfo=None)
+        return parsed
+    except (TypeError, ValueError, OverflowError):
+        return now_local()
+
+
+def _extract_message_content(
+    msg: Message, cfg: AppConfig
+) -> tuple[str, list[AttachmentData]]:
+    """提取 MIME 正文和附件，不在后端适配阶段落盘。"""
+    plain_parts: list[str] = []
+    html_parts: list[str] = []
+    attachments: list[AttachmentData] = []
+    for part in msg.walk() if msg.is_multipart() else [msg]:
+        if part.is_multipart():
+            continue
+        filename = decode_mime_header(part.get_filename())
+        disposition = (part.get_content_disposition() or "").lower()
+        payload = part.get_payload(decode=True) or b""
+        content_type = part.get_content_type()
+        if filename or disposition in {"attachment", "inline"} and content_type not in {
+            "text/plain", "text/html"
+        }:
+            safe_name = sanitize_filename(filename or "未命名附件", max_len=120)
+            if check_size_ok(len(payload), cfg.max_attachment_bytes):
+                attachments.append(AttachmentData(
+                    filename=safe_name,
+                    content=payload,
+                    mime_type=content_type,
+                    security_status=attachment_security_status(safe_name),
+                ))
+            continue
+        text = _decode_payload_text(part)
+        if content_type == "text/plain" and text:
+            plain_parts.append(text)
+        elif content_type == "text/html" and text:
+            html_parts.append(text)
+    body = "\n\n".join(plain_parts).strip()
+    if not body:
+        body = _html_to_text("\n".join(html_parts))
+    return body, attachments
 
 
 # ============================================================

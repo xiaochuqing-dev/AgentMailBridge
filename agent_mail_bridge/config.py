@@ -164,6 +164,8 @@ class AppConfig:
 
     # --- 本地数据目录 ---
     data_root: Path = field(default_factory=lambda: PROJECT_ROOT / "AgentMailBridgeData")
+    # 允许应用服务读取并发送文件的额外目录；默认只允许 DATA_ROOT。
+    allowed_send_roots: list[Path] = field(default_factory=list)
 
     # --- 收件规则 ---
     auto_receive_only_self_mail: bool = True
@@ -213,6 +215,12 @@ class AppConfig:
         return self.max_send_file_mb * 1024 * 1024
 
     @property
+    def effective_allowed_send_roots(self) -> list[Path]:
+        """返回包含 DATA_ROOT 的明确发送路径白名单。"""
+        roots = [self.data_root_path, *self.allowed_send_roots]
+        return list(dict.fromkeys(Path(item).resolve() for item in roots))
+
+    @property
     def gmail_api_scopes_str(self) -> str:
         """Gmail API scopes 的字符串表示（逗号分隔），便于诊断输出。"""
         return ",".join(self.gmail_api_scopes)
@@ -252,6 +260,7 @@ class AppConfig:
             "qq_smtp_connect_timeout": self.qq_smtp_connect_timeout,
             "owner_gmail": self.owner_gmail,
             "data_root": str(self.data_root_path),
+            "allowed_send_roots": [str(item) for item in self.effective_allowed_send_roots],
             "auto_receive_only_self_mail": self.auto_receive_only_self_mail,
             "max_fetch_limit": self.max_fetch_limit,
             "receive_unseen_only": self.receive_unseen_only,
@@ -288,7 +297,9 @@ def load_config(env_path: Path | str | None = None) -> AppConfig:
     注意：本函数只负责读取，不强制要求所有字段都填写。
     收 / 发件时再按需校验。
     """
-    if load_dotenv is not None:
+    if load_dotenv is not None and not _as_bool(
+        os.getenv("AGENT_MAIL_BRIDGE_DISABLE_DOTENV"), False
+    ):
         env_file = Path(env_path) if env_path else PROJECT_ROOT / ".env"
         if env_file.exists():
             load_dotenv(env_file, override=False)
@@ -298,6 +309,11 @@ def load_config(env_path: Path | str | None = None) -> AppConfig:
     if not data_root.is_absolute():
         data_root = (PROJECT_ROOT / data_root).resolve()
 
+    allowed_send_roots = []
+    for raw_path in os.getenv("ALLOWED_SEND_ROOTS", "").split(os.pathsep):
+        if raw_path.strip():
+            allowed_send_roots.append(_resolve_path(raw_path, raw_path))
+
     cfg = AppConfig(
         gmail_address=os.getenv("GMAIL_ADDRESS", "").strip(),
         gmail_app_password=os.getenv("GMAIL_APP_PASSWORD", "").strip(),
@@ -306,7 +322,9 @@ def load_config(env_path: Path | str | None = None) -> AppConfig:
         gmail_network_mode=_parse_network_mode(
             os.getenv("GMAIL_NETWORK_MODE"), "GMAIL_NETWORK_MODE", "auto"
         ),
-        gmail_connect_timeout=_as_int(os.getenv("GMAIL_CONNECT_TIMEOUT"), 20),
+        gmail_connect_timeout=_as_positive_int(
+            os.getenv("GMAIL_CONNECT_TIMEOUT"), "GMAIL_CONNECT_TIMEOUT", 20
+        ),
         gmail_socks5_host=os.getenv("GMAIL_SOCKS5_HOST", "127.0.0.1").strip(),
         gmail_socks5_port=_parse_port_strict(
             os.getenv("GMAIL_SOCKS5_PORT"), "GMAIL_SOCKS5_PORT"
@@ -340,7 +358,9 @@ def load_config(env_path: Path | str | None = None) -> AppConfig:
         qq_smtp_network_mode=_parse_network_mode(
             os.getenv("QQ_SMTP_NETWORK_MODE"), "QQ_SMTP_NETWORK_MODE", "direct"
         ),
-        qq_smtp_connect_timeout=_as_int(os.getenv("QQ_SMTP_CONNECT_TIMEOUT"), 20),
+        qq_smtp_connect_timeout=_as_positive_int(
+            os.getenv("QQ_SMTP_CONNECT_TIMEOUT"), "QQ_SMTP_CONNECT_TIMEOUT", 20
+        ),
         qq_smtp_socks5_host=os.getenv("QQ_SMTP_SOCKS5_HOST", "").strip(),
         qq_smtp_socks5_port=_parse_port_strict(
             os.getenv("QQ_SMTP_SOCKS5_PORT"), "QQ_SMTP_SOCKS5_PORT"
@@ -350,6 +370,7 @@ def load_config(env_path: Path | str | None = None) -> AppConfig:
         ),
         owner_gmail=os.getenv("OWNER_GMAIL", "").strip(),
         data_root=data_root,
+        allowed_send_roots=allowed_send_roots,
         auto_receive_only_self_mail=_as_bool(
             os.getenv("AUTO_RECEIVE_ONLY_SELF_MAIL"), True
         ),
@@ -363,6 +384,17 @@ def load_config(env_path: Path | str | None = None) -> AppConfig:
     return cfg
 
 
+def require_readonly_gmail_scope(cfg: AppConfig) -> None:
+    """拒绝缺失或扩大 Gmail API 权限。"""
+    expected = {_DEFAULT_GMAIL_API_SCOPES}
+    actual = set(cfg.gmail_api_scopes)
+    if actual != expected:
+        raise ConfigError(
+            "GMAIL_API_SCOPES 必须且只能是 "
+            f"{_DEFAULT_GMAIL_API_SCOPES}，当前配置已拒绝。"
+        )
+
+
 def require_receive_config(cfg: AppConfig) -> None:
     """收件前校验必需配置，缺失时给出明确错误。
 
@@ -373,6 +405,7 @@ def require_receive_config(cfg: AppConfig) -> None:
     """
     backend = _effective_receive_backend(cfg)
     if backend == "gmail_api":
+        require_readonly_gmail_scope(cfg)
         missing: list[str] = []
         if not cfg.gmail_address:
             missing.append("GMAIL_ADDRESS")

@@ -48,7 +48,11 @@ class TestNetworkMode:
         assert load_config().gmail_network_mode == "direct"
 
     def test_socks5(self, monkeypatch):
-        _set_env(monkeypatch, GMAIL_NETWORK_MODE="socks5")
+        _set_env(
+            monkeypatch,
+            GMAIL_NETWORK_MODE="socks5",
+            GMAIL_APP_PASSWORD="test-app-password",
+        )
         assert load_config().gmail_network_mode == "socks5"
 
     def test_auto(self, monkeypatch):
@@ -136,7 +140,11 @@ class TestRequireGmailNetworkConfig:
 
 class TestMaskNoSecretLeak:
     def test_mask_has_network_fields_no_password(self, monkeypatch):
-        _set_env(monkeypatch, GMAIL_NETWORK_MODE="socks5")
+        _set_env(
+            monkeypatch,
+            GMAIL_NETWORK_MODE="socks5",
+            GMAIL_APP_PASSWORD="test-app-password",
+        )
         cfg = load_config()
         masked = cfg.mask()
         assert "gmail_network_mode" in masked

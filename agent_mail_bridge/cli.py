@@ -22,6 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from agent_mail_bridge.application_service import ApplicationService
 from agent_mail_bridge.config import (
     ConfigError,
     load_config,
@@ -67,7 +68,7 @@ def _resolve_date(date_str: str | None) -> str:
 # ============================================================
 
 def cmd_init(args, cfg) -> int:
-    _setup(cfg)
+    ApplicationService(cfg).initialize()
     logger = get_logger("cli")
     logger.info("初始化完成：%s", cfg.data_root_path)
     log_event(cfg.db_path, "SUCCESS", "config",
@@ -82,60 +83,48 @@ def cmd_init(args, cfg) -> int:
 
 
 def cmd_receive(args, cfg) -> int:
-    _setup(cfg)
-    try:
-        require_receive_config(cfg)
-    except ConfigError as exc:
-        print(f"[ERROR] {exc}", file=sys.stderr)
-        return 2
-
-    result = receive_mails(
-        cfg,
+    result = ApplicationService(cfg).receive(
         limit=args.limit,
         unseen_only=args.unseen_only,
         mark_seen=args.mark_seen,
     )
-    backend = result.get("backend", "?")
-    print(f"收件后端：{backend}")
-    print(f"扫描邮件数：{result['fetched']}")
-    print(f"新保存邮件：{result['saved']}")
-    print(f"跳过(已记录)：{result['skipped']}")
-    print(f"保存附件数：{result['attachments']}")
-    if result["errors"]:
+    print(f"收件后端：{result.backend}")
+    print(f"扫描邮件数：{result.scanned}")
+    print(f"新保存邮件：{result.saved}")
+    print(f"跳过邮件：{result.skipped}")
+    print(f"重复邮件：{result.duplicates}")
+    print(f"保存附件数：{result.attachments}")
+    if result.errors or not result.ok:
         print("错误：", file=sys.stderr)
-        for e in result["errors"]:
+        for e in result.errors or [result.message]:
             print(f"  - {e}", file=sys.stderr)
-        return 1 if not result["ok"] else 0
+        return 1 if not result.ok else 0
     return 0
 
 
 def cmd_send(args, cfg) -> int:
-    _setup(cfg)
-    try:
-        require_send_config(cfg)
-    except ConfigError as exc:
-        print(f"[ERROR] {exc}", file=sys.stderr)
-        return 2
-
-    result = send_file_to_owner_gmail(args.file, subject=args.subject, cfg=cfg)
-    if result["ok"]:
-        print("[OK] 发送成功")
-        print(f"  主题:    {result['subject']}")
-        print(f"  源文件:  {result['source_path']}")
-        print(f"  send副本:{result['send_copy_path']}")
-        print(f"  sent副本:{result['sent_copy_path']}")
-        print(f"  收件人:  {result['to']}")
-        print(f"  发送时间:{result['sent_at']}")
+    result = ApplicationService(cfg).send_file(
+        args.file, subject=args.subject, request_id=args.request_id
+    )
+    if result.ok:
+        print(f"[OK] 发送状态：{result.send_status}")
+        print(f"  请求标识:{result.request_id}")
+        print(f"  主题:    {result.subject}")
+        print(f"  源文件:  {result.source_path}")
+        print(f"  send副本:{result.send_copy_path}")
+        print(f"  sent副本:{result.sent_copy_path or '—'}")
+        print(f"  收件人:  {result.to_email}")
+        print(f"  发送时间:{result.sent_at}")
         return 0
     else:
-        print(f"[ERROR] 发送失败：{result['error']}", file=sys.stderr)
+        print(f"[ERROR] 发送失败：{result.message}", file=sys.stderr)
         return 1
 
 
 def cmd_list_received(args, cfg) -> int:
     _setup(cfg)
     date_str = _resolve_date(args.date)
-    files = list_received_files_for_date(cfg, date_str)
+    files = ApplicationService(cfg).get_received_files(date_str).details["files"]
     print(f"=== {date_str} 收到的文件（共 {len(files)} 个）===")
     if not files:
         print("（无）")
@@ -160,7 +149,7 @@ def cmd_list_received(args, cfg) -> int:
 def cmd_list_sent(args, cfg) -> int:
     _setup(cfg)
     date_str = _resolve_date(args.date)
-    rows = query_sent_files_by_date(cfg.db_path, date_str)
+    rows = ApplicationService(cfg).get_sent_files(date_str).details["files"]
     print(f"=== {date_str} 发送的文件（共 {len(rows)} 个）===")
     if not rows:
         print("（无）")
@@ -181,7 +170,7 @@ def cmd_list_sent(args, cfg) -> int:
 
 def cmd_scan_status(args, cfg) -> int:
     _setup(cfg)
-    changes = scan_file_status(cfg)
+    changes = ApplicationService(cfg).scan_file_status().details["changes"]
     print(f"=== 文件状态扫描完成（变化 {len(changes)} 处）===")
     if not changes:
         print("所有文件状态正常。")
@@ -195,7 +184,7 @@ def cmd_scan_status(args, cfg) -> int:
 
 
 def cmd_show_config(args, cfg) -> int:
-    _setup(cfg)
+    ApplicationService(cfg).initialize()
     print("=== 当前配置（脱敏）===")
     for k, v in cfg.mask().items():
         print(f"  {k}: {v}")
@@ -203,9 +192,9 @@ def cmd_show_config(args, cfg) -> int:
 
 
 def cmd_diagnose_gmail(args, cfg) -> int:
-    # 诊断命令不写数据库、不建目录，只做网络诊断输出
-    from agent_mail_bridge.diagnose import run_diagnose_gmail
-    return run_diagnose_gmail(cfg)
+    result = ApplicationService(cfg).diagnose_imap()
+    print(result.message)
+    return 0 if result.ok else 1
 
 
 def cmd_diagnose_network(args, cfg) -> int:
@@ -230,37 +219,31 @@ def cmd_gmail_api_auth(args, cfg) -> int:
     print(f"  GMAIL_API_SCOPES           = {cfg.gmail_api_scopes_str}")
     print()
 
-    try:
-        service = get_gmail_api_service(cfg)
-    except CredentialsNotFoundError as exc:
-        print(f"[ERROR] {exc}", file=sys.stderr)
-        return 2
-    except GmailApiAuthError as exc:
-        print(f"[ERROR] {exc}", file=sys.stderr)
-        return 1
-
-    # 验证 service 可用：获取 profile
-    try:
-        profile = service.users().getProfile(userId="me").execute()
-        email_addr = profile.get("emailAddress", "(未知)")
+    result = ApplicationService(cfg).authorize_gmail_api()
+    if result.ok:
+        email_addr = result.details.get("email", "(未知)")
         print(f"[OK] Gmail API 授权成功")
         print(f"     授权账号：{email_addr}")
         print(f"     token 已保存到：{cfg.gmail_api_token_path}")
         log_event(cfg.db_path, "SUCCESS", "config",
                   f"Gmail API 授权成功：{email_addr}")
         return 0
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Gmail API profile 获取失败")
-        print(f"[WARN] 授权已完成，但 profile 获取失败：{exc}", file=sys.stderr)
-        print(f"       token 已保存到：{cfg.gmail_api_token_path}", file=sys.stderr)
-        print("       可运行 diagnose-gmail-api 进一步排查。", file=sys.stderr)
-        return 1
+    print(f"[ERROR] {result.message}", file=sys.stderr)
+    return 1
 
 
 def cmd_diagnose_gmail_api(args, cfg) -> int:
     """Gmail API 诊断命令。"""
-    from agent_mail_bridge.diagnose import run_diagnose_gmail_api
-    return run_diagnose_gmail_api(cfg)
+    result = ApplicationService(cfg).diagnose_gmail_api()
+    print(result.message)
+    return 0 if result.ok else 1
+
+
+def cmd_diagnose_qq_smtp(args, cfg) -> int:
+    """QQ SMTP 连接与认证诊断。"""
+    result = ApplicationService(cfg).diagnose_qq_smtp()
+    print(result.message)
+    return 0 if result.ok else 1
 
 
 # ============================================================
@@ -301,6 +284,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_send = sub.add_parser("send", help="发送本地文件到 OWNER_GMAIL")
     p_send.add_argument("--file", required=True, help="待发送的本地文件路径")
     p_send.add_argument("--subject", default=None, help="邮件主题")
+    p_send.add_argument("--request-id", default=None, help="发送幂等请求标识")
 
     # list-received
     p_lr = sub.add_parser("list-received", help="列出某天收到的文件")
@@ -321,6 +305,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     # diagnose-gmail-api
     sub.add_parser("diagnose-gmail-api", help="诊断 Gmail API 收件后端")
+
+    # diagnose-qq-smtp
+    sub.add_parser("diagnose-qq-smtp", help="诊断 QQ SMTP 连接与认证")
 
     # gmail-api-auth
     sub.add_parser("gmail-api-auth", help="Gmail API OAuth 授权（首次浏览器授权 / token 刷新）")
@@ -347,6 +334,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_diagnose_network(args, cfg)
     if args.command == "diagnose-gmail-api":
         return cmd_diagnose_gmail_api(args, cfg)
+    if args.command == "diagnose-qq-smtp":
+        return cmd_diagnose_qq_smtp(args, cfg)
 
     _setup(cfg)
 

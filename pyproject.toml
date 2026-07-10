@@ -24,6 +24,7 @@ dev = ["pytest>=7.4.0"]
 
 [project.scripts]
 agent-mail-bridge = "agent_mail_bridge.cli:main"
+agent-mail-bridge-gui = "agent_mail_bridge.gui:main"
 
 [tool.setuptools.packages.find]
 include = ["agent_mail_bridge*"]
