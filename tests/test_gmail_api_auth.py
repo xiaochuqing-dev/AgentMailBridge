@@ -109,6 +109,34 @@ class TestTokenValid:
             # 不应调用 flow / run_local_server
             mock_build.assert_called_once()
 
+    def test_gmail_service_uses_configured_timeout(self, tmp_path):
+        cfg = _cfg(tmp_path, token_exists=True, expired=False)
+        cfg.gmail_connect_timeout = 17  # Gmail API 单次请求超时，单位：秒
+        with patch(
+            "agent_mail_bridge.gmail_api_auth.Credentials"
+        ) as MockCreds, patch(
+            "agent_mail_bridge.gmail_api_auth.httplib2.Http"
+        ) as MockHttp, patch(
+            "agent_mail_bridge.gmail_api_auth.AuthorizedHttp"
+        ) as MockAuthorizedHttp, patch(
+            "agent_mail_bridge.gmail_api_auth.build"
+        ) as mock_build:
+            fake_creds = MagicMock()
+            fake_creds.valid = True
+            fake_creds.expired = False
+            fake_creds.scopes = SCOPES
+            MockCreds.from_authorized_user_file.return_value = fake_creds
+            raw_http = MockHttp.return_value
+            authorized_http = MockAuthorizedHttp.return_value
+            mock_build.return_value = "fake_service"
+
+            assert get_gmail_api_service(cfg) == "fake_service"
+            MockHttp.assert_called_once_with(timeout=17)
+            MockAuthorizedHttp.assert_called_once_with(fake_creds, http=raw_http)
+            mock_build.assert_called_once_with(
+                "gmail", "v1", http=authorized_http, cache_discovery=False
+            )
+
 
 class TestTokenExpiredRefresh:
     def test_expired_token_refreshed(self, tmp_path):

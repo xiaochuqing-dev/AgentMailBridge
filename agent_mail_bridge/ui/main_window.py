@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QObject, QPoint, QRunnable, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QObject, QPoint, QRunnable, Qt, QThreadPool, QTimer, Signal, Slot
 from PySide6.QtGui import QCloseEvent, QColor, QFont, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -211,6 +211,8 @@ class BridgeWindow(QMainWindow):
         super().__init__()
         self.service = service
         self.task_active = False
+        self._active_runner: _TaskRunner | None = None
+        self._task_callback: Callable[[ServiceResult], None] | None = None
         self.closed = False
         self.thread_pool = QThreadPool.globalInstance()
         self.task_buttons: list[QPushButton] = []
@@ -283,7 +285,7 @@ class BridgeWindow(QMainWindow):
         label.setObjectName("fieldLabel")
         layout.addWidget(label)
         self.gmail_card = AccountCard("M", "Gmail（收件邮箱）", "未配置", "作为主要收件邮箱｜自动收取", "#EA4335")
-        self.qq_card = AccountCard("Q", "QQ邮箱（发件身份）", "未配置", "用于发送邮件附件", "#21A4E8")
+        self.qq_card = AccountCard("Q", "QQ 邮箱（发件）", "未配置", "用于发送邮件附件", "#21A4E8")
         self.gmail_card.clicked.connect(lambda: self.select_page("basic"))
         self.qq_card.clicked.connect(lambda: self.select_page("advanced"))
         layout.addWidget(self.gmail_card)
@@ -827,11 +829,6 @@ class BridgeWindow(QMainWindow):
         if backend == "imap" and not password.strip():
             self.show_message("IMAP 模式需要 Gmail 应用专用密码", "error")
             return
-        self.service.cfg.gmail_address = email
-        self.service.cfg.owner_gmail = email
-        self.service.cfg.gmail_app_password = password
-        self.service.cfg.gmail_receive_backend = backend
-        self.service.cfg.auto_receive_only_self_mail = self.self_mail_check.isChecked()
         minutes = int(self.interval_combo.currentData() or AUTO_RECEIVE_DEFAULT_MINUTES)
         try:
             save_env_values(
@@ -848,6 +845,11 @@ class BridgeWindow(QMainWindow):
         except OSError as exc:
             self.show_message(f"保存配置失败：{exc}", "error")
             return
+        self.service.cfg.gmail_address = email
+        self.service.cfg.owner_gmail = email
+        self.service.cfg.gmail_app_password = password
+        self.service.cfg.gmail_receive_backend = backend
+        self.service.cfg.auto_receive_only_self_mail = self.self_mail_check.isChecked()
         self.recipient_edit.setText(email)
         self.refresh()
         self.show_message("配置已安全保存并在当前运行中生效", "success")
@@ -862,11 +864,6 @@ class BridgeWindow(QMainWindow):
             self.show_message("QQ 邮箱和 SMTP 授权码必须同时填写", "error")
             return
         network_mode = str(self.network_combo.currentData())
-        self.service.cfg.qq_email = qq_email
-        self.service.cfg.qq_auth_code = qq_auth
-        self.service.cfg.gmail_network_mode = network_mode
-        self.service.cfg.max_fetch_limit = self.fetch_limit_spin.value()
-        self.service.cfg.max_send_file_mb = self.send_limit_spin.value()
         try:
             save_env_values(
                 {
@@ -880,6 +877,11 @@ class BridgeWindow(QMainWindow):
         except OSError as exc:
             self.show_message(f"保存高级设置失败：{exc}", "error")
             return
+        self.service.cfg.qq_email = qq_email
+        self.service.cfg.qq_auth_code = qq_auth
+        self.service.cfg.gmail_network_mode = network_mode
+        self.service.cfg.max_fetch_limit = self.fetch_limit_spin.value()
+        self.service.cfg.max_send_file_mb = self.send_limit_spin.value()
         self.refresh()
         self.show_message("高级设置已安全保存", "success")
 
@@ -1061,24 +1063,41 @@ class BridgeWindow(QMainWindow):
         for button in self.task_buttons:
             button.setEnabled(False)
         runner = _TaskRunner(operation)
-        runner.signals.finished.connect(lambda result: self._finish_task(result, callback))
+        self._task_callback = callback
+        runner.signals.finished.connect(self._finish_task)
+        # 保留 Python 包装对象，避免任务完成前信号对象被回收。
+        self._active_runner = runner
         self.thread_pool.start(runner)
 
-    def _finish_task(self, result: ServiceResult, callback: Callable[[ServiceResult], None]) -> None:
+    @Slot(object)
+    def _finish_task(self, result: ServiceResult) -> None:
+        """在 GUI 线程完成状态更新和结果展示。"""
+        callback = self._task_callback
+        self._task_callback = None
+        self._active_runner = None
         if self.closed:
             return
         self.task_active = False
         for button in self.task_buttons:
             button.setEnabled(True)
         self.refresh()
-        callback(result)
+        if callback is not None:
+            callback(result)
 
     def _show_receive_result(self, result: ServiceResult) -> None:
         if isinstance(result, ReceiveResult):
-            message = (
+            summary = (
                 f"收件完成：扫描 {result.scanned}，保存 {result.saved}，"
                 f"重复 {result.duplicates}，失败 {result.failed}"
             )
+            if result.status in {OperationStatus.FAILED, OperationStatus.AUTH_REQUIRED}:
+                reason = result.message or (result.errors[0] if result.errors else result.error_code)
+                message = f"收件失败：{reason or '原因未知'}；{summary}"
+            elif result.status == OperationStatus.PARTIAL:
+                reason = result.message or (result.errors[0] if result.errors else "部分邮件处理失败")
+                message = f"{summary}；{reason}"
+            else:
+                message = summary
         else:
             message = result.message or result.status.value
         self.show_message(message, "success" if result.ok else "error")

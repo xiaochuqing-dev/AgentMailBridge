@@ -38,13 +38,17 @@ def _serialized_oauth(func):
 # Gmail API 客户端库（必装依赖）。提到模块级以便单元测试 mock，
 # 同时用 try/except 防御：未安装时仍可导入本模块，调用时给出友好错误。
 try:
+    import httplib2
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
+    from google_auth_httplib2 import AuthorizedHttp
     from google_auth_oauthlib.flow import InstalledAppFlow
     from googleapiclient.discovery import build
 except ImportError:  # pragma: no cover - 仅在未安装依赖时触发
+    httplib2 = None  # type: ignore[assignment]
     Request = None  # type: ignore[assignment]
     Credentials = None  # type: ignore[assignment]
+    AuthorizedHttp = None  # type: ignore[assignment]
     InstalledAppFlow = None  # type: ignore[assignment]
     build = None  # type: ignore[assignment]
 
@@ -106,7 +110,7 @@ def get_gmail_api_service(cfg: AppConfig, *, interactive: bool = True) -> Any:
     if creds is not None and creds.valid:
         _ensure_scopes_match(creds, scopes)
         logger.info("Gmail API token 有效，直接复用。")
-        return build("gmail", "v1", credentials=creds)
+        return _build_gmail_service(cfg, creds)
 
     # ---- 3. token 过期但有 refresh_token，刷新 ----
     if creds is not None and creds.expired and creds.refresh_token:
@@ -120,7 +124,7 @@ def get_gmail_api_service(cfg: AppConfig, *, interactive: bool = True) -> Any:
                 "python -m agent_mail_bridge gmail-api-auth"
             ) from exc
         _save_token(creds, token_path)
-        return build("gmail", "v1", credentials=creds)
+        return _build_gmail_service(cfg, creds)
 
     # ---- 4. 无可用 token，启动浏览器授权 ----
     if not credentials_path.exists():
@@ -152,7 +156,21 @@ def get_gmail_api_service(cfg: AppConfig, *, interactive: bool = True) -> Any:
 
     _save_token(creds, token_path)
     logger.info("Gmail API 授权成功，token 已保存。")
-    return build("gmail", "v1", credentials=creds)
+    return _build_gmail_service(cfg, creds)
+
+
+def _build_gmail_service(cfg: AppConfig, creds: Any) -> Any:
+    """创建带明确网络超时的 Gmail API 客户端。"""
+    if httplib2 is None or AuthorizedHttp is None or build is None:
+        raise GmailApiAuthError(
+            "Gmail API 依赖未安装。请运行：pip install -r requirements.txt"
+        )
+    # 每个 HTTPS 请求最多等待配置秒数，避免 GUI 后台任务无限挂起。
+    http = httplib2.Http(timeout=cfg.gmail_connect_timeout)
+    authorized_http = AuthorizedHttp(creds, http=http)
+    return build(
+        "gmail", "v1", http=authorized_http, cache_discovery=False
+    )
 
 
 def _ensure_scopes_match(creds: Any, scopes: list[str]) -> None:

@@ -159,7 +159,8 @@ class StatusRow(QWidget):
         name = QLabel(label)
         name.setStyleSheet("font-size: 10px; color: #5E6270;")
         self.value_label = QLabel(value)
-        self.value_label.setMinimumWidth(92)
+        # 126 像素可容纳完整日期和常见邮箱，避免高 DPI 下左侧截断。
+        self.value_label.setMinimumWidth(126)
         self.value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.value_label.setStyleSheet("font-size: 10px; color: #4E5260;")
         layout.addWidget(icon_label)

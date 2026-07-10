@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import QThread
 from PySide6.QtWidgets import QApplication
 
 from agent_mail_bridge.application_service import ApplicationService
+from agent_mail_bridge.models import OperationStatus, ReceiveResult, ServiceResult
 from agent_mail_bridge.ui.main_window import AUTO_RECEIVE_DEFAULT_MINUTES, BridgeWindow
 from agent_mail_bridge.ui.settings_store import save_env_values
 from agent_mail_bridge.ui.theme import build_stylesheet, load_interface_font
@@ -42,6 +45,10 @@ def test_formal_gui_uses_reference_three_column_layout(bridge_window):
     assert bridge_window.central_panel.width() >= 620
     assert set(bridge_window.pages) == {"basic", "inbox", "send", "advanced", "history", "logs"}
     assert set(bridge_window.tab_buttons) == {"basic", "inbox", "send", "advanced"}
+    assert all(
+        row.value_label.minimumWidth() >= 126
+        for row in bridge_window.service_rows.values()
+    )
 
 
 def test_navigation_switches_real_pages(bridge_window):
@@ -64,6 +71,45 @@ def test_auto_receive_interval_uses_minutes(bridge_window):
     assert not bridge_window.auto_timer.isActive()
 
 
+def test_background_task_completion_reaches_gui(bridge_window, qt_app):
+    completed: list[ServiceResult] = []
+    callback_on_gui_thread: list[bool] = []
+
+    def finish(result: ServiceResult) -> None:
+        completed.append(result)
+        callback_on_gui_thread.append(QThread.currentThread() is qt_app.thread())
+
+    bridge_window._run_task(
+        "后台任务测试",
+        lambda: ServiceResult(OperationStatus.SUCCESS, message="完成"),
+        finish,
+    )
+    deadline = time.monotonic() + 2  # 最多等待 2 秒处理 Qt 完成信号。
+    while bridge_window.task_active and time.monotonic() < deadline:
+        qt_app.processEvents()
+        time.sleep(0.01)
+
+    assert not bridge_window.task_active
+    assert bridge_window._active_runner is None
+    assert len(completed) == 1
+    assert callback_on_gui_thread == [True]
+    assert all(button.isEnabled() for button in bridge_window.task_buttons)
+
+
+def test_receive_failure_message_contains_reason(bridge_window):
+    bridge_window._show_receive_result(
+        ReceiveResult(
+            OperationStatus.FAILED,
+            failed=1,
+            error_code="network_error",
+            message="网络连接中断",
+        )
+    )
+    text = bridge_window.message_bar.label.text()
+    assert "收件失败" in text
+    assert "网络连接中断" in text
+
+
 def test_basic_config_updates_runtime_without_core_rewrite(bridge_window, monkeypatch):
     saved: dict[str, str] = {}
     monkeypatch.setattr(
@@ -78,6 +124,62 @@ def test_basic_config_updates_runtime_without_core_rewrite(bridge_window, monkey
     assert bridge_window.service.cfg.owner_gmail == "updated@gmail.com"
     assert saved["GMAIL_RECEIVE_BACKEND"] == "imap"
     assert saved["GMAIL_APP_PASSWORD"] == "dummy-app-password"
+
+
+def test_basic_config_save_failure_keeps_runtime_config(bridge_window, monkeypatch):
+    original = (
+        bridge_window.service.cfg.gmail_address,
+        bridge_window.service.cfg.owner_gmail,
+        bridge_window.service.cfg.gmail_app_password,
+        bridge_window.service.cfg.gmail_receive_backend,
+    )
+
+    def fail_save(_values):
+        raise OSError("只读文件")
+
+    monkeypatch.setattr("agent_mail_bridge.ui.main_window.save_env_values", fail_save)
+    bridge_window.gmail_email_edit.setText("not-saved@gmail.com")
+    bridge_window.gmail_password_edit.setText("not-saved-password")
+    bridge_window._set_combo_data(bridge_window.backend_combo, "imap")
+    bridge_window.save_basic_config()
+
+    current = (
+        bridge_window.service.cfg.gmail_address,
+        bridge_window.service.cfg.owner_gmail,
+        bridge_window.service.cfg.gmail_app_password,
+        bridge_window.service.cfg.gmail_receive_backend,
+    )
+    assert current == original
+
+
+def test_advanced_config_save_failure_keeps_runtime_config(bridge_window, monkeypatch):
+    original = (
+        bridge_window.service.cfg.qq_email,
+        bridge_window.service.cfg.qq_auth_code,
+        bridge_window.service.cfg.gmail_network_mode,
+        bridge_window.service.cfg.max_fetch_limit,
+        bridge_window.service.cfg.max_send_file_mb,
+    )
+
+    def fail_save(_values):
+        raise OSError("只读文件")
+
+    monkeypatch.setattr("agent_mail_bridge.ui.main_window.save_env_values", fail_save)
+    bridge_window.qq_email_edit.setText("not-saved@qq.com")
+    bridge_window.qq_auth_edit.setText("not-saved-auth")
+    bridge_window._set_combo_data(bridge_window.network_combo, "direct")
+    bridge_window.fetch_limit_spin.setValue(7)
+    bridge_window.send_limit_spin.setValue(8)
+    bridge_window.save_advanced_config()
+
+    current = (
+        bridge_window.service.cfg.qq_email,
+        bridge_window.service.cfg.qq_auth_code,
+        bridge_window.service.cfg.gmail_network_mode,
+        bridge_window.service.cfg.max_fetch_limit,
+        bridge_window.service.cfg.max_send_file_mb,
+    )
+    assert current == original
 
 
 def test_env_save_preserves_unrelated_lines_and_quotes_values(tmp_path: Path):
