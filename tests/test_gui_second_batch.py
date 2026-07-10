@@ -85,6 +85,36 @@ def test_auto_receive_interval_uses_minutes(bridge_window):
     assert not bridge_window.auto_timer.isActive()
 
 
+def test_auto_receive_disables_manual_receive_actions(bridge_window):
+    bridge_window.auto_switch.setChecked(True)
+    assert not bridge_window.receive_button.isEnabled()
+    assert all(not button.isEnabled() for button in bridge_window.manual_receive_buttons)
+    assert "自动收取已开启" in bridge_window.receive_button.toolTip()
+
+    bridge_window.auto_switch.setChecked(False)
+    assert all(button.isEnabled() for button in bridge_window.manual_receive_buttons)
+
+
+def test_diagnose_only_disables_clicked_button_and_announces_recovery(bridge_window, qt_app):
+    bridge_window._diagnose(
+        "正在诊断 Gmail IMAP",
+        lambda: ServiceResult(OperationStatus.SUCCESS, message="连接正常"),
+        bridge_window.imap_diagnose_button,
+    )
+    assert not bridge_window.imap_diagnose_button.isEnabled()
+    assert bridge_window.authorize_button.isEnabled()
+    assert bridge_window.gmail_api_diagnose_button.isEnabled()
+    assert bridge_window.smtp_diagnose_button.isEnabled()
+
+    deadline = time.monotonic() + 2
+    while bridge_window.task_active and time.monotonic() < deadline:
+        qt_app.processEvents()
+        time.sleep(0.01)
+
+    assert bridge_window.imap_diagnose_button.isEnabled()
+    assert "按钮已恢复可用" in bridge_window.message_bar.label.text()
+
+
 def test_background_task_completion_reaches_gui(bridge_window, qt_app):
     completed: list[ServiceResult] = []
     callback_on_gui_thread: list[bool] = []

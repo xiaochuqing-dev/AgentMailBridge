@@ -810,5 +810,5 @@ def query_recent_events(
             "SELECT * FROM app_events ORDER BY id DESC LIMIT ?",
             (limit,),
         ).fetchall()
-        # 反转为时间正序，便于阅读
-        return [dict(r) for r in reversed(rows)]
+        # 保持最新事件在前，界面打开即可看到最新日志。
+        return [dict(r) for r in rows]

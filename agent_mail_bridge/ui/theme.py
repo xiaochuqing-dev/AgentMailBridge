@@ -31,9 +31,9 @@ def load_interface_font() -> QFont:
     return QFont("Microsoft YaHei UI", 10)
 
 
-def build_stylesheet() -> str:
-    """生成全局浅色主题。"""
-    return f"""
+def build_stylesheet(theme: str = "light") -> str:
+    """生成指定的全局主题样式。"""
+    base = f"""
     * {{
         font-family: "Noto Sans SC", "Microsoft YaHei UI", "Segoe UI";
         color: {TEXT};
@@ -296,4 +296,27 @@ def build_stylesheet() -> str:
         padding: 5px 8px;
         font-size: 10px;
     }}
+    """
+    if theme != "dark":
+        return base
+    return base + f"""
+    * {{ color: #E8EAF2; }}
+    QMainWindow, QWidget#windowRoot, QWidget#titleBar, QWidget#sidebar,
+    QWidget#centralPanel, QWidget#rightPanel, QWidget#pageSurface,
+    QWidget#bodySurface, QWidget#tabBar, QScrollArea {{ background: #171923; }}
+    QWidget#rightPanel {{ background: #1C1E2A; border-left-color: #343746; }}
+    QWidget#sidebar, QWidget#titleBar, QWidget#tabBar {{ border-color: #343746; }}
+    QLabel#fieldLabel, QLabel#muted, QLabel#hint {{ color: #AEB4C5; }}
+    QFrame#card, QLineEdit, QComboBox, QSpinBox, QTableWidget,
+    QHeaderView::section, QComboBox QAbstractItemView {{
+        background: #222532;
+        border-color: #3A3E50;
+    }}
+    QTableWidget {{ alternate-background-color: #1D202C; gridline-color: #343746; }}
+    QHeaderView::section {{ color: #BFC4D3; }}
+    QPushButton {{ background: #292C3A; border-color: #42465A; }}
+    QPushButton:hover, QPushButton#titleButton:hover {{ background: #35394B; }}
+    QPushButton#outlinePurple {{ background: #242736; }}
+    QPushButton#textButton, QPushButton#tabButton, QPushButton#navButton {{ background: transparent; }}
+    QScrollBar::handle:vertical {{ background: #555A6C; }}
     """

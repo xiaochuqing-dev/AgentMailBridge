@@ -50,6 +50,7 @@ from agent_mail_bridge.ui.theme import (
     SUCCESS,
     TEXT_MUTED,
     WARNING,
+    build_stylesheet,
 )
 from agent_mail_bridge.ui.widgets import (
     AccountCard,
@@ -155,12 +156,12 @@ class TitleBar(QWidget):
         layout.addWidget(status_box)
         layout.addStretch(1)
 
-        theme_button = QPushButton("日  月")
-        theme_button.setObjectName("titleButton")
-        theme_button.setFixedSize(64, 30)
-        theme_button.setToolTip("当前使用设计图浅色主题")
-        theme_button.clicked.connect(self._show_theme_notice)
-        layout.addWidget(theme_button)
+        self.theme_button = QPushButton()
+        self.theme_button.setObjectName("titleButton")
+        self.theme_button.setFixedSize(38, 30)
+        self.theme_button.clicked.connect(self.window_ref.toggle_theme)
+        self.set_theme(self.window_ref.theme_mode)
+        layout.addWidget(self.theme_button)
 
         minimize = QPushButton("—")
         maximize = QPushButton("□")
@@ -177,9 +178,14 @@ class TitleBar(QWidget):
         layout.addWidget(maximize)
         layout.addWidget(close)
 
-    def _show_theme_notice(self) -> None:
-        if hasattr(self.window_ref, "show_message"):
-            self.window_ref.show_message("当前按设计图使用浅色主题", "normal")
+    def set_theme(self, theme: str) -> None:
+        """用清晰图标显示下一次可切换的主题。"""
+        if theme == "dark":
+            self.theme_button.setText("☀")
+            self.theme_button.setToolTip("切换为浅色模式")
+        else:
+            self.theme_button.setText("☾")
+            self.theme_button.setToolTip("切换为深色模式")
 
     def _toggle_maximized(self) -> None:
         if self.window_ref.isMaximized():
@@ -226,6 +232,10 @@ class BridgeWindow(QMainWindow):
         self.instance_guard = None
         self._notification_times: dict[str, float] = {}
         self.task_buttons: list[QPushButton] = []
+        self.manual_receive_buttons: list[QPushButton] = []
+        self._active_task_button: QPushButton | None = None
+        saved_theme = os.getenv("GUI_THEME", "light").strip().lower()
+        self.theme_mode = saved_theme if saved_theme in {"light", "dark"} else "light"
         self.file_rows: list[dict] = []
         self.log_rows: list[dict] = []
         self.history_rows: dict[str, list[dict]] = {"received": [], "sent": []}
@@ -242,6 +252,7 @@ class BridgeWindow(QMainWindow):
         self.resize(1272, 900)
         self.setMinimumSize(1120, 760)
         self._build()
+        self.apply_theme(self.theme_mode)
         self._build_tray()
         self._load_auto_receive_preferences()
         QTimer.singleShot(0, self.refresh)
@@ -462,6 +473,7 @@ class BridgeWindow(QMainWindow):
             outline=True,
         )
         self.task_buttons.extend((test_button, self.receive_button, self.send_button))
+        self.manual_receive_buttons.append(self.receive_button)
         for button in (test_button, save_button, self.receive_button, self.send_button, mcp_button):
             actions.addWidget(button)
         actions.addStretch(1)
@@ -521,6 +533,7 @@ class BridgeWindow(QMainWindow):
         receive = self._button("↓  立即收取", self.receive, primary=True)
         refresh = self._button("刷新", self.refresh)
         self.task_buttons.append(receive)
+        self.manual_receive_buttons.append(receive)
         tools.addWidget(self.inbox_search, 1)
         tools.addWidget(receive)
         tools.addWidget(refresh)
@@ -609,10 +622,23 @@ class BridgeWindow(QMainWindow):
 
         actions = QHBoxLayout()
         save = self._button("保存高级设置", self.save_advanced_config, primary=True)
-        auth = self._button("Gmail API 显式授权", self.authorize_gmail_api)
-        imap = self._button("诊断 IMAP", lambda: self._diagnose("正在诊断 Gmail IMAP", self.service.diagnose_imap))
-        api = self._button("诊断 Gmail API", lambda: self._diagnose("正在诊断 Gmail API", self.service.diagnose_gmail_api))
-        smtp = self._button("诊断 QQ SMTP", lambda: self._diagnose("正在诊断 QQ SMTP", self.service.diagnose_qq_smtp))
+        self.authorize_button = self._button("Gmail API 显式授权", self.authorize_gmail_api)
+        self.imap_diagnose_button = self._button("诊断 IMAP")
+        self.gmail_api_diagnose_button = self._button("诊断 Gmail API")
+        self.smtp_diagnose_button = self._button("诊断 QQ SMTP")
+        self.imap_diagnose_button.clicked.connect(
+            lambda: self._diagnose("正在诊断 Gmail IMAP", self.service.diagnose_imap, self.imap_diagnose_button)
+        )
+        self.gmail_api_diagnose_button.clicked.connect(
+            lambda: self._diagnose("正在诊断 Gmail API", self.service.diagnose_gmail_api, self.gmail_api_diagnose_button)
+        )
+        self.smtp_diagnose_button.clicked.connect(
+            lambda: self._diagnose("正在诊断 QQ SMTP", self.service.diagnose_qq_smtp, self.smtp_diagnose_button)
+        )
+        auth = self.authorize_button
+        imap = self.imap_diagnose_button
+        api = self.gmail_api_diagnose_button
+        smtp = self.smtp_diagnose_button
         self.task_buttons.extend((auth, imap, api, smtp))
         for button in (save, auth, imap, api, smtp):
             actions.addWidget(button)
@@ -818,7 +844,7 @@ class BridgeWindow(QMainWindow):
     def _button(
         self,
         label: str,
-        callback: Callable,
+        callback: Callable | None = None,
         *,
         primary: bool = False,
         outline: bool = False,
@@ -832,7 +858,8 @@ class BridgeWindow(QMainWindow):
         elif text_only:
             button.setObjectName("textButton")
         button.setCursor(Qt.CursorShape.PointingHandCursor)
-        button.clicked.connect(callback)
+        if callback is not None:
+            button.clicked.connect(callback)
         return button
 
     def _configure_file_table(self, table: DataTable) -> None:
@@ -865,6 +892,9 @@ class BridgeWindow(QMainWindow):
             button.setChecked(key == nav_target)
 
     def receive(self) -> None:
+        if self.auto_switch.isChecked():
+            self.show_message("自动收取已开启，手动收取已禁用", "normal")
+            return
         self._run_task("正在收取邮件，请稍候", self.service.receive, self._show_receive_result)
 
     def choose_and_send(self) -> None:
@@ -903,11 +933,22 @@ class BridgeWindow(QMainWindow):
         else:
             self._diagnose("正在测试 Gmail IMAP 连接", self.service.diagnose_imap)
 
-    def _diagnose(self, title: str, operation: Callable[[], ServiceResult]) -> None:
-        self._run_task(title, operation, self._show_service_result)
+    def _diagnose(
+        self,
+        title: str,
+        operation: Callable[[], ServiceResult],
+        button: QPushButton | None = None,
+    ) -> None:
+        self._run_task(title, operation, self._show_service_result, button=button, operation_name="诊断")
 
     def authorize_gmail_api(self) -> None:
-        self._run_task("正在进行 Gmail API 授权", self.service.authorize_gmail_api, self._show_service_result)
+        self._run_task(
+            "正在进行 Gmail API 授权",
+            self.service.authorize_gmail_api,
+            self._show_service_result,
+            button=self.authorize_button,
+            operation_name="授权",
+        )
 
     def save_basic_config(self) -> None:
         email = self.gmail_email_edit.text().strip()
@@ -1171,6 +1212,9 @@ class BridgeWindow(QMainWindow):
         title: str,
         operation: Callable[[], ServiceResult],
         callback: Callable[[ServiceResult], None],
+        *,
+        button: QPushButton | None = None,
+        operation_name: str | None = None,
     ) -> None:
         if not getattr(self, "accepting_tasks", True):
             self.error_var.set("程序正在退出，不再启动新任务")
@@ -1180,10 +1224,15 @@ class BridgeWindow(QMainWindow):
             return
         self.task_active = True
         self.status_var.set(title)
-        for button in self.task_buttons:
+        self._active_task_button = button
+        if button is not None:
             button.setEnabled(False)
+            button.setToolTip("正在执行，请稍候")
         runner = _TaskRunner(operation)
-        self._task_callback = callback
+        if operation_name:
+            self._task_callback = lambda result: self._show_operation_result(result, operation_name, callback)
+        else:
+            self._task_callback = callback
         runner.signals.finished.connect(self._finish_task)
         # 保留 Python 包装对象，避免任务完成前信号对象被回收。
         self._active_runner = runner
@@ -1198,8 +1247,10 @@ class BridgeWindow(QMainWindow):
         if self.closed:
             return
         self.task_active = False
-        for button in self.task_buttons:
-            button.setEnabled(True)
+        if self._active_task_button is not None:
+            self._active_task_button.setEnabled(True)
+            self._active_task_button.setToolTip("")
+        self._active_task_button = None
         self.refresh()
         if callback is not None:
             callback(result)
@@ -1246,9 +1297,48 @@ class BridgeWindow(QMainWindow):
     def _show_service_result(self, result: ServiceResult) -> None:
         self.show_message(result.message or result.status.value, "success" if result.ok else "error")
 
+    def _show_operation_result(
+        self,
+        result: ServiceResult,
+        operation_name: str,
+        callback: Callable[[ServiceResult], None],
+    ) -> None:
+        callback(result)
+        state = "完成" if result.ok else "失败"
+        detail = result.message or result.status.value
+        self.show_message(f"{operation_name}{state}，按钮已恢复可用：{detail}", "success" if result.ok else "error")
+
     def show_message(self, text: str, kind: str = "normal") -> None:
         if hasattr(self, "message_bar"):
             self.message_bar.set_message(text, kind)
+
+    def apply_theme(self, theme: str) -> None:
+        """在不重建界面的情况下应用主题。"""
+        self.theme_mode = "dark" if theme == "dark" else "light"
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(build_stylesheet(self.theme_mode))
+        if hasattr(self, "title_bar"):
+            self.title_bar.set_theme(self.theme_mode)
+
+    def toggle_theme(self) -> None:
+        next_theme = "dark" if self.theme_mode == "light" else "light"
+        self.apply_theme(next_theme)
+        try:
+            save_env_values({"GUI_THEME": next_theme})
+        except OSError as exc:
+            self.show_message(f"已切换主题，但无法保存下次启动设置：{exc}", "error")
+            return
+        theme_name = "深色模式" if next_theme == "dark" else "浅色模式"
+        self.show_message(f"已切换为{theme_name}", "success")
+
+    def _sync_manual_receive_actions(self) -> None:
+        """自动收取期间禁止所有入口重复手动收取。"""
+        enabled = not self.auto_switch.isChecked()
+        hint = "自动收取已开启，关闭后可手动收取" if not enabled else ""
+        for button in self.manual_receive_buttons:
+            button.setEnabled(enabled)
+            button.setToolTip(hint)
 
     def _load_auto_receive_preferences(self) -> None:
         minutes_text = os.getenv("GUI_AUTO_RECEIVE_INTERVAL_MINUTES", str(AUTO_RECEIVE_DEFAULT_MINUTES))
@@ -1259,9 +1349,11 @@ class BridgeWindow(QMainWindow):
         self._set_combo_data(self.interval_combo, minutes)
         enabled = os.getenv("GUI_AUTO_RECEIVE", "false").strip().lower() in {"1", "true", "yes", "on"}
         self.auto_switch.setChecked(enabled)
+        self._sync_manual_receive_actions()
         self._reschedule_auto_receive()
 
     def _toggle_auto_receive(self, enabled: bool) -> None:
+        self._sync_manual_receive_actions()
         if enabled:
             self.auto_failures = 0
             self._schedule_auto_receive()

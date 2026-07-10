@@ -176,6 +176,6 @@ class TestAppEvents:
         log_event(tmp_cfg.db_path, "SUCCESS", "receive", "完成")
         rows = query_recent_events(tmp_cfg.db_path, limit=10)
         assert len(rows) == 2
-        # 反转为时间正序，第一条是最早的
-        assert rows[0]["message"] == "开始收取"
-        assert rows[1]["message"] == "完成"
+        # 最新日志应排在第一条，避免用户看不到刚发生的事件。
+        assert rows[0]["message"] == "完成"
+        assert rows[1]["message"] == "开始收取"
