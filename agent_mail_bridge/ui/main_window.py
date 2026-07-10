@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import QObject, QPoint, QRunnable, Qt, QThreadPool, QTimer, Signal, Slot
-from PySide6.QtGui import QCloseEvent, QColor, QFont, QPalette, QPixmap
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QFont, QIcon, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -27,6 +27,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSystemTrayIcon,
+    QMenu,
     QSizeGrip,
     QSpinBox,
     QStackedWidget,
@@ -37,6 +39,8 @@ from PySide6.QtWidgets import (
 )
 
 from agent_mail_bridge.application_service import ApplicationService
+from agent_mail_bridge.database import close_connection
+from agent_mail_bridge.desktop_runtime import StartupManager
 from agent_mail_bridge.models import OperationStatus, ReceiveResult, SendResult, ServiceResult
 from agent_mail_bridge.security import SecurityError, assert_within_allowed_roots
 from agent_mail_bridge.ui.settings_store import save_env_values
@@ -166,7 +170,7 @@ class TitleBar(QWidget):
             button.setFixedSize(42, 38)
         close.setObjectName("closeButton")
         close.setFixedSize(42, 38)
-        minimize.clicked.connect(window.showMinimized)
+        minimize.clicked.connect(window.minimize_to_tray)
         maximize.clicked.connect(self._toggle_maximized)
         close.clicked.connect(window.close)
         layout.addWidget(minimize)
@@ -214,7 +218,13 @@ class BridgeWindow(QMainWindow):
         self._active_runner: _TaskRunner | None = None
         self._task_callback: Callable[[ServiceResult], None] | None = None
         self.closed = False
-        self.thread_pool = QThreadPool.globalInstance()
+        self.thread_pool = QThreadPool(self)
+        self.thread_pool.setMaxThreadCount(1)
+        self.accepting_tasks = True
+        self.quitting = False
+        self.pending_quit = False
+        self.instance_guard = None
+        self._notification_times: dict[str, float] = {}
         self.task_buttons: list[QPushButton] = []
         self.file_rows: list[dict] = []
         self.log_rows: list[dict] = []
@@ -224,12 +234,15 @@ class BridgeWindow(QMainWindow):
         self.status_var = _ValueSink(lambda value: self.show_message(value, "working"))
         self.error_var = _ValueSink(lambda value: self.show_message(value, "error"))
         self.auto_timer = QTimer(self)
+        self.auto_timer.setSingleShot(True)
         self.auto_timer.timeout.connect(self._automatic_receive)
+        self.auto_failures = 0
         self.setWindowTitle("Agent 邮箱桥接工具")
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
         self.resize(1272, 900)
         self.setMinimumSize(1120, 760)
         self._build()
+        self._build_tray()
         self._load_auto_receive_preferences()
         QTimer.singleShot(0, self.refresh)
 
@@ -589,6 +602,10 @@ class BridgeWindow(QMainWindow):
         limits.addWidget(self.send_limit_spin)
         limits.addStretch(1)
         layout.addLayout(limits)
+
+        self.startup_check = QCheckBox("Windows 开机后在后台启动（默认关闭）")
+        self.startup_check.setChecked(StartupManager.is_enabled())
+        layout.addWidget(self.startup_check)
 
         actions = QHBoxLayout()
         save = self._button("保存高级设置", self.save_advanced_config, primary=True)
@@ -950,6 +967,11 @@ class BridgeWindow(QMainWindow):
         except OSError as exc:
             self.show_message(f"保存高级设置失败：{exc}", "error")
             return
+        try:
+            StartupManager.set_enabled(self.startup_check.isChecked())
+        except OSError as exc:
+            self.show_message(f"开机启动设置失败：{exc}", "error")
+            return
         self.service.cfg.qq_email = qq_email
         self.service.cfg.qq_auth_code = qq_auth
         self.service.cfg.gmail_network_mode = network_mode
@@ -1150,6 +1172,9 @@ class BridgeWindow(QMainWindow):
         operation: Callable[[], ServiceResult],
         callback: Callable[[ServiceResult], None],
     ) -> None:
+        if not getattr(self, "accepting_tasks", True):
+            self.error_var.set("程序正在退出，不再启动新任务")
+            return
         if self.task_active:
             self.error_var.set("已有任务正在运行，请勿重复点击")
             return
@@ -1178,6 +1203,9 @@ class BridgeWindow(QMainWindow):
         self.refresh()
         if callback is not None:
             callback(result)
+        if self.pending_quit:
+            self.pending_quit = False
+            QTimer.singleShot(0, self._finalize_quit)
 
     def _show_receive_result(self, result: ServiceResult) -> None:
         if isinstance(result, ReceiveResult):
@@ -1196,6 +1224,11 @@ class BridgeWindow(QMainWindow):
         else:
             message = result.message or result.status.value
         self.show_message(message, "success" if result.ok else "error")
+        if isinstance(result, ReceiveResult) and result.saved:
+            self.notify("收到新邮件", f"已安全保存 {result.saved} 封邮件中的文件", "receive-success")
+        elif isinstance(result, ReceiveResult) and not result.ok:
+            title = "需要重新授权" if result.needs_auth else "自动收取失败"
+            self.notify(title, "请打开主窗口查看具体原因", "receive-failure", 300)
 
     def _show_send_result(self, result: ServiceResult) -> None:
         if isinstance(result, SendResult):
@@ -1230,9 +1263,9 @@ class BridgeWindow(QMainWindow):
 
     def _toggle_auto_receive(self, enabled: bool) -> None:
         if enabled:
-            minutes = int(self.interval_combo.currentData() or AUTO_RECEIVE_DEFAULT_MINUTES)
-            self.auto_timer.start(minutes * 60 * 1000)
-            self.show_message(f"自动收件已开启，每 {minutes} 分钟检查一次", "success")
+            self.auto_failures = 0
+            self._schedule_auto_receive()
+            self.show_message(f"自动收件已开启，每 {self._auto_minutes()} 分钟检查一次", "success")
         else:
             self.auto_timer.stop()
             self.show_message("自动收件已关闭", "normal")
@@ -1241,13 +1274,37 @@ class BridgeWindow(QMainWindow):
 
     def _reschedule_auto_receive(self) -> None:
         if hasattr(self, "auto_switch") and self.auto_switch.isChecked():
-            minutes = int(self.interval_combo.currentData() or AUTO_RECEIVE_DEFAULT_MINUTES)
-            self.auto_timer.start(minutes * 60 * 1000)
+            self._schedule_auto_receive()
 
     def _automatic_receive(self) -> None:
         if self.task_active:
+            self._schedule_auto_receive(1)
             return
-        self._run_task("自动收件正在运行", self.service.receive, self._show_receive_result)
+        self._run_task("自动收件正在运行", self.service.receive, self._finish_auto_receive)
+
+    def _auto_minutes(self) -> int:
+        return int(self.interval_combo.currentData() or AUTO_RECEIVE_DEFAULT_MINUTES)
+
+    def _schedule_auto_receive(self, minutes: int | None = None) -> None:
+        if not self.auto_switch.isChecked():
+            return
+        delay = minutes if minutes is not None else self._auto_minutes()
+        self.auto_timer.start(max(1, delay) * 60 * 1000)
+
+    def _finish_auto_receive(self, result: ServiceResult) -> None:
+        self._show_receive_result(result)
+        if not self.auto_switch.isChecked():
+            return
+        if result.needs_auth:
+            self.service_rows["auto"].set_value("需重新授权", danger=True)
+            return
+        if not result.ok:
+            self.auto_failures += 1
+            delay = min(self._auto_minutes() * (2 ** min(self.auto_failures, 3)), 60)
+            self._schedule_auto_receive(delay)
+            return
+        self.auto_failures = 0
+        self._schedule_auto_receive()
 
     def open_today_folder(self) -> None:
         today_folder = self.service.cfg.received_dir / datetime.now().strftime("%Y-%m-%d")
@@ -1360,6 +1417,67 @@ class BridgeWindow(QMainWindow):
         QApplication.clipboard().setText(command)
         self.show_message("MCP 配置命令已复制", "success")
 
+    def _build_tray(self) -> None:
+        self.tray_available = QSystemTrayIcon.isSystemTrayAvailable()
+        self.tray_icon: QSystemTrayIcon | None = None
+        if not self.tray_available:
+            return
+        self.tray_icon = QSystemTrayIcon(self.style().standardIcon(self.style().StandardPixmap.SP_ComputerIcon), self)
+        menu = QMenu(self)
+        show_action = QAction("显示主窗口", self)
+        show_action.triggered.connect(self.show_from_tray)
+        receive_action = QAction("手动检查新邮件", self)
+        receive_action.triggered.connect(self.receive)
+        status_action = QAction("刷新最近状态", self)
+        status_action.triggered.connect(self.refresh)
+        quit_action = QAction("退出程序", self)
+        quit_action.triggered.connect(self.request_quit)
+        for action in (show_action, receive_action, status_action):
+            menu.addAction(action)
+        menu.addSeparator()
+        menu.addAction(quit_action)
+        self.tray_icon.setContextMenu(menu)
+        self.tray_icon.activated.connect(lambda reason: self.show_from_tray() if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
+        self.tray_icon.show()
+
+    def notify(self, title: str, message: str, key: str, cooldown_seconds: int = 120) -> None:
+        now = datetime.now().timestamp()
+        if now - self._notification_times.get(key, 0) < cooldown_seconds:
+            return
+        self._notification_times[key] = now
+        if self.tray_icon is not None:
+            self.tray_icon.showMessage(title, message, QSystemTrayIcon.MessageIcon.Information, 6000)
+
+    def minimize_to_tray(self) -> None:
+        if self.tray_icon is None:
+            self.showMinimized()
+            return
+        self.hide()
+        self.notify("Agent 邮箱桥接工具仍在运行", "可从系统托盘打开窗口或正常退出", "tray-hidden", 3600)
+
+    def show_from_tray(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def request_quit(self) -> None:
+        self.accepting_tasks = False
+        self.auto_timer.stop()
+        if self.task_active:
+            self.pending_quit = True
+            self.show_message("正在等待当前任务安全结束", "working")
+            return
+        self._finalize_quit()
+
+    def _finalize_quit(self) -> None:
+        self.quitting = True
+        self.thread_pool.waitForDone(1000)
+        close_connection()
+        if self.tray_icon is not None:
+            self.tray_icon.hide()
+        self.close()
+        QApplication.quit()
+
     def _show_help(self) -> None:
         QMessageBox.information(self, "帮助", "详细配置、诊断和安全说明请查看项目 README.md。")
 
@@ -1408,6 +1526,10 @@ class BridgeWindow(QMainWindow):
         return "—"
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if not self.quitting and self.tray_icon is not None:
+            self.minimize_to_tray()
+            event.ignore()
+            return
         self.closed = True
         self.auto_timer.stop()
         event.accept()
