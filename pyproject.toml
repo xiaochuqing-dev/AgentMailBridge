@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agent-mail-bridge"
 version = "0.1.0"
-description = "Agent Mail Bridge - 面向 AI Agent 工作流的本地邮箱桥接工具（第一阶段 CLI）"
+description = "Agent Mail Bridge - 面向 AI Agent 工作流的本地邮箱桥接桌面工具"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -16,6 +16,7 @@ dependencies = [
     "google-api-python-client>=2.0.0",
     "google-auth-httplib2>=0.2.0",
     "google-auth-oauthlib>=1.0.0",
+    "PySide6>=6.8,<7",
 ]
 
 [project.optional-dependencies]

@@ -12,6 +12,9 @@ google-api-python-client>=2.0.0
 google-auth-httplib2>=0.2.0
 google-auth-oauthlib>=1.0.0
 
+# 第二批次正式桌面界面
+PySide6>=6.8,<7
+
 # 后续可用于系统密钥环存储（本阶段仅预留接口，未强制使用）
 keyring>=24.0.0
 

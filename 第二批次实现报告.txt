@@ -1,0 +1,87 @@
+AgentMailBridge 第二批次实现报告
+
+一、完成结果
+
+第二批次已把第一批次 tkinter 骨架替换为 PySide6 正式桌面界面。界面继续使用 ApplicationService，未重写 Gmail IMAP、Gmail API、QQ SMTP、SQLite、OAuth、文件处理或安全逻辑。
+
+主界面按设计图实现顶部状态栏、左侧账号与导航、中间工作区、右侧服务状态与今日统计。默认窗口为 1272×900，左栏 230 像素，右栏 306 像素，中间区域自适应。基础配置页的表单、快捷按钮、今日文件和最近日志保持与设计图相同的上下分布。离屏截图逐项对照后，布局、间距、主色和区块分布预计达到 80％以上还原度。
+
+二、框架与依赖
+
+正式界面采用 PySide6 6.11.1。requirements.txt 与 pyproject.toml 均已写入 PySide6 大于等于 6.8 且小于 7 的版本范围。pip check 结果为 No broken requirements found。
+
+项目显式加载 Windows 中文字体，避免 Qt 离屏或精简环境出现中文方框。未安装或使用 CustomTkinter、PyQt6，也未升级其他无关依赖。
+
+三、界面功能
+
+已实现基础配置、收邮箱、发邮件、高级设置、历史记录和日志六个页面。
+
+基础配置支持收件后端选择、Gmail 地址、应用专用密码、可信自发自收规则、自动收件开关、分钟间隔、连接测试、配置保存、手动收取和手动选择发送。
+
+自动收件只在 GUI 运行期间工作，默认关闭。推荐间隔为 3 分钟，即 180000 毫秒。自动任务与手动任务共用任务互斥，重复点击不会启动第二个任务。
+
+发邮件页仍由 ApplicationService.send_file 执行，收件人固定为绑定 Gmail，SMTP 失败、归档失败和重复请求继续使用第一批次结构化状态。
+
+今日文件、历史记录和日志均来自 ApplicationService。安全预览只读取 DATA_ROOT 内的文本和图片，文本最多读取 131072 字节。其他文件类型只在资源管理器中定位，不自动执行、解压或调用脚本。
+
+配置保存只更新界面明确编辑的 .env 键，保留其他配置行，使用临时文件原子替换。密钥不会进入日志、测试、截图或报告。
+
+MCP 按钮仅保留设计图中的入口位置，并明确提示第二批次未实现 MCP，不会伪装成可用功能。
+
+四、修改文件
+
+agent_mail_bridge/gui.py：改为 PySide6 正式界面启动入口。
+
+agent_mail_bridge/ui/main_window.py：新增主窗口、六个页面、线程池任务、自动收件调度、安全预览、配置与状态交互。
+
+agent_mail_bridge/ui/theme.py：新增颜色、字体和 Qt 全局样式。
+
+agent_mail_bridge/ui/widgets.py：新增账号卡片、导航、开关、状态行、统计卡片、表格和消息栏。
+
+agent_mail_bridge/ui/settings_store.py：新增 .env 原子更新。
+
+agent_mail_bridge/ui/__init__.py：新增正式 GUI 包入口。
+
+tests/test_gui_second_batch.py：新增 6 项 GUI 回归测试。
+
+requirements.txt、pyproject.toml：登记 PySide6，并更新项目描述。
+
+README.md：更新第二批次 GUI、启动方式、安全边界和当前限制。
+
+agent_mail_bridge/cli.py：仅移除帮助文案中的“第一阶段 CLI”旧描述，命令未改变。
+
+五、验证结果
+
+python -m pytest -q：185 passed，最后一次复跑耗时 2.05 秒。
+
+python -m compileall -q agent_mail_bridge tests：通过。
+
+python -m pip check：通过，无损坏依赖。
+
+python -m agent_mail_bridge --help：通过，原 CLI 命令完整保留。
+
+PySide6 实际安装版本：6.11.1。
+
+GUI 隔离离屏启动、页面构建和截图：通过。预览路径为 test-output/ui-preview.png，该目录已被 Git 忽略。
+
+启动正式界面命令：python -m agent_mail_bridge.gui
+
+六、安全和兼容性
+
+GUI 长任务在线程池运行，不冻结主界面。关闭窗口时停止 GUI 自动收件计时器，不启动新的任务。现有 ApplicationService 接口及 CLI 保持兼容。
+
+测试继续禁用真实 .env，并使用临时 credentials.json、token.json 和 DATA_ROOT。未读取或修改真实邮箱数据，未执行真实收发操作。
+
+七、风险和未确认项
+
+PySide6 安装内容较大，未来 Windows 安装包体积会明显高于 tkinter 版本。
+
+当前未制作 Windows 安装包、托盘、系统通知、开机启动、后台常驻收件或 MCP。
+
+自动化测试已通过，但真实 Gmail IMAP、Gmail API 和 QQ SMTP 仍应使用用户自己的账号做人工链路验收。
+
+八、存档与备份
+
+修改前 Git 存档提交为 fb154c0，提交说明为“chore: 第二批次界面开发前存档”。
+
+本次没有创建文件夹备份或备份压缩包，因此没有备份文件路径和大小。Git 存档已保留修改前的完整版本。

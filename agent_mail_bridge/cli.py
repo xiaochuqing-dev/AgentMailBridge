@@ -267,7 +267,7 @@ def _human_size(size: int | None) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent_mail_bridge",
-        description="Agent Mail Bridge - 面向 AI Agent 的本地邮箱桥接工具（第一阶段 CLI）",
+        description="Agent Mail Bridge - 面向 AI Agent 的本地邮箱桥接工具",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
