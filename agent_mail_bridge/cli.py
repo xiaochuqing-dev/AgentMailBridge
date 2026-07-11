@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import argparse
+import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -264,6 +265,24 @@ def cmd_migrate_credentials(args, cfg) -> int:
     return 0 if result.ok else 1
 
 
+def cmd_stability_benchmark(args, cfg) -> int:
+    """执行隔离的大数据量与资源稳定性基准。"""
+    del cfg
+    from agent_mail_bridge.performance import run_stability_benchmark
+    try:
+        report = run_stability_benchmark(
+            records=args.records, cycles=args.cycles, output=args.output
+        )
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        print(f"基准执行失败：{exc}", file=sys.stderr)
+        return 1
+    print(
+        f"基准完成：收件 {report['records']['received']} 条，"
+        f"刷新 {report['cycles']} 周期，报告已保存"
+    )
+    return 0
+
+
 # ============================================================
 # 工具
 # ============================================================
@@ -334,6 +353,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("diagnose-network", help="诊断整体网络环境")
     sub.add_parser("credential-status", help="显示 Windows 凭据配置状态")
     sub.add_parser("migrate-credentials", help="迁移旧 .env 凭据到 Windows 安全存储")
+    p_benchmark = sub.add_parser("stability-benchmark", help="运行隔离性能与稳定性基准")
+    p_benchmark.add_argument("--records", type=int, default=10000, help="收件记录数，默认 10000")
+    p_benchmark.add_argument("--cycles", type=int, default=50, help="刷新周期数，默认 50")
+    p_benchmark.add_argument("--output", required=True, help="JSON 结果文件")
 
     return parser
 
@@ -369,6 +392,7 @@ def main(argv: list[str] | None = None) -> int:
         "gmail-api-auth": cmd_gmail_api_auth,
         "credential-status": cmd_credential_status,
         "migrate-credentials": cmd_migrate_credentials,
+        "stability-benchmark": cmd_stability_benchmark,
     }
     handler = handlers.get(args.command)
     if handler is None:
