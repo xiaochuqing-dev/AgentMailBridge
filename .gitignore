@@ -16,6 +16,8 @@ __pycache__/
 .Python
 build/
 dist/
+release/
+installer-output/
 *.egg-info/
 *.egg
 .eggs/
@@ -30,6 +32,7 @@ artifacts/gui-qa*/
 diagnostic-report*.md
 *.diagnostic.md
 screenshots/
+qa-artifacts/
 *.log
 .tox/
 .coverage
@@ -37,6 +40,10 @@ screenshots/
 htmlcov/
 .mypy_cache/
 .ruff_cache/
+*.pfx
+*.p12
+*.cer
+*.key
 
 # --- 虚拟环境 ---
 .venv/
