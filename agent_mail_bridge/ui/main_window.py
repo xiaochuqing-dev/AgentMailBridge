@@ -68,6 +68,7 @@ from agent_mail_bridge.ui.widgets import (
     horizontal_line,
     paint_app_icon,
 )
+from agent_mail_bridge.utils import sha256_of_file
 
 AUTO_RECEIVE_DEFAULT_MINUTES = 3  # 自动收件默认间隔，单位：分钟
 PREVIEW_MAX_BYTES = 128 * 1024  # 文本预览上限，单位：字节
@@ -82,18 +83,30 @@ class SendFileSelection:
     path: Path
     size: int
     modified_ns: int
+    sha256: str
 
     @classmethod
     def capture(cls, path: Path) -> "SendFileSelection":
         stat = path.stat()
-        return cls(path=path.resolve(), size=stat.st_size, modified_ns=stat.st_mtime_ns)
+        resolved = path.resolve(strict=True)
+        return cls(
+            path=resolved,
+            size=stat.st_size,
+            modified_ns=stat.st_mtime_ns,
+            sha256=sha256_of_file(resolved),
+        )
 
     def is_unchanged(self) -> bool:
         try:
             current = self.path.stat()
+            current_sha = sha256_of_file(self.path)
         except OSError:
             return False
-        return current.st_size == self.size and current.st_mtime_ns == self.modified_ns
+        return (
+            current.st_size == self.size
+            and current.st_mtime_ns == self.modified_ns
+            and current_sha == self.sha256
+        )
 
 
 def _fill_background(widget: QWidget, color: str) -> None:
@@ -603,7 +616,7 @@ class BridgeWindow(QMainWindow):
         return page
 
     def _build_send_page(self) -> QWidget:
-        page, layout = self._standard_page("发邮件", "使用 QQ 邮箱把白名单目录内的本地结果发送到绑定 Gmail。")
+        page, layout = self._standard_page("发邮件", "用户可手动选择任意位置的普通文件；MCP 和 CLI 仍受目录限制。")
         card = QFrame()
         card.setObjectName("card")
         form = QVBoxLayout(card)
@@ -614,7 +627,7 @@ class BridgeWindow(QMainWindow):
         source_row = QHBoxLayout()
         self.send_path_edit = QLineEdit()
         self.send_path_edit.setReadOnly(True)
-        self.send_path_edit.setPlaceholderText("请选择 DATA_ROOT 或允许目录内的文件")
+        self.send_path_edit.setPlaceholderText("请选择电脑任意位置的普通文件")
         choose = self._button("选择文件", self.choose_send_file)
         source_row.addWidget(self.send_path_edit, 1)
         source_row.addWidget(choose)
@@ -679,7 +692,9 @@ class BridgeWindow(QMainWindow):
         history_title = QLabel("最近发送记录")
         history_title.setObjectName("sectionTitle")
         layout.addWidget(history_title)
-        self.sent_table = DataTable(["文件", "主题", "收件人", "发送时间", "状态"])
+        self.sent_table = DataTable(
+            ["文件", "大小", "来源", "request_id", "发送时间", "状态"]
+        )
         layout.addWidget(self.sent_table, 1)
         return page
 
@@ -1108,14 +1123,13 @@ class BridgeWindow(QMainWindow):
 
     def choose_send_file(self) -> bool:
         path, _ = QFileDialog.getOpenFileName(
-            self, "选择待发送文件", str(self.service.cfg.data_root_path), "所有文件 (*.*)"
+            self, "选择待发送文件", str(Path.home()), "所有文件 (*.*)"
         )
         if not path:
             self.show_message("已取消选择文件")
             return False
         selected_path = Path(path)
         try:
-            assert_within_allowed_roots(selected_path, self.service.cfg.effective_allowed_send_roots)
             if not selected_path.is_file():
                 raise OSError("文件不存在或不是普通文件")
             selection = SendFileSelection.capture(selected_path)
@@ -1195,7 +1209,11 @@ class BridgeWindow(QMainWindow):
                 error_code="file_changed",
                 message="确认后文件发生变化，已阻止发送",
             )
-        return self.service.send_file(selection.path, subject=subject)
+        return self.service.send_user_selected_file(
+            selection.path,
+            subject=subject,
+            expected_sha256=selection.sha256,
+        )
 
     def _clear_send_selection(self) -> None:
         self.send_selection = None
@@ -1517,11 +1535,14 @@ class BridgeWindow(QMainWindow):
         self.sent_table.setRowCount(0)
         for index, row in enumerate(rows):
             self.sent_table.insertRow(index)
-            path = str(row.get("source_path") or row.get("sent_copy_path") or "")
+            path = str(row.get("sent_copy_path") or row.get("send_copy_path") or "")
+            filename = str(row.get("original_filename") or Path(path).name or "—")
+            origin = "用户手动选择" if row.get("source_origin") == "manual_gui" else "受控目录"
             values = [
-                Path(path).name or "—",
-                str(row.get("subject") or "—"),
-                str(row.get("to_email") or "—"),
+                filename,
+                format_size(int(row.get("size_bytes") or 0)),
+                origin,
+                str(row.get("request_id") or "—"),
                 self._short_time(row.get("sent_at"), include_date=True),
                 str(row.get("status") or "—"),
             ]

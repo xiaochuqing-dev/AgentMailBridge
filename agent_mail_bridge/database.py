@@ -74,6 +74,9 @@ CREATE TABLE IF NOT EXISTS sent_files (
     sent_at TEXT,
     status TEXT,
     error_message TEXT,
+    original_filename TEXT,
+    size_bytes INTEGER,
+    source_origin TEXT NOT NULL DEFAULT 'controlled',
     created_at TEXT,
     updated_at TEXT
 );
@@ -127,6 +130,9 @@ _RECEIVED_MESSAGES_NEW_COLUMNS = {
 _SENT_FILES_NEW_COLUMNS = {
     "request_id": "TEXT",
     "attempt_count": "INTEGER NOT NULL DEFAULT 1",
+    "original_filename": "TEXT",
+    "size_bytes": "INTEGER",
+    "source_origin": "TEXT NOT NULL DEFAULT 'controlled'",
 }
 
 
@@ -617,6 +623,9 @@ def create_or_retry_send_attempt(
     subject: str,
     from_email: str,
     to_email: str,
+    original_filename: str | None = None,
+    size_bytes: int | None = None,
+    source_origin: str = "controlled",
 ) -> tuple[str, dict[str, Any]]:
     """创建发送尝试；失败记录可重试，已发送记录按重复返回。"""
     now = _now()
@@ -647,10 +656,14 @@ def create_or_retry_send_attempt(
                 """
                 INSERT INTO sent_files
                     (request_id, attempt_count, source_path, sha256, subject,
-                     from_email, to_email, status, created_at, updated_at)
-                VALUES (?, 1, ?, ?, ?, ?, ?, 'attempt_created', ?, ?)
+                     from_email, to_email, status, original_filename, size_bytes,
+                     source_origin, created_at, updated_at)
+                VALUES (?, 1, ?, ?, ?, ?, ?, 'attempt_created', ?, ?, ?, ?, ?)
                 """,
-                (request_id, source_path, sha256, subject, from_email, to_email, now, now),
+                (
+                    request_id, source_path, sha256, subject, from_email, to_email,
+                    original_filename, size_bytes, source_origin, now, now,
+                ),
             )
             conn.commit()
             return "created", get_send_by_request_id(db_path, request_id) or {}

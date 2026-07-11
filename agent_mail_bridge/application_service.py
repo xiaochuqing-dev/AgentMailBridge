@@ -8,6 +8,7 @@ import platform
 import sys
 import threading
 import uuid
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -35,9 +36,14 @@ from agent_mail_bridge.logging_setup import setup_logging
 from agent_mail_bridge.mail_receive import receive_mails
 from agent_mail_bridge.mail_send import send_file_with_request
 from agent_mail_bridge.models import OperationStatus, ReceiveResult, SendResult, ServiceResult
-from agent_mail_bridge.security import SecurityError, assert_within_allowed_roots
+from agent_mail_bridge.security import (
+    SecurityError,
+    assert_within_allowed_roots,
+    check_size_ok,
+    is_dangerous,
+)
 from agent_mail_bridge.storage import ensure_data_dirs
-from agent_mail_bridge.utils import fmt_date
+from agent_mail_bridge.utils import fmt_date, sanitize_filename, sha256_of_file
 
 
 class ApplicationService:
@@ -174,6 +180,87 @@ class ApplicationService:
             error_code=raw.get("error_code"),
             message=raw.get("error", "发送完成"),
             details={"previous_status": raw.get("previous_status")},
+        )
+
+    def send_user_selected_file(
+        self,
+        file_path: str | Path,
+        *,
+        subject: str | None = None,
+        request_id: str | None = None,
+        expected_sha256: str | None = None,
+    ) -> SendResult:
+        """发送用户在 GUI 中明确选择的全局文件，不扩大 MCP/CLI 权限。"""
+        self.initialize()
+        stable_request_id = request_id or str(uuid.uuid4())
+        try:
+            source = Path(file_path).resolve(strict=True)
+            if not source.is_file():
+                raise OSError("文件不存在或不是普通文件")
+            if is_dangerous(source.name):
+                return SendResult(
+                    OperationStatus.FAILED, request_id=stable_request_id,
+                    error_code="file_type_not_allowed", message="危险扩展名文件禁止发送",
+                )
+            size_bytes = source.stat().st_size
+            if not check_size_ok(size_bytes, self.cfg.max_send_file_bytes):
+                return SendResult(
+                    OperationStatus.FAILED, request_id=stable_request_id,
+                    error_code="file_too_large", message="文件超过发送大小限制",
+                )
+            source_sha = sha256_of_file(source)
+            if expected_sha256 and source_sha != expected_sha256:
+                return SendResult(
+                    OperationStatus.FAILED, request_id=stable_request_id,
+                    error_code="file_changed", message="文件在确认后发生变化，已阻止发送",
+                )
+            safe_name = sanitize_filename(source.stem) + source.suffix.lower()
+            snapshot = self.cfg.send_dir / "staging" / stable_request_id / safe_name
+            snapshot.parent.mkdir(parents=True, exist_ok=True)
+            if snapshot.exists() and sha256_of_file(snapshot) != source_sha:
+                raise OSError("同一请求的受控快照内容不一致")
+            if not snapshot.exists():
+                shutil.copy2(source, snapshot)
+            if snapshot.stat().st_size != size_bytes or sha256_of_file(snapshot) != source_sha:
+                raise OSError("受控快照与源文件校验不一致")
+        except (OSError, ValueError) as exc:
+            return SendResult(
+                OperationStatus.FAILED, request_id=stable_request_id,
+                error_code="snapshot_failed", message=f"创建受控快照失败：{exc}",
+            )
+
+        raw = send_file_with_request(
+            snapshot,
+            request_id=stable_request_id,
+            subject=subject,
+            cfg=self.cfg,
+            attachment_name=source.name,
+            source_origin="manual_gui",
+        )
+        status_map = {
+            "success": OperationStatus.SUCCESS,
+            "partial": OperationStatus.PARTIAL,
+            "duplicate": OperationStatus.DUPLICATE,
+            "failed": OperationStatus.FAILED,
+        }
+        return SendResult(
+            status_map.get(raw.get("status", "failed"), OperationStatus.FAILED),
+            request_id=stable_request_id,
+            send_status=raw.get("send_status", "not_sent"),
+            source_path="",
+            send_copy_path=raw.get("send_copy_path", ""),
+            sent_copy_path=raw.get("sent_copy_path", ""),
+            subject=raw.get("subject", subject or ""),
+            to_email=raw.get("to", self.cfg.owner_gmail),
+            sent_at=raw.get("sent_at", ""),
+            error_code=raw.get("error_code"),
+            message=raw.get("error", "发送完成"),
+            details={
+                "source_origin": "manual_gui",
+                "original_filename": source.name,
+                "size_bytes": size_bytes,
+                "sha256": source_sha,
+            },
         )
 
     def submit_result(

@@ -94,7 +94,8 @@ def test_send_requires_confirmation_and_clears_after_success(
 
     calls: list[Path] = []
 
-    def fake_send(path: Path, *, subject=None):
+    def fake_send(path: Path, *, subject=None, expected_sha256=None):
+        assert expected_sha256
         calls.append(path)
         return SendResult(
             OperationStatus.SUCCESS,
@@ -104,7 +105,7 @@ def test_send_requires_confirmation_and_clears_after_success(
             message="发送完成",
         )
 
-    monkeypatch.setattr(stage_window.service, "send_file", fake_send)
+    monkeypatch.setattr(stage_window.service, "send_user_selected_file", fake_send)
     monkeypatch.setattr(
         "agent_mail_bridge.ui.main_window.QMessageBox.question",
         lambda *_args, **_kwargs: QMessageBox.StandardButton.No,

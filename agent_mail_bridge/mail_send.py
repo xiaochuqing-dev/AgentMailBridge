@@ -309,6 +309,8 @@ def send_file_with_request(
     request_id: str,
     subject: str | None,
     cfg: AppConfig,
+    attachment_name: str | None = None,
+    source_origin: str = "controlled",
 ) -> dict[str, Any]:
     """按 request_id 幂等发送，并准确区分 SMTP 与归档状态。"""
     try:
@@ -331,7 +333,8 @@ def send_file_with_request(
         return _send_error_result(request_id, "file_too_large", "文件超过发送大小限制")
 
     sha = sha256_of_file(source_path)
-    actual_subject = subject or f"Agent执行结果 - {source_path.name}"
+    confirmed_name = attachment_name or source_path.name
+    actual_subject = subject or f"Agent执行结果 - {confirmed_name}"
     attempt_state, previous = create_or_retry_send_attempt(
         cfg.db_path,
         request_id=request_id,
@@ -340,6 +343,9 @@ def send_file_with_request(
         subject=actual_subject,
         from_email=cfg.qq_email,
         to_email=cfg.owner_gmail,
+        original_filename=confirmed_name,
+        size_bytes=size_bytes,
+        source_origin=source_origin,
     )
     if attempt_state == "duplicate":
         return {
@@ -368,7 +374,7 @@ def send_file_with_request(
             cfg=cfg,
             subject=actual_subject,
             file_path=send_copy_path,
-            source_name=source_path.name,
+            source_name=confirmed_name,
         )
         _smtp_send_with_stage(cfg, message)
     except SmtpStageError as exc:
