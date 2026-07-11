@@ -43,6 +43,15 @@ from agent_mail_bridge.gmail_api_auth import get_oauth_state
 from agent_mail_bridge.logging_setup import setup_logging
 from agent_mail_bridge.mail_receive import receive_mails
 from agent_mail_bridge.mail_send import send_file_with_request
+from agent_mail_bridge.maintenance import (
+    create_database_backup,
+    data_statistics,
+    export_maintenance_report,
+    list_database_backups,
+    restore_database_backup,
+    scan_consistency,
+    verify_database_backup,
+)
 from agent_mail_bridge.models import OperationStatus, ReceiveResult, SendResult, ServiceResult
 from agent_mail_bridge.security import (
     SecurityError,
@@ -61,6 +70,7 @@ class ApplicationService:
         self.cfg = cfg
         self._receive_lock = threading.Lock()
         self._setup_lock = threading.Lock()
+        self._maintenance_lock = threading.Lock()
         self._ready = False
         if os.getenv("AGENT_MAIL_BRIDGE_DISABLE_CREDENTIAL_STORE") == "1":
             self._credentials = CredentialService(
@@ -568,6 +578,113 @@ class ApplicationService:
             message=f"发现 {len(changes)} 项变化",
             details={"changes": changes},
         )
+
+    def get_maintenance_status(self) -> ServiceResult:
+        self.initialize()
+        try:
+            return ServiceResult(OperationStatus.SUCCESS, details=data_statistics(self.cfg))
+        except Exception as exc:  # noqa: BLE001
+            return ServiceResult(
+                OperationStatus.FAILED, error_code="maintenance_status_failed",
+                message=f"读取维护状态失败：{exc}",
+            )
+
+    def create_backup(self) -> ServiceResult:
+        self.initialize()
+        if not self._maintenance_lock.acquire(blocking=False):
+            return ServiceResult(
+                OperationStatus.CANCELLED, error_code="maintenance_busy",
+                message="已有维护任务正在运行",
+            )
+        try:
+            backup = create_database_backup(self.cfg)
+            return ServiceResult(
+                OperationStatus.SUCCESS, message="数据库备份创建并校验成功",
+                details=backup,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ServiceResult(
+                OperationStatus.FAILED, error_code="backup_failed",
+                message=f"数据库备份失败：{exc}",
+            )
+        finally:
+            self._maintenance_lock.release()
+
+    def verify_backup(self, path: str | Path) -> ServiceResult:
+        try:
+            verified = verify_database_backup(self.cfg, path)
+            return ServiceResult(
+                OperationStatus.SUCCESS, message="备份完整性校验通过", details=verified
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ServiceResult(
+                OperationStatus.FAILED, error_code="backup_invalid",
+                message=f"备份验证失败：{exc}",
+            )
+
+    def list_backups(self) -> ServiceResult:
+        self.initialize()
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            details={"backups": list_database_backups(self.cfg)},
+        )
+
+    def restore_backup(self, path: str | Path, *, confirmed: bool = False) -> ServiceResult:
+        """恢复必须由界面明确确认，且收件或维护任务运行时拒绝。"""
+        self.initialize()
+        if not confirmed:
+            return ServiceResult(
+                OperationStatus.CANCELLED, error_code="restore_confirmation_required",
+                message="恢复前必须明确确认",
+            )
+        if self._receive_lock.locked() or not self._maintenance_lock.acquire(blocking=False):
+            return ServiceResult(
+                OperationStatus.CANCELLED, error_code="maintenance_busy",
+                message="当前有任务运行，暂不能恢复数据库",
+            )
+        try:
+            restored = restore_database_backup(self.cfg, path)
+            init_db(self.cfg.db_path)
+            return ServiceResult(
+                OperationStatus.SUCCESS, message="数据库恢复并重新打开成功",
+                details=restored,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ServiceResult(
+                OperationStatus.FAILED, error_code="restore_failed",
+                message=f"数据库恢复失败，当前数据库已保留或回滚：{exc}",
+            )
+        finally:
+            self._maintenance_lock.release()
+
+    def scan_consistency(self) -> ServiceResult:
+        self.initialize()
+        try:
+            details = scan_consistency(self.cfg)
+            return ServiceResult(
+                OperationStatus.SUCCESS,
+                message=f"一致性扫描完成，发现 {len(details['issues'])} 项",
+                details=details,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ServiceResult(
+                OperationStatus.FAILED, error_code="consistency_scan_failed",
+                message=f"一致性扫描失败：{exc}",
+            )
+
+    def export_maintenance_report(self, destination: str | Path) -> ServiceResult:
+        self.initialize()
+        try:
+            report = export_maintenance_report(self.cfg, destination)
+            return ServiceResult(
+                OperationStatus.SUCCESS, message="脱敏维护报告已导出",
+                details={"report_path": str(report)},
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ServiceResult(
+                OperationStatus.FAILED, error_code="maintenance_report_failed",
+                message=f"维护报告导出失败：{exc}",
+            )
 
     def get_config_and_connection_status(self) -> ServiceResult:
         """返回脱敏配置及三个连接面的可见状态。"""

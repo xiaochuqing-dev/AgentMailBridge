@@ -392,6 +392,7 @@ class BridgeWindow(QMainWindow):
             ("send", "▷", "发邮件"),
             ("history", "○", "历史记录"),
             ("logs", "≡", "日志"),
+            ("maintenance", "▣", "数据维护"),
             ("agent", "◇", "Agent 接口"),
         )
         for key, icon, text in nav_items:
@@ -449,6 +450,7 @@ class BridgeWindow(QMainWindow):
             "advanced": self._build_advanced_page(),
             "history": self._build_history_page(),
             "logs": self._build_logs_page(),
+            "maintenance": self._build_maintenance_page(),
             "agent": self._build_agent_page(),
         }
         for page in self.pages.values():
@@ -834,6 +836,150 @@ class BridgeWindow(QMainWindow):
         self._configure_log_table(self.full_logs_table, full=True)
         layout.addWidget(self.full_logs_table, 1)
         return page
+
+    def _build_maintenance_page(self) -> QWidget:
+        page, layout = self._standard_page(
+            "数据维护",
+            "备份和扫描默认不删除用户数据；数据库恢复前会再次确认并自动备份当前库。",
+        )
+        actions = QHBoxLayout()
+        self.maintenance_refresh_button = self._button("刷新状态", self.refresh_maintenance)
+        self.backup_button = self._button("创建备份", self.create_backup, primary=True)
+        self.scan_button = self._button("一致性扫描", self.run_consistency_scan)
+        self.verify_backup_button = self._button("验证备份", self.choose_verify_backup)
+        self.restore_backup_button = self._button("恢复备份", self.choose_restore_backup)
+        self.open_backup_button = self._button("打开备份目录", self.open_backup_folder)
+        self.export_maintenance_button = self._button("导出维护报告", self.export_maintenance_report)
+        for button in (
+            self.maintenance_refresh_button, self.backup_button, self.scan_button,
+            self.verify_backup_button, self.restore_backup_button,
+            self.open_backup_button, self.export_maintenance_button,
+        ):
+            actions.addWidget(button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+        self.maintenance_summary = QTextEdit()
+        self.maintenance_summary.setReadOnly(True)
+        self.maintenance_summary.setFixedHeight(190)
+        layout.addWidget(self.maintenance_summary)
+        self.backup_table = DataTable(["备份文件", "大小", "状态"])
+        layout.addWidget(self.backup_table, 1)
+        return page
+
+    def refresh_maintenance(self) -> None:
+        self._run_task(
+            "正在读取数据维护状态",
+            self.service.get_maintenance_status,
+            self._show_maintenance_status,
+            button=self.maintenance_refresh_button,
+        )
+
+    def _show_maintenance_status(self, result: ServiceResult) -> None:
+        if not result.ok:
+            self._show_service_result(result)
+            return
+        details = result.details
+        counts = details.get("counts", {})
+        lines = [
+            f"数据目录：{self.service.cfg.data_root_path}",
+            f"SQLite：{details.get('integrity_check', '—')}，{format_size(details.get('database_size_bytes', 0))}",
+            f"收件记录：{counts.get('received_messages', 0)}，发件记录：{counts.get('sent_files', 0)}，MCP：{counts.get('mcp_calls', 0)}",
+            f"received：{details.get('received', {}).get('files', 0)} 个文件 / {format_size(details.get('received', {}).get('size_bytes', 0))}",
+            f"send：{details.get('send', {}).get('files', 0)} 个文件 / {format_size(details.get('send', {}).get('size_bytes', 0))}",
+            f"sent：{details.get('sent', {}).get('files', 0)} 个文件 / {format_size(details.get('sent', {}).get('size_bytes', 0))}",
+        ]
+        self.maintenance_summary.setPlainText("\n".join(lines))
+        backups = details.get("backups", [])
+        self.backup_table.setRowCount(0)
+        for index, backup in enumerate(backups):
+            self.backup_table.insertRow(index)
+            values = [
+                str(backup.get("name", "")),
+                format_size(int(backup.get("size_bytes", 0))),
+                "有效" if backup.get("status") == "valid" else "损坏",
+            ]
+            for column, value in enumerate(values):
+                self.backup_table.setItem(index, column, QTableWidgetItem(value))
+        self._show_service_result(result)
+
+    def create_backup(self) -> None:
+        self._run_task(
+            "正在创建并校验数据库备份",
+            self.service.create_backup,
+            lambda result: (self._show_service_result(result), self.refresh_maintenance()),
+            button=self.backup_button,
+        )
+
+    def run_consistency_scan(self) -> None:
+        self._run_task(
+            "正在执行只读一致性扫描",
+            self.service.scan_consistency,
+            self._show_consistency_result,
+            button=self.scan_button,
+        )
+
+    def _show_consistency_result(self, result: ServiceResult) -> None:
+        if result.ok:
+            summary = result.details.get("summary", {})
+            self.maintenance_summary.setPlainText(
+                "一致性扫描结果（未删除任何数据）\n"
+                f"缺失：{summary.get('missing', 0)}，孤立：{summary.get('orphan', 0)}，"
+                f"Hash 异常：{summary.get('hash_mismatch', 0)}，越界：{summary.get('unsafe_path', 0)}，"
+                f"暂存残留：{summary.get('staging_residual', 0)}，无法访问：{summary.get('inaccessible', 0)}"
+            )
+        self._show_service_result(result)
+
+    def _choose_backup_path(self, title: str) -> str:
+        path, _ = QFileDialog.getOpenFileName(
+            self, title, str(self.service.cfg.data_root_path / "backups"), "SQLite 备份 (*.db)"
+        )
+        return path
+
+    def choose_verify_backup(self) -> None:
+        path = self._choose_backup_path("选择要验证的数据库备份")
+        if path:
+            self._run_task(
+                "正在验证数据库备份", lambda: self.service.verify_backup(path),
+                self._show_service_result, button=self.verify_backup_button,
+            )
+
+    def choose_restore_backup(self) -> None:
+        path = self._choose_backup_path("选择要恢复的数据库备份")
+        if not path:
+            return
+        confirmation = QMessageBox.question(
+            self, "确认恢复数据库",
+            "恢复前会自动备份当前数据库。附件文件不会被覆盖。是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            self.show_message("已取消数据库恢复", "normal")
+            return
+        self._run_task(
+            "正在校验并恢复数据库", lambda: self.service.restore_backup(path, confirmed=True),
+            lambda result: (self._show_service_result(result), self.request_refresh()),
+            button=self.restore_backup_button,
+        )
+
+    def open_backup_folder(self) -> None:
+        folder = self.service.cfg.data_root_path / "backups"
+        folder.mkdir(parents=True, exist_ok=True)
+        os.startfile(str(folder))
+
+    def export_maintenance_report(self) -> None:
+        destination, _ = QFileDialog.getSaveFileName(
+            self, "保存脱敏维护报告",
+            str(self.service.cfg.data_root_path / "maintenance-report.md"),
+            "Markdown 文件 (*.md)",
+        )
+        if destination:
+            self._run_task(
+                "正在导出脱敏维护报告",
+                lambda: self.service.export_maintenance_report(destination),
+                self._show_service_result,
+                button=self.export_maintenance_button,
+            )
 
     def _build_agent_page(self) -> QWidget:
         page, layout = self._standard_page(
