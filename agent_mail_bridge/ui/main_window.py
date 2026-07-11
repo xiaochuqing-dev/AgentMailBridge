@@ -45,6 +45,14 @@ from agent_mail_bridge.application_service import ApplicationService
 from agent_mail_bridge.database import close_connection
 from agent_mail_bridge.credentials import GMAIL_IMAP_SECRET, QQ_SMTP_SECRET
 from agent_mail_bridge.desktop_runtime import StartupManager
+from agent_mail_bridge.version import __version__
+from agent_mail_bridge.mcp_client_config import (
+    generic_mcp_json,
+    mcp_client_command,
+    mcp_launch,
+)
+from agent_mail_bridge.runtime_paths import get_runtime_paths
+from agent_mail_bridge.oauth_storage import import_oauth_credentials
 from agent_mail_bridge.models import OperationStatus, ReceiveResult, SendResult, ServiceResult
 from agent_mail_bridge.security import SecurityError, assert_within_allowed_roots
 from agent_mail_bridge.ui.settings_store import save_env_values
@@ -174,7 +182,7 @@ class TitleBar(QWidget):
         self.brand_asset_loaded = apply_brand_label(icon, paint_app_icon)
         title = QLabel("Agent 邮箱桥接工具")
         title.setObjectName("appTitle")
-        version = QLabel("v1.0.0")
+        version = QLabel(f"v{__version__}")
         version.setObjectName("version")
         layout.addWidget(icon)
         layout.addWidget(title)
@@ -826,6 +834,7 @@ class BridgeWindow(QMainWindow):
         actions.setVerticalSpacing(8)
         save = self._button("保存高级设置", self.save_advanced_config, primary=True)
         self.authorize_button = self._button("Gmail API 显式授权", self.authorize_gmail_api)
+        self.import_oauth_button = self._button("导入 OAuth JSON", self.import_oauth_json)
         self.imap_diagnose_button = self._button("诊断 IMAP")
         self.gmail_api_diagnose_button = self._button("诊断 Gmail API")
         self.smtp_diagnose_button = self._button("诊断 QQ SMTP")
@@ -851,7 +860,7 @@ class BridgeWindow(QMainWindow):
         self.export_diagnosis_button.clicked.connect(self.export_diagnostic_report)
         self.task_buttons.extend((auth, imap, api, smtp, self.export_diagnosis_button))
         action_buttons = (
-            save, auth, imap, api, smtp,
+            save, self.import_oauth_button, auth, imap, api, smtp,
             self.export_diagnosis_button, self.error_details_button,
             self.delete_qq_credential_button,
         )
@@ -1066,7 +1075,11 @@ class BridgeWindow(QMainWindow):
         status_grid.setHorizontalSpacing(18)
         status_grid.setVerticalSpacing(8)
         status_grid.addWidget(QLabel("MCP 状态"), 0, 0)
-        self.mcp_status_label = QLabel("可用 · stdio · 仅本机")
+        mcp_command, _ = mcp_launch()
+        packaged_mcp_ready = not get_runtime_paths().frozen or Path(mcp_command).is_file()
+        self.mcp_status_label = QLabel(
+            "已安装 · 按需启动 · stdio" if packaged_mcp_ready else "内部 MCP 组件缺失"
+        )
         self.mcp_status_label.setStyleSheet(f"color: {SUCCESS}; font-weight: 700;")
         status_grid.addWidget(self.mcp_status_label, 0, 1)
         status_grid.addWidget(QLabel("固定 Gmail"), 1, 0)
@@ -1086,15 +1099,22 @@ class BridgeWindow(QMainWindow):
         self.mcp_command_text = QTextEdit()
         self.mcp_command_text.setReadOnly(True)
         self.mcp_command_text.setFixedHeight(104)
+        command, args = mcp_launch()
+        launch_text = (
+            subprocess.list2cmdline([command, *args])
+            if get_runtime_paths().frozen
+            else "python -m agent_mail_bridge.mcp_server"
+        )
         self.mcp_command_text.setPlainText(
-            "启动命令：python -m agent_mail_bridge.mcp_server\n\n"
-            "Codex：codex mcp add agent-mail-bridge -- python -m agent_mail_bridge.mcp_server\n"
-            "Claude Code：claude mcp add agent-mail-bridge -- python -m agent_mail_bridge.mcp_server"
+            f"内部接口：{launch_text}\n按需启动，会话结束自动退出\n\n"
+            f"Codex：{mcp_client_command('codex')}\n"
+            f"Claude Code：{mcp_client_command('claude')}"
         )
         layout.addWidget(self.mcp_command_text)
         actions = QHBoxLayout()
         actions.addWidget(self._button("复制 Codex 配置", lambda: self._copy_mcp_config("codex")))
         actions.addWidget(self._button("复制 Claude Code 配置", lambda: self._copy_mcp_config("claude")))
+        actions.addWidget(self._button("复制通用 JSON", lambda: self._copy_mcp_config("json")))
         self.mcp_refresh_button = self._button("刷新调用记录", primary=True)
         self.mcp_refresh_button.clicked.connect(
             lambda: self.request_refresh(self.mcp_refresh_button)
@@ -1521,6 +1541,33 @@ class BridgeWindow(QMainWindow):
             button=self.authorize_button,
             operation_name="授权",
         )
+
+    def import_oauth_json(self) -> None:
+        source, _ = QFileDialog.getOpenFileName(
+            self,
+            "导入 Gmail OAuth 客户端配置",
+            "",
+            "JSON 文件 (*.json)",
+        )
+        if not source:
+            return
+        target = self.service.cfg.gmail_api_credentials_path
+        replace = False
+        if target.exists():
+            replace = QMessageBox.question(
+                self,
+                "替换 OAuth 客户端配置",
+                "受控 OAuth 目录中已存在配置，确认替换吗？现有 token 不会删除。",
+            ) == QMessageBox.StandardButton.Yes
+            if not replace:
+                return
+        try:
+            import_oauth_credentials(Path(source), destination=target, replace=replace)
+        except (OSError, ValueError) as exc:
+            self.show_message(f"OAuth 配置导入失败：{exc}", "error")
+            return
+        self.refresh()
+        self.show_message("OAuth 客户端配置已复制到受控用户目录", "success")
 
     def save_basic_config(self) -> None:
         email = self.gmail_email_edit.text().strip()
@@ -2334,8 +2381,9 @@ class BridgeWindow(QMainWindow):
 
     def _copy_mcp_config(self, target: str) -> None:
         commands = {
-            "codex": "codex mcp add agent-mail-bridge -- python -m agent_mail_bridge.mcp_server",
-            "claude": "claude mcp add agent-mail-bridge -- python -m agent_mail_bridge.mcp_server",
+            "codex": mcp_client_command("codex"),
+            "claude": mcp_client_command("claude"),
+            "json": generic_mcp_json(),
         }
         command = commands.get(target)
         if command is None:
@@ -2420,7 +2468,7 @@ class BridgeWindow(QMainWindow):
         QMessageBox.information(
             self,
             "关于 AgentMailBridge",
-            "AgentMailBridge v1.0.0\n\n本地优先、单用户的邮箱桥接工具。\n"
+            f"AgentMailBridge v{__version__}\n\n本地优先、单用户的邮箱桥接工具。\n"
             f"{logo_state}。\n正式界面使用 PySide6，核心能力复用 ApplicationService。",
         )
 

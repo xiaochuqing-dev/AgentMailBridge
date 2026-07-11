@@ -11,18 +11,25 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import QLabel
 
+from agent_mail_bridge.runtime_paths import get_runtime_paths
 
-BRAND_DIR = Path(__file__).resolve().parents[1] / "resources" / "branding"
-BRAND_CANDIDATES = (
-    BRAND_DIR / "agentmailbridge.ico",
-    BRAND_DIR / "agentmailbridge.png",
-    BRAND_DIR / "logo.png",
-)
+
+def brand_candidates() -> tuple[Path, ...]:
+    brand_dir = get_runtime_paths().resource_root / "branding"
+    return (
+        brand_dir / "agentmailbridge.ico",
+        brand_dir / "agentmailbridge.png",
+        brand_dir / "logo.png",
+    )
+
+
+# 源码兼容常量；实际查找每次重新发现路径，以支持 frozen。
+BRAND_CANDIDATES = brand_candidates()
 
 
 def find_brand_asset() -> Path | None:
     """返回第一个可用的最终品牌资源。"""
-    return next((path for path in BRAND_CANDIDATES if path.is_file()), None)
+    return next((path for path in brand_candidates() if path.is_file()), None)
 
 
 def brand_icon() -> QIcon:

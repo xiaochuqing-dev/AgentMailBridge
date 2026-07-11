@@ -253,7 +253,7 @@ def test_env_save_preserves_unrelated_lines_and_quotes_values(tmp_path: Path):
     assert "# 保留注释" in content
     assert "UNRELATED=keep" in content
     assert 'GMAIL_ADDRESS="new@example.com"' in content
-    assert 'QQ_AUTH_CODE="dummy \\"code\\""' in content
+    assert "QQ_AUTH_CODE" not in content
     assert not list(tmp_path.glob("*.tmp"))
 
 

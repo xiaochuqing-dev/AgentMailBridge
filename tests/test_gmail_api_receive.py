@@ -134,6 +134,11 @@ def _make_message(
 
 @pytest.fixture()
 def tmp_cfg(tmp_path: Path) -> AppConfig:
+    credentials_path = tmp_path / "credentials.json"
+    credentials_path.write_text(
+        '{"installed":{"client_id":"test","client_secret":"test"}}',
+        encoding="utf-8",
+    )
     cfg = AppConfig(
         gmail_address="user@gmail.com",
         gmail_app_password="",
@@ -142,6 +147,8 @@ def tmp_cfg(tmp_path: Path) -> AppConfig:
         owner_gmail="user@gmail.com",
         data_root=tmp_path / "data",
         gmail_receive_backend="gmail_api",
+        gmail_api_credentials_path=credentials_path,
+        gmail_api_token_path=tmp_path / "token.json",
         gmail_api_max_results=20,
         gmail_api_query="in:inbox",
         gmail_api_scopes=["https://www.googleapis.com/auth/gmail.readonly"],

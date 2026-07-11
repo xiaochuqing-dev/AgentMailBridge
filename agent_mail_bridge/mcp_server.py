@@ -14,9 +14,10 @@ from agent_mail_bridge.application_service import ApplicationService
 from agent_mail_bridge.config import load_config
 from agent_mail_bridge.database import close_connection
 from agent_mail_bridge.models import OperationStatus, SendResult
+from agent_mail_bridge.version import __version__
 
 SERVER_NAME = "agent-mail-bridge"
-SERVER_VERSION = "0.4.0"
+SERVER_VERSION = __version__
 LATEST_PROTOCOL_VERSION = "2025-06-18"
 SUPPORTED_PROTOCOL_VERSIONS = {
     "2024-11-05",

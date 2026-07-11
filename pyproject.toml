@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-mail-bridge"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Agent Mail Bridge - 面向 AI Agent 工作流的本地邮箱桥接桌面工具"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -29,6 +29,12 @@ agent-mail-bridge-mcp = "agent_mail_bridge.mcp_server:main"
 
 [tool.setuptools.packages.find]
 include = ["agent_mail_bridge*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "agent_mail_bridge.version.__version__" }
+
+[tool.setuptools.package-data]
+agent_mail_bridge = ["resources/branding/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

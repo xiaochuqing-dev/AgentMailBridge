@@ -1,7 +1,7 @@
 """配置加载模块。
 
 职责：
-1. 读取项目根目录下 `.env` 文件（若不存在则使用 `.env.example` 的默认值占位）。
+1. 源码模式读取项目 `.env`，安装版读取当前用户配置目录 `.env`。
 2. 把环境变量解析为强类型的 AppConfig 对象。
 3. 提供安全校验：缺少关键配置时给出明确错误提示。
 4. 不允许真实密钥进入代码库；日志中不打印完整密码 / 授权码。
@@ -15,6 +15,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from agent_mail_bridge.runtime_paths import get_runtime_paths
+
 try:
     # python-dotenv 为可选依赖，缺失时回退到纯环境变量
     from dotenv import load_dotenv
@@ -22,8 +24,8 @@ except Exception:  # pragma: no cover - 仅在未安装时触发
     load_dotenv = None  # type: ignore[assignment]
 
 
-# 项目根目录：本文件位于 agent_mail_bridge/config.py，根目录是其上两层
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# 兼容旧调用；新代码应通过 RuntimePaths 明确路径语义。
+PROJECT_ROOT = get_runtime_paths().source_root
 
 
 def _as_bool(value: str | None, default: bool = False) -> bool:
@@ -102,12 +104,12 @@ def _as_positive_int(value: str | None, field: str, default: int) -> int:
     return n
 
 
-def _resolve_path(raw: str, default: str) -> Path:
-    """把配置中的路径解析为绝对路径：相对路径基于项目根目录。"""
+def _resolve_path(raw: str, default: str, *, base_dir: Path) -> Path:
+    """把配置中的路径解析为绝对路径；相对路径基于配置文件目录。"""
     text = (raw or default).strip()
     p = Path(text)
     if not p.is_absolute():
-        p = (PROJECT_ROOT / p).resolve()
+        p = (base_dir / p).resolve()
     return p
 
 
@@ -132,12 +134,12 @@ class AppConfig:
     # gmail_api = 通过 Gmail API over HTTPS 443 收件（需 OAuth）
     # auto      = 优先 gmail_api（已配置），否则回退 imap
     gmail_receive_backend: str = "auto"
-    # Gmail API OAuth 文件（相对路径基于项目根目录）
+    # Gmail API OAuth 文件（安装版默认位于当前用户 OAuth 目录）
     gmail_api_credentials_path: Path = field(
-        default_factory=lambda: PROJECT_ROOT / "secrets" / "credentials.json"
+        default_factory=lambda: get_runtime_paths().oauth_root / "credentials.json"
     )
     gmail_api_token_path: Path = field(
-        default_factory=lambda: PROJECT_ROOT / "secrets" / "token.json"
+        default_factory=lambda: get_runtime_paths().oauth_root / "token.json"
     )
     # Gmail API scope（默认只读）
     gmail_api_scopes: list[str] = field(
@@ -163,7 +165,7 @@ class AppConfig:
     owner_gmail: str = ""
 
     # --- 本地数据目录 ---
-    data_root: Path = field(default_factory=lambda: PROJECT_ROOT / "AgentMailBridgeData")
+    data_root: Path = field(default_factory=lambda: get_runtime_paths().data_root)
     # 允许应用服务读取并发送文件的额外目录；默认只允许 DATA_ROOT。
     allowed_send_roots: list[Path] = field(default_factory=list)
 
@@ -289,7 +291,7 @@ def load_config(env_path: Path | str | None = None) -> AppConfig:
     """加载配置。
 
     Args:
-        env_path: 自定义 .env 路径；默认使用项目根目录下的 .env。
+        env_path: 自定义 .env 路径；默认由 RuntimePaths 决定。
 
     Returns:
         AppConfig 实例。
@@ -297,30 +299,49 @@ def load_config(env_path: Path | str | None = None) -> AppConfig:
     注意：本函数只负责读取，不强制要求所有字段都填写。
     收 / 发件时再按需校验。
     """
+    runtime = get_runtime_paths()
+    env_file = Path(env_path).expanduser().resolve() if env_path else runtime.config_file
     if load_dotenv is not None and not _as_bool(
         os.getenv("AGENT_MAIL_BRIDGE_DISABLE_DOTENV"), False
     ):
-        env_file = Path(env_path) if env_path else PROJECT_ROOT / ".env"
         if env_file.exists():
             load_dotenv(env_file, override=False)
 
     from agent_mail_bridge.credentials import load_secure_secrets
     secure_secrets = load_secure_secrets()
 
-    data_root_raw = os.getenv("DATA_ROOT", "./AgentMailBridgeData").strip()
+    base_dir = env_file.parent
+    default_data_root = (
+        str(runtime.data_root) if runtime.frozen else "./AgentMailBridgeData"
+    )
+    data_root_raw = os.getenv("DATA_ROOT", default_data_root).strip()
     data_root = Path(data_root_raw)
     if not data_root.is_absolute():
-        data_root = (PROJECT_ROOT / data_root).resolve()
+        data_root = (base_dir / data_root).resolve()
 
     allowed_send_roots = []
     for raw_path in os.getenv("ALLOWED_SEND_ROOTS", "").split(os.pathsep):
         if raw_path.strip():
-            allowed_send_roots.append(_resolve_path(raw_path, raw_path))
+            allowed_send_roots.append(
+                _resolve_path(raw_path, raw_path, base_dir=base_dir)
+            )
+
+    # 安装版不从普通配置读取秘密；环境变量回退仅保留给源码迁移兼容。
+    legacy_gmail_secret = "" if runtime.frozen else os.getenv("GMAIL_APP_PASSWORD", "")
+    legacy_qq_secret = "" if runtime.frozen else os.getenv("QQ_AUTH_CODE", "")
+    default_credentials = (
+        str(runtime.oauth_root / "credentials.json")
+        if runtime.frozen else "secrets/credentials.json"
+    )
+    default_token = (
+        str(runtime.oauth_root / "token.json")
+        if runtime.frozen else "secrets/token.json"
+    )
 
     cfg = AppConfig(
         gmail_address=os.getenv("GMAIL_ADDRESS", "").strip(),
         gmail_app_password=secure_secrets.get(
-            "GMAIL_APP_PASSWORD", os.getenv("GMAIL_APP_PASSWORD", "")
+            "GMAIL_APP_PASSWORD", legacy_gmail_secret
         ).strip(),
         gmail_imap_host=os.getenv("GMAIL_IMAP_HOST", "imap.gmail.com").strip(),
         gmail_imap_port=_as_int(os.getenv("GMAIL_IMAP_PORT"), 993),
@@ -341,10 +362,12 @@ def load_config(env_path: Path | str | None = None) -> AppConfig:
             os.getenv("GMAIL_RECEIVE_BACKEND"), "auto"
         ),
         gmail_api_credentials_path=_resolve_path(
-            os.getenv("GMAIL_API_CREDENTIALS_PATH", ""), "secrets/credentials.json"
+            os.getenv("GMAIL_API_CREDENTIALS_PATH", ""), default_credentials,
+            base_dir=base_dir,
         ),
         gmail_api_token_path=_resolve_path(
-            os.getenv("GMAIL_API_TOKEN_PATH", ""), "secrets/token.json"
+            os.getenv("GMAIL_API_TOKEN_PATH", ""), default_token,
+            base_dir=base_dir,
         ),
         gmail_api_scopes=[
             s.strip()
@@ -358,7 +381,7 @@ def load_config(env_path: Path | str | None = None) -> AppConfig:
         gmail_api_query=os.getenv("GMAIL_API_QUERY", "in:inbox").strip(),
         qq_email=os.getenv("QQ_EMAIL", "").strip(),
         qq_auth_code=secure_secrets.get(
-            "QQ_AUTH_CODE", os.getenv("QQ_AUTH_CODE", "")
+            "QQ_AUTH_CODE", legacy_qq_secret
         ).strip(),
         qq_smtp_host=os.getenv("QQ_SMTP_HOST", "smtp.qq.com").strip(),
         qq_smtp_port=_as_int(os.getenv("QQ_SMTP_PORT"), 465),

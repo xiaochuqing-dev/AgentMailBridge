@@ -45,6 +45,7 @@ from agent_mail_bridge.mail_receive import receive_mails
 from agent_mail_bridge.mail_send import send_file_to_owner_gmail
 from agent_mail_bridge.storage import ensure_data_dirs
 from agent_mail_bridge.utils import fmt_date
+from agent_mail_bridge.version import __version__
 
 
 def _setup(cfg) -> None:
@@ -265,6 +266,37 @@ def cmd_migrate_credentials(args, cfg) -> int:
     return 0 if result.ok else 1
 
 
+def cmd_import_config(args, cfg) -> int:
+    """显式导入旧配置，不扫描其他目录。"""
+    del cfg
+    from agent_mail_bridge.ui.settings_store import import_legacy_env
+
+    try:
+        result = import_legacy_env(Path(args.from_path))
+    except Exception as exc:  # noqa: BLE001
+        print(f"旧配置导入失败：{exc}", file=sys.stderr)
+        return 1
+    print(
+        f"旧配置已导入：{result.destination}；"
+        f"非敏感项 {len(result.imported_keys)}，安全迁移凭据 {len(result.migrated_secret_keys)}"
+    )
+    return 0
+
+
+def cmd_import_oauth(args, cfg) -> int:
+    """复制用户明确选择的 credentials.json 到受控 OAuth 目录。"""
+    del cfg
+    from agent_mail_bridge.oauth_storage import import_oauth_credentials
+
+    try:
+        target = import_oauth_credentials(Path(args.from_path), replace=args.replace)
+    except Exception as exc:  # noqa: BLE001
+        print(f"OAuth 客户端配置导入失败：{exc}", file=sys.stderr)
+        return 1
+    print(f"OAuth 客户端配置已导入：{target}")
+    return 0
+
+
 def cmd_stability_benchmark(args, cfg) -> int:
     """执行隔离的大数据量与资源稳定性基准。"""
     del cfg
@@ -306,6 +338,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="agent_mail_bridge",
         description="Agent Mail Bridge - 面向 AI Agent 的本地邮箱桥接工具",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     # init
@@ -353,6 +386,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("diagnose-network", help="诊断整体网络环境")
     sub.add_parser("credential-status", help="显示 Windows 凭据配置状态")
     sub.add_parser("migrate-credentials", help="迁移旧 .env 凭据到 Windows 安全存储")
+    p_import = sub.add_parser("import-config", help="显式导入旧版 .env 配置")
+    p_import.add_argument("--from", dest="from_path", required=True, help="旧 .env 文件路径")
+    p_oauth = sub.add_parser("import-oauth", help="导入 Gmail OAuth credentials.json")
+    p_oauth.add_argument("--from", dest="from_path", required=True, help="credentials.json 路径")
+    p_oauth.add_argument("--replace", action="store_true", help="明确替换已导入的客户端配置")
     p_benchmark = sub.add_parser("stability-benchmark", help="运行隔离性能与稳定性基准")
     p_benchmark.add_argument("--records", type=int, default=10000, help="收件记录数，默认 10000")
     p_benchmark.add_argument("--cycles", type=int, default=50, help="刷新周期数，默认 50")
@@ -369,6 +407,10 @@ def main(argv: list[str] | None = None) -> int:
     # init 命令不需要预先 setup（它本身就是做 setup）
     if args.command == "init":
         return cmd_init(args, cfg)
+    if args.command == "import-config":
+        return cmd_import_config(args, cfg)
+    if args.command == "import-oauth":
+        return cmd_import_oauth(args, cfg)
 
     # diagnose-* 命令只做诊断，不写数据库、不建目录
     if args.command == "diagnose-gmail":

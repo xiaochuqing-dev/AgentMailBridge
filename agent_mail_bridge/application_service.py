@@ -170,9 +170,11 @@ class ApplicationService:
                 error_code="credential_store_disabled",
                 message="测试环境已禁用真实凭据存储",
             )
-        from agent_mail_bridge.config import PROJECT_ROOT
+        from agent_mail_bridge.runtime_paths import get_runtime_paths
         try:
-            result = CredentialService().migrate_env(env_path or PROJECT_ROOT / ".env")
+            result = CredentialService().migrate_env(
+                env_path or get_runtime_paths().source_root / ".env"
+            )
         except Exception as exc:  # noqa: BLE001
             return ServiceResult(
                 OperationStatus.FAILED,

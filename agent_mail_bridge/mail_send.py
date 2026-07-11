@@ -314,10 +314,6 @@ def send_file_with_request(
 ) -> dict[str, Any]:
     """按 request_id 幂等发送，并准确区分 SMTP 与归档状态。"""
     try:
-        require_send_config(cfg)
-    except ConfigError as exc:
-        return _send_error_result(request_id, "configuration_error", str(exc))
-    try:
         source_path = assert_within_allowed_roots(
             Path(file_path), cfg.effective_allowed_send_roots
         )
@@ -331,6 +327,10 @@ def send_file_with_request(
     size_bytes = source_path.stat().st_size
     if not check_size_ok(size_bytes, cfg.max_send_file_bytes):
         return _send_error_result(request_id, "file_too_large", "文件超过发送大小限制")
+    try:
+        require_send_config(cfg)
+    except ConfigError as exc:
+        return _send_error_result(request_id, "configuration_error", str(exc))
 
     sha = sha256_of_file(source_path)
     confirmed_name = attachment_name or source_path.name

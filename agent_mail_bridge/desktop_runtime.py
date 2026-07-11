@@ -35,6 +35,8 @@ class StartupManager:
 
     @staticmethod
     def command() -> str:
+        if getattr(sys, "frozen", False):
+            return subprocess.list2cmdline([sys.executable, "--background"])
         return subprocess.list2cmdline([sys.executable, "-m", "agent_mail_bridge.gui", "--background"])
 
     @classmethod

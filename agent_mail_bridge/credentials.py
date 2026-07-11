@@ -145,9 +145,22 @@ class CredentialService:
         return self.backend.read(name)
 
     def set(self, name: str, value: str) -> None:
-        self.backend.write(name, value)
-        if self.backend.read(name) != value:
-            raise CredentialError("凭据写入后验证失败")
+        previous = self.backend.read(name)
+        try:
+            self.backend.write(name, value)
+            if self.backend.read(name) != value:
+                raise CredentialError("凭据写入后验证失败")
+        except Exception as exc:
+            try:
+                if previous:
+                    self.backend.write(name, previous)
+                else:
+                    self.backend.delete(name)
+            except Exception:
+                pass
+            if isinstance(exc, CredentialError):
+                raise
+            raise CredentialError("凭据写入失败") from exc
 
     def delete(self, name: str) -> None:
         self.backend.delete(name)
@@ -178,7 +191,7 @@ class CredentialService:
             migrated.append(env_key)
             clear_values[env_key] = ""
         if clear_values:
-            save_env_values(clear_values, env_path)
+            save_env_values(clear_values, env_path, allow_secret_keys=True)
         return MigrationResult(migrated, skipped, failed)
 
 
