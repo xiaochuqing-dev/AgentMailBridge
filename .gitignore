@@ -21,6 +21,10 @@ dist/
 .eggs/
 .pytest_cache/
 test-output/
+artifacts/gui-qa/
+diagnostic-report*.md
+*.diagnostic.md
+screenshots/
 *.log
 .tox/
 .coverage

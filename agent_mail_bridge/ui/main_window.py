@@ -730,7 +730,9 @@ class BridgeWindow(QMainWindow):
         self.unsaved_config_label.setObjectName("hint")
         layout.addWidget(self.unsaved_config_label)
 
-        actions = QHBoxLayout()
+        actions = QGridLayout()
+        actions.setHorizontalSpacing(8)
+        actions.setVerticalSpacing(8)
         save = self._button("保存高级设置", self.save_advanced_config, primary=True)
         self.authorize_button = self._button("Gmail API 显式授权", self.authorize_gmail_api)
         self.imap_diagnose_button = self._button("诊断 IMAP")
@@ -754,12 +756,13 @@ class BridgeWindow(QMainWindow):
         smtp = self.smtp_diagnose_button
         self.export_diagnosis_button.clicked.connect(self.export_diagnostic_report)
         self.task_buttons.extend((auth, imap, api, smtp, self.export_diagnosis_button))
-        for button in (
+        action_buttons = (
             save, auth, imap, api, smtp,
             self.export_diagnosis_button, self.error_details_button,
-        ):
-            actions.addWidget(button)
-        actions.addStretch(1)
+        )
+        for index, button in enumerate(action_buttons):
+            actions.addWidget(button, index // 4, index % 4)
+        actions.setColumnStretch(3, 1)
         layout.addLayout(actions)
         layout.addWidget(horizontal_line())
 
@@ -1068,11 +1071,9 @@ class BridgeWindow(QMainWindow):
             if choice != QMessageBox.StandardButton.Yes:
                 return
         self.page_stack.setCurrentWidget(self.pages[target])
-        for key, button in self.tab_buttons.items():
-            button.setChecked(key == target)
-        nav_target = name if name in self.nav_buttons else target
-        for key, button in self.nav_buttons.items():
-            button.setChecked(key == nav_target)
+        self._set_exclusive_checked(self.tab_buttons, target)
+        nav_target = "basic" if target == "advanced" else name if name in self.nav_buttons else target
+        self._set_exclusive_checked(self.nav_buttons, nav_target)
 
     def _current_page_name(self) -> str:
         if not hasattr(self, "page_stack"):
@@ -1082,6 +1083,17 @@ class BridgeWindow(QMainWindow):
             if page is current:
                 return name
         return "basic"
+
+    @staticmethod
+    def _set_exclusive_checked(buttons: dict[str, QPushButton], selected: str) -> None:
+        """允许跨导航组页面清空旧选中态，再恢复互斥行为。"""
+        for button in buttons.values():
+            button.setAutoExclusive(False)
+            button.setChecked(False)
+        if selected in buttons:
+            buttons[selected].setChecked(True)
+        for button in buttons.values():
+            button.setAutoExclusive(True)
 
     def receive(self) -> None:
         if self.auto_switch.isChecked():

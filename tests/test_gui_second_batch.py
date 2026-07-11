@@ -63,6 +63,11 @@ def test_navigation_switches_real_pages(bridge_window):
     bridge_window.select_page("agent")
     assert bridge_window.page_stack.currentWidget() is bridge_window.pages["agent"]
     assert bridge_window.nav_buttons["agent"].isChecked()
+    assert not any(button.isChecked() for button in bridge_window.tab_buttons.values())
+    bridge_window.select_page("advanced")
+    assert bridge_window.page_stack.currentWidget() is bridge_window.pages["advanced"]
+    assert bridge_window.tab_buttons["advanced"].isChecked()
+    assert bridge_window.nav_buttons["basic"].isChecked()
 
 
 def test_agent_page_exposes_safe_stdio_configuration(bridge_window):
