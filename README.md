@@ -51,7 +51,7 @@ pip install -r requirements.txt
 
 ## 四、配置 `.env`
 
-复制 `.env.example` 为 `.env`，填入真实值：
+复制 `.env.example` 为 `.env`，填写非敏感配置；邮箱秘密值在 GUI 中保存到 Windows Credential Manager：
 
 ```bash
 cp .env.example .env
@@ -66,7 +66,7 @@ cp .env.example .env
 1. 访问 https://myaccount.google.com/apppasswords
 2. 需要先为账号开启两步验证（2FA）。
 3. 生成一个“邮件”用途的应用专用密码，得到 16 位字符串。
-4. 填入 `.env` 的 `GMAIL_APP_PASSWORD`。
+4. 在 GUI 基础配置页输入，保存后不会写入 `.env`。
 
 ### 2. QQ 邮箱授权码
 
@@ -78,7 +78,7 @@ cp .env.example .env
 2. 进入「设置」→「账户」。
 3. 找到「POP3/IMAP/SMTP/Exchange/CardDAV/CalDAV 服务」，开启 IMAP/SMTP 服务。
 4. 按提示用手机发短信验证，生成授权码（16 位）。
-5. 填入 `.env` 的 `QQ_AUTH_CODE`。
+5. 在 GUI 高级设置页输入，保存后不会写入 `.env`。
 
 > ⚠️ `.env` 已被 `.gitignore` 忽略，**绝不会**进入版本库。代码中也不包含任何真实密码。
 
@@ -239,7 +239,7 @@ AgentMailBridgeData/
 
 ## 十、安全注意事项
 
-1. ✅ Gmail 应用密码、QQ 授权码**不写入代码**，仅通过 `.env` 读取。
+1. ✅ Gmail 应用密码、QQ 授权码**不写入代码或明文配置**，由 Windows Credential Manager 保存。
 2. ✅ `.env` 被 `.gitignore` 忽略。
 3. ✅ 不自动执行任何收到的附件。
 4. ✅ 不自动解压 zip 附件。
@@ -558,7 +558,7 @@ agent_mail_bridge/
 - [x] PySide6 GUI 桌面界面：三栏布局、账号配置、今日文件、安全预览、发件、诊断、历史和日志
 - [x] MCP `submit_result` 接口：本机 stdio、固定收件人、路径白名单、审计和 request_id 幂等
 - [ ] ProjectFlow 集成
-- [ ] 系统密钥环（keyring）存储密钥，替代 `.env`
+- [x] Windows Credential Manager 存储密钥并迁移旧 `.env`
 - [ ] QQ SMTP SOCKS5 适配（当前仅预留配置键）
 
 ## 十七、第一批次核心收口说明
@@ -600,3 +600,21 @@ python -m pytest -q
 桌面运行：窗口关闭或最小化会隐藏到系统托盘；从托盘菜单可显示窗口、手动检查、刷新状态或正常退出。自动收件使用单次定时器，失败后按有限退避重试，OAuth 需要重新授权时停止无意义重试。开机启动默认关闭，仅写入当前 Windows 用户的 Run 项；首次缺少 Gmail 地址时会显示简洁配置向导。单实例锁按 DATA_ROOT 隔离，避免重复收件和数据库竞争。
 
 当前限制：仅支持本地单用户；收件人固定为绑定 Gmail；不支持多租户和正式安装包。MCP 第一版只有 submit_result，不提供邮箱读取、删除、标记或任意发件能力。PySide6 会增加后续安装包体积，当前仍通过 Python 命令启动。连续数日运行和休眠唤醒仍建议由用户在真实日常环境中观察。
+
+## 十八、全局文件、凭据、维护与稳定性专项
+
+GUI 的“手动选择发送”可浏览桌面、下载目录、其他磁盘和普通用户目录。用户确认时记录大小、修改时间和 SHA-256，后台发送前再次校验，再复制到 DATA_ROOT/send/staging 下的受控快照。SMTP 与 sent 归档基于快照，邮件附件保留用户确认的原始文件名；历史显示大小、来源和 request_id。危险脚本和可执行文件仍拒绝发送且绝不执行。
+
+该信任入口只属于本地 GUI。CLI send、MCP submit_result 和 Agent 自动流程仍必须位于 DATA_ROOT 或 ALLOWED_SEND_ROOTS，GUI 的全局文件选择不会扩大 MCP 权限。
+
+Gmail IMAP 应用专用密码和 QQ SMTP 授权码由 Windows Credential Manager 保存。旧 `.env` 可执行 `python -m agent_mail_bridge migrate-credentials` 迁移，成功项会在验证后清空，失败项保留旧值。`python -m agent_mail_bridge credential-status` 只显示已配置或未配置，不回显秘密。OAuth credentials.json 和 token.json 继续使用 secrets 目录与只读 Gmail scope，不进入凭据管理器、Git、日志或报告。
+
+GUI“数据维护”页提供容量与记录统计、SQLite 在线备份、验证、确认恢复、一致性扫描、打开备份目录和脱敏维护报告。恢复前自动备份当前数据库；扫描只报告缺失、孤立、Hash 异常、越界和暂存残留，不自动删除文件。附件和 received/sent 文件不会随数据库恢复被覆盖。
+
+可重复稳定性基准命令：
+
+```powershell
+python -m agent_mail_bridge stability-benchmark --records 10000 --cycles 50 --output test-output/stability.json
+```
+
+基准始终使用独立临时 DATA_ROOT，生成收发历史、MCP 审计、日志和代表性文件，测量启动、历史、日志、MCP、组合刷新、内存、线程、句柄、SQLite 和日志轮转，不读取真实邮箱、OAuth 或用户数据。

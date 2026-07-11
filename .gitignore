@@ -21,6 +21,11 @@ dist/
 .eggs/
 .pytest_cache/
 test-output/
+performance-output/
+stability-output/
+maintenance-report*.md
+AgentMailBridgeData/backups/
+AgentMailBridgeData/send/staging/
 artifacts/gui-qa/
 diagnostic-report*.md
 *.diagnostic.md
