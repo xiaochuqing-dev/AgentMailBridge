@@ -37,3 +37,15 @@
 测试：新增阶段 5.5 GUI 回归测试，完整测试结果为 213 项通过。Windows 图形后端完成 100% 截图验收，并以 Qt 1.25、1.50 比例检查布局。未改变 Gmail、QQ SMTP、MCP 和 SQLite 核心实现，未新增第三方依赖。
 
 兼容性：仍支持 Python 3.11+ 和 PySide6；保持现有 `.env` 配置键，不要求数据迁移。当前不包含正式 Windows 安装包。
+# 0.9.0 - 2026-07-12
+
+- 新增 source/frozen 双模式 Runtime Paths，安装目录与配置、OAuth、数据、缓存彻底分离。
+- 新增用户明确选择的旧 `.env` 事务式导入与 OAuth JSON 受控复制；秘密值写入并回读验证后才清空旧文件。
+- 修复首次配置向导把 QQ 授权码交给普通配置保存的 P0 风险；普通配置层拒绝写入非空秘密。
+- 统一 Python、GUI、MCP、EXE 和安装器版本为 0.9.0。
+- 新增 PyInstaller onedir 双入口：用户可见 `AgentMailBridge.exe` 与内部按需 stdio `AgentMailBridgeMCP.exe`。
+- 新增 frozen 开机启动命令、安装版 MCP 配置生成、资源发现、EXE 图标和版本元数据。
+- 新增 Inno Setup 当前用户安装器，支持覆盖安装、默认保留用户数据的卸载及失效开机启动项清理。
+- 新增可重复构建、packaged smoke、真实发送 E2E、秘密排除、portable ZIP、SHA-256 和 Defender 验收流程。
+- 251 项自动化测试通过；10,000 条/50 周期稳定性基准通过。
+- 最终 Gate 为 CONDITIONALLY PASS：缺真正独立无 Python Sandbox/VM 和跨版本旧候选升级，不建议立即公开发布。

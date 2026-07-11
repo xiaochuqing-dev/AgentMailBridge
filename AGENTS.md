@@ -1,0 +1,40 @@
+# AgentMailBridge agent instructions
+
+## Product boundary
+
+AgentMailBridge is a local-first, single-user, Windows-first email bridge that may be open sourced. Users perceive one product. `AgentMailBridgeMCP.exe` is an internal stdio component started on demand by an Agent and must exit when stdin closes. It must not have a shortcut, tray icon, startup entry, listener, daemon or arbitrary recipient support.
+
+Do not expand the project into SaaS, multi-tenant infrastructure, a general email client, a general Gmail MCP or an Agent orchestration platform.
+
+## Security invariants
+
+- The recipient is fixed by `OWNER_GMAIL`.
+- Gmail OAuth scope must remain exactly `gmail.readonly`.
+- MCP file access is limited to `DATA_ROOT` and `ALLOWED_SEND_ROOTS`.
+- A GUI user-selected global file does not expand MCP trust.
+- Gmail IMAP and QQ SMTP secrets live in Windows Credential Manager and are never echoed back.
+- `.env`, credentials.json, token.json, secrets, databases, logs, mail and attachments must not enter Git, reports, dist or installers.
+- Never silently delete user data, OAuth files or credentials during uninstall.
+
+## Runtime paths
+
+Use `runtime_paths.py`. Frozen program files are read-only under the install directory. Installed configuration, OAuth and data are current-user writable paths under `%LOCALAPPDATA%\AgentMailBridge`. Source mode continues to support the repository `.env`. Do not depend on the current working directory or hard-code a user name or drive.
+
+## Development commands
+
+```powershell
+python -m pip install -r requirements.txt
+python -m pytest -q
+python -m agent_mail_bridge --version
+python -m agent_mail_bridge.gui
+python -m agent_mail_bridge.mcp_server
+```
+
+Windows release build:
+
+```powershell
+python -m pip install -r requirements-build.txt
+powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
+```
+
+The installer source is `packaging/windows/AgentMailBridge.iss`. The single version source is `agent_mail_bridge/version.py`; Python metadata, GUI, MCP, EXE metadata and installer must match it. Do not claim a test passed unless it was actually executed. Before release, run pytest, packaged smoke, secret scan, install/upgrade/uninstall checks, hashes, Defender where available and signature inspection. Never publish a GitHub Release without explicit user approval.
