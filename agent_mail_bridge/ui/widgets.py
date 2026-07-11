@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractButton,
     QFrame,
@@ -113,11 +113,12 @@ class AccountCard(QFrame):
         title_row = QHBoxLayout()
         title_label = QLabel(title)
         title_label.setObjectName("minorTitle")
-        tag = QLabel("已连接")
-        tag.setObjectName("tag")
+        self.status_tag = QLabel("未配置")
+        self.status_tag.setObjectName("tag")
+        self.status_tag.setProperty("configured", False)
         title_row.addWidget(title_label)
         title_row.addStretch()
-        title_row.addWidget(tag)
+        title_row.addWidget(self.status_tag)
         self.email_label = QLabel(email or "未配置")
         self.email_label.setObjectName("muted")
         detail = QLabel(description)
@@ -126,6 +127,12 @@ class AccountCard(QFrame):
         text_area.addWidget(self.email_label)
         text_area.addWidget(detail)
         layout.addLayout(text_area, 1)
+
+    def set_configured(self, configured: bool) -> None:
+        self.status_tag.setText("已配置" if configured else "未配置")
+        self.status_tag.setProperty("configured", configured)
+        self.status_tag.style().unpolish(self.status_tag)
+        self.status_tag.style().polish(self.status_tag)
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -136,8 +143,11 @@ class AccountCard(QFrame):
 class NavButton(QPushButton):
     """左侧导航按钮。"""
 
-    def __init__(self, icon: str, text: str):
-        super().__init__(f"{icon}   {text}")
+    def __init__(self, icon: QIcon | str, text: str):
+        super().__init__(text if isinstance(icon, QIcon) else f"{icon}   {text}")
+        if isinstance(icon, QIcon):
+            self.setIcon(icon)
+            self.setIconSize(QSize(15, 15))
         self.setObjectName("navButton")
         self.setCheckable(True)
         self.setAutoExclusive(True)
@@ -157,12 +167,14 @@ class StatusRow(QWidget):
         icon_label.setStyleSheet(f"color: {PURPLE}; font-size: 14px;")
         icon_label.setFixedWidth(18)
         name = QLabel(label)
-        name.setStyleSheet("font-size: 10px; color: #5E6270;")
+        name.setObjectName("statusName")
+        name.setStyleSheet("font-size: 10px;")
         self.value_label = QLabel(value)
         # 126 像素可容纳完整日期和常见邮箱，避免高 DPI 下左侧截断。
         self.value_label.setMinimumWidth(126)
         self.value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.value_label.setStyleSheet("font-size: 10px; color: #4E5260;")
+        self.value_label.setObjectName("statusValue")
+        self.value_label.setStyleSheet("font-size: 10px;")
         layout.addWidget(icon_label)
         layout.addWidget(name)
         layout.addStretch()
@@ -170,9 +182,10 @@ class StatusRow(QWidget):
 
     def set_value(self, value: str, *, success: bool = False, danger: bool = False) -> None:
         self.value_label.setText(value)
-        color = SUCCESS if success else DANGER if danger else "#4E5260"
-        weight = "700" if success or danger else "500"
-        self.value_label.setStyleSheet(f"font-size: 10px; color: {color}; font-weight: {weight};")
+        state = "success" if success else "danger" if danger else "normal"
+        self.value_label.setProperty("statusState", state)
+        self.value_label.style().unpolish(self.value_label)
+        self.value_label.style().polish(self.value_label)
 
 
 class StatCard(QFrame):
@@ -189,13 +202,15 @@ class StatCard(QFrame):
         icon_label = QLabel(icon)
         icon_label.setStyleSheet(f"color: {color}; font-size: 21px;")
         self.number = QLabel("0")
-        self.number.setStyleSheet(f"color: {TEXT}; font-size: 24px; font-weight: 500;")
+        self.number.setObjectName("statNumber")
+        self.number.setStyleSheet("font-size: 24px; font-weight: 500;")
         number_row.addWidget(icon_label)
         number_row.addSpacing(6)
         number_row.addWidget(self.number)
         number_row.addStretch()
         caption = QLabel(title)
-        caption.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 10px;")
+        caption.setObjectName("statCaption")
+        caption.setStyleSheet("font-size: 10px;")
         layout.addLayout(number_row)
         layout.addWidget(caption)
 
@@ -216,8 +231,9 @@ class TipRow(QWidget):
         icon_label.setAlignment(Qt.AlignmentFlag.AlignTop)
         icon_label.setStyleSheet(f"color: {color}; font-size: 15px;")
         label = QLabel(text)
+        label.setObjectName("tipText")
         label.setWordWrap(True)
-        label.setStyleSheet("color: #5F6370; font-size: 10px; line-height: 1.5;")
+        label.setStyleSheet("font-size: 10px;")
         layout.addWidget(icon_label)
         layout.addWidget(label, 1)
 
@@ -238,13 +254,25 @@ class DataTable(QTableWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.verticalHeader().setDefaultSectionSize(30)
 
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if self.rowCount() != 0:
+            return
+        painter = QPainter(self.viewport())
+        painter.setPen(self.palette().color(self.foregroundRole()).lighter(155))
+        painter.drawText(
+            self.viewport().rect(),
+            Qt.AlignmentFlag.AlignCenter,
+            "暂无数据",
+        )
+
 
 class MessageBar(QFrame):
     """展示任务结果和错误。"""
 
     def __init__(self):
         super().__init__()
-        self.setFixedHeight(30)
+        self.setMinimumHeight(34)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(10, 0, 10, 0)
         self.label = QLabel("就绪")
@@ -258,6 +286,7 @@ class MessageBar(QFrame):
             "normal": ("#F7F8FB", TEXT_MUTED),
             "success": ("#EFFAF3", SUCCESS),
             "error": ("#FFF1F2", DANGER),
+            "warning": ("#FFF8E8", "#A76500"),
             "working": (PURPLE_SOFT, PURPLE),
         }
         background, foreground = colors.get(kind, colors["normal"])
@@ -266,6 +295,7 @@ class MessageBar(QFrame):
         )
         self.label.setStyleSheet(f"color: {foreground}; font-size: 10px; font-weight: 600;")
         self.label.setText(text)
+        self.label.setToolTip(text)
 
 
 def paint_app_icon(widget: QLabel) -> None:

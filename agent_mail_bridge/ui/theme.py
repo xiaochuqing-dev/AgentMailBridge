@@ -108,6 +108,8 @@ def build_stylesheet(theme: str = "light") -> str:
         font-size: 11px;
         font-weight: 700;
     }}
+    QLabel#statusValue[statusState="success"] {{ color: {SUCCESS}; font-weight: 700; }}
+    QLabel#statusValue[statusState="danger"] {{ color: {DANGER}; font-weight: 700; }}
     QLabel#tag {{
         color: {SUCCESS};
         background: {SUCCESS_SOFT};
@@ -115,6 +117,10 @@ def build_stylesheet(theme: str = "light") -> str:
         padding: 2px 7px;
         font-size: 9px;
         font-weight: 700;
+    }}
+    QLabel#tag[configured="false"] {{
+        color: {TEXT_MUTED};
+        background: #F1F2F5;
     }}
     QLabel#iconBadge {{
         color: {PURPLE};
@@ -132,6 +138,12 @@ def build_stylesheet(theme: str = "light") -> str:
     QFrame#card {{
         background: #FFFFFF;
         border: 1px solid {BORDER};
+        border-radius: 10px;
+    }}
+    QFrame#heroCard {{
+        background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #F3F0FF, stop:0.58 #F7F5FF, stop:1 #EFF9FC);
+        border: 1px solid #E1DBFF;
         border-radius: 10px;
     }}
     QFrame#statPurple {{
@@ -186,6 +198,11 @@ def build_stylesheet(theme: str = "light") -> str:
         color: #FFFFFF;
         border-color: {DANGER};
         background: {DANGER};
+    }}
+    QPushButton[taskState="warning"] {{
+        color: #FFFFFF;
+        border-color: {WARNING};
+        background: {WARNING};
     }}
     QPushButton#primaryButton {{
         color: #FFFFFF;
@@ -254,7 +271,7 @@ def build_stylesheet(theme: str = "light") -> str:
         border-bottom: 2px solid {PURPLE};
         font-weight: 700;
     }}
-    QLineEdit, QComboBox, QSpinBox {{
+    QLineEdit, QComboBox, QSpinBox, QTextEdit {{
         min-height: 35px;
         background: #FFFFFF;
         border: 1px solid #E1E3E9;
@@ -263,6 +280,7 @@ def build_stylesheet(theme: str = "light") -> str:
         font-size: 12px;
         selection-background-color: {PURPLE};
     }}
+    QTextEdit {{ padding: 8px; }}
     QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{
         border: 1px solid #8E7AF4;
     }}
@@ -338,9 +356,16 @@ def build_stylesheet(theme: str = "light") -> str:
     QWidget#rightPanel {{ background: #1C1E2A; border-left-color: #343746; }}
     QWidget#sidebar, QWidget#titleBar, QWidget#tabBar {{ border-color: #343746; }}
     QLabel#fieldLabel, QLabel#muted, QLabel#hint {{ color: #AEB4C5; }}
-    QFrame#card, QLineEdit, QComboBox, QSpinBox, QTableWidget,
+    QLabel#statusName, QLabel#statusValue, QLabel#tipText, QLabel#statNumber,
+    QLabel#statCaption {{ color: #C7CBD8; }}
+    QFrame#card, QLineEdit, QComboBox, QSpinBox, QTextEdit, QTableWidget,
     QHeaderView::section, QComboBox QAbstractItemView {{
         background: #222532;
+        border-color: #3A3E50;
+    }}
+    QFrame#heroCard, QFrame#statPurple, QFrame#statGreen,
+    QFrame#statBlue, QFrame#statRed {{
+        background: #242736;
         border-color: #3A3E50;
     }}
     QTableWidget {{ alternate-background-color: #1D202C; gridline-color: #343746; }}
@@ -349,5 +374,6 @@ def build_stylesheet(theme: str = "light") -> str:
     QPushButton:hover, QPushButton#titleButton:hover {{ background: #35394B; }}
     QPushButton#outlinePurple {{ background: #242736; }}
     QPushButton#textButton, QPushButton#tabButton, QPushButton#navButton {{ background: transparent; }}
+    QPushButton#navButton, QPushButton#tabButton {{ color: #C7CBD8; }}
     QScrollBar::handle:vertical {{ background: #555A6C; }}
     """

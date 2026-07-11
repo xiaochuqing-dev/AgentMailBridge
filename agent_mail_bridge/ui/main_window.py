@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QSizeGrip,
     QSpinBox,
     QStackedWidget,
+    QStyle,
     QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
@@ -47,6 +48,7 @@ from agent_mail_bridge.desktop_runtime import StartupManager
 from agent_mail_bridge.models import OperationStatus, ReceiveResult, SendResult, ServiceResult
 from agent_mail_bridge.security import SecurityError, assert_within_allowed_roots
 from agent_mail_bridge.ui.settings_store import save_env_values
+from agent_mail_bridge.ui.branding import apply_brand_label, brand_icon, find_brand_asset
 from agent_mail_bridge.ui.theme import (
     DANGER,
     PURPLE,
@@ -169,7 +171,7 @@ class TitleBar(QWidget):
         layout.setSpacing(8)
 
         icon = QLabel()
-        paint_app_icon(icon)
+        self.brand_asset_loaded = apply_brand_label(icon, paint_app_icon)
         title = QLabel("Agent 邮箱桥接工具")
         title.setObjectName("appTitle")
         version = QLabel("v1.0.0")
@@ -296,6 +298,7 @@ class BridgeWindow(QMainWindow):
         self.auto_timer.timeout.connect(self._automatic_receive)
         self.auto_failures = 0
         self.setWindowTitle("Agent 邮箱桥接工具")
+        self.setWindowIcon(brand_icon())
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
         self.resize(1272, 900)
         self.setMinimumSize(1120, 760)
@@ -307,7 +310,7 @@ class BridgeWindow(QMainWindow):
         saved_geometry = self.settings.value("window/geometry")
         if saved_geometry:
             self.restoreGeometry(saved_geometry)
-        self.select_page(str(self.settings.value("window/last_page", "basic")))
+        self.select_page(str(self.settings.value("window/last_page", "dashboard")))
         QTimer.singleShot(0, self.refresh)
         if not self.previous_exit_was_clean:
             QTimer.singleShot(
@@ -377,7 +380,7 @@ class BridgeWindow(QMainWindow):
         layout.addWidget(self.gmail_card)
         layout.addWidget(self.qq_card)
 
-        identity = QPushButton("Q   设置发件身份                              ›")
+        identity = QPushButton("设置发件身份  ›")
         identity.setObjectName("outlinePurple")
         identity.setFixedHeight(42)
         identity.clicked.connect(lambda: self.select_page("advanced"))
@@ -385,26 +388,27 @@ class BridgeWindow(QMainWindow):
         layout.addSpacing(12)
 
         self.nav_buttons: dict[str, NavButton] = {}
+        standard = QStyle.StandardPixmap
         nav_items = (
-            ("dashboard", "●", "仪表盘"),
-            ("basic", "◆", "账号与配置"),
-            ("inbox", "□", "收邮箱"),
-            ("send", "▷", "发邮件"),
-            ("history", "○", "历史记录"),
-            ("logs", "≡", "日志"),
-            ("maintenance", "▣", "数据维护"),
-            ("agent", "◇", "Agent 接口"),
+            ("dashboard", standard.SP_DesktopIcon, "仪表盘"),
+            ("basic", standard.SP_FileDialogDetailedView, "账号与配置"),
+            ("inbox", standard.SP_ArrowDown, "收邮箱"),
+            ("send", standard.SP_ArrowUp, "发邮件"),
+            ("history", standard.SP_BrowserReload, "历史记录"),
+            ("logs", standard.SP_FileIcon, "日志"),
+            ("maintenance", standard.SP_DriveHDIcon, "数据维护"),
+            ("agent", standard.SP_ComputerIcon, "Agent 接口"),
         )
-        for key, icon, text in nav_items:
-            button = NavButton(icon, text)
+        for key, standard_icon, text in nav_items:
+            button = NavButton(self.style().standardIcon(standard_icon), text)
             button.clicked.connect(lambda checked=False, page=key: self.select_page(page))
             self.nav_buttons[key] = button
             layout.addWidget(button)
-        self.nav_buttons["basic"].setChecked(True)
+        self.nav_buttons["dashboard"].setChecked(True)
         layout.addStretch(1)
 
-        settings = NavButton("◆", "设置")
-        about = NavButton("i", "关于")
+        settings = NavButton(self.style().standardIcon(standard.SP_FileDialogDetailedView), "设置")
+        about = NavButton(self.style().standardIcon(standard.SP_MessageBoxInformation), "关于")
         settings.clicked.connect(lambda: self.select_page("advanced"))
         about.clicked.connect(self._show_about)
         layout.addWidget(settings)
@@ -444,6 +448,7 @@ class BridgeWindow(QMainWindow):
 
         self.page_stack = QStackedWidget()
         self.pages = {
+            "dashboard": self._build_dashboard_page(),
             "basic": self._build_basic_page(),
             "inbox": self._build_inbox_page(),
             "send": self._build_send_page(),
@@ -457,6 +462,61 @@ class BridgeWindow(QMainWindow):
             self.page_stack.addWidget(page)
         layout.addWidget(self.page_stack, 1)
         return panel
+
+    def _build_dashboard_page(self) -> QWidget:
+        page, layout = self._standard_page(
+            "仪表盘",
+            "查看桥接服务健康状态、今日处理结果和常用操作。",
+        )
+        health = QFrame()
+        health.setObjectName("heroCard")
+        health_layout = QHBoxLayout(health)
+        health_layout.setContentsMargins(18, 14, 18, 14)
+        health_text = QVBoxLayout()
+        health_title = QLabel("桥接服务正在运行")
+        health_title.setObjectName("sectionTitle")
+        self.dashboard_health_detail = QLabel("正在读取邮箱连接和最近任务状态…")
+        self.dashboard_health_detail.setObjectName("hint")
+        health_text.addWidget(health_title)
+        health_text.addWidget(self.dashboard_health_detail)
+        health_layout.addLayout(health_text, 1)
+        self.dashboard_receive_button = self._button("立即收取", self.receive, primary=True)
+        self.task_buttons.append(self.dashboard_receive_button)
+        self.manual_receive_buttons.append(self.dashboard_receive_button)
+        health_layout.addWidget(self.dashboard_receive_button)
+        health_layout.addWidget(self._button("发送文件", self.choose_and_send, outline=True))
+        layout.addWidget(health)
+
+        stats = QGridLayout()
+        stats.setSpacing(10)
+        self.dashboard_stat_cards = {
+            "received": StatCard("statPurple", "R", "今日收取", PURPLE),
+            "saved": StatCard("statGreen", "S", "今日保存", SUCCESS),
+            "sent": StatCard("statBlue", "↑", "今日发送", "#2394C8"),
+            "errors": StatCard("statRed", "E", "今日异常", DANGER),
+        }
+        for index, card in enumerate(self.dashboard_stat_cards.values()):
+            stats.addWidget(card, index // 2, index % 2)
+        layout.addLayout(stats)
+
+        activity_header = QHBoxLayout()
+        activity_title = QLabel("最近活动")
+        activity_title.setObjectName("sectionTitle")
+        self.dashboard_refresh_label = QLabel("尚未刷新")
+        self.dashboard_refresh_label.setObjectName("hint")
+        self.dashboard_refresh_button = self._button("刷新", text_only=True)
+        self.dashboard_refresh_button.clicked.connect(
+            lambda: self.request_refresh(self.dashboard_refresh_button)
+        )
+        activity_header.addWidget(activity_title)
+        activity_header.addStretch(1)
+        activity_header.addWidget(self.dashboard_refresh_label)
+        activity_header.addWidget(self.dashboard_refresh_button)
+        layout.addLayout(activity_header)
+        self.dashboard_logs_table = DataTable(["时间", "级别", "消息"])
+        self._configure_log_table(self.dashboard_logs_table)
+        layout.addWidget(self.dashboard_logs_table, 1)
+        return page
 
     def _build_basic_page(self) -> QWidget:
         scroll = QScrollArea()
@@ -527,28 +587,29 @@ class BridgeWindow(QMainWindow):
         rule_row.addWidget(help_label)
         layout.addLayout(rule_row)
 
-        actions = QHBoxLayout()
-        actions.setSpacing(8)
-        test_button = self._button("●  测试连接", self.test_connection, primary=True)
-        save_button = self._button("□  保存配置", self.save_basic_config)
+        actions = QGridLayout()
+        actions.setHorizontalSpacing(8)
+        actions.setVerticalSpacing(8)
+        test_button = self._button("测试连接", self.test_connection, primary=True)
+        save_button = self._button("保存配置", self.save_basic_config)
         delete_password_button = self._button(
             "删除 IMAP 凭据", lambda: self.delete_credential(GMAIL_IMAP_SECRET), text_only=True
         )
-        self.receive_button = self._button("↓  手动收取", self.receive)
-        self.send_button = self._button("▷  手动选择发送", self.choose_and_send)
+        self.receive_button = self._button("手动收取", self.receive)
+        self.send_button = self._button("选择文件发送", self.choose_and_send)
         mcp_button = self._button(
-            "◇  Agent 提交结果（MCP）",
+            "Agent 提交结果（MCP）",
             lambda: self.select_page("agent"),
             outline=True,
         )
         self.task_buttons.extend((test_button, self.receive_button, self.send_button))
         self.manual_receive_buttons.append(self.receive_button)
-        for button in (
+        for index, button in enumerate((
             test_button, save_button, delete_password_button,
             self.receive_button, self.send_button, mcp_button,
-        ):
-            actions.addWidget(button)
-        actions.addStretch(1)
+        )):
+            actions.addWidget(button, index // 3, index % 3)
+        actions.setColumnStretch(2, 1)
         layout.addLayout(actions)
 
         self.message_bar = MessageBar()
@@ -561,7 +622,7 @@ class BridgeWindow(QMainWindow):
         file_hint = QLabel("（保存至已接收文件夹中）")
         file_hint.setObjectName("hint")
         view_button = self._button("查  查看今日文件 / 最新筛选", self.select_latest_file, text_only=True)
-        open_button = self._button("□  打开今日接收文件夹", self.open_today_folder)
+        open_button = self._button("打开今日接收文件夹", self.open_today_folder)
         file_header.addWidget(file_title)
         file_header.addWidget(file_hint)
         file_header.addStretch(1)
@@ -610,7 +671,7 @@ class BridgeWindow(QMainWindow):
         self.inbox_search = QLineEdit()
         self.inbox_search.setPlaceholderText("搜索文件名或路径")
         self.inbox_search.textChanged.connect(self._filter_inbox)
-        receive = self._button("↓  立即收取", self.receive, primary=True)
+        receive = self._button("立即收取", self.receive, primary=True)
         self.inbox_refresh_button = self._button("刷新")
         self.inbox_refresh_button.clicked.connect(
             lambda: self.request_refresh(self.inbox_refresh_button)
@@ -679,7 +740,7 @@ class BridgeWindow(QMainWindow):
         self.subject_edit.setPlaceholderText("可选；留空时使用默认主题")
         self.recipient_edit = QLineEdit(self.service.cfg.owner_gmail)
         self.recipient_edit.setReadOnly(True)
-        self.send_action_button = self._button("▷  发送到绑定 Gmail", self.send_selected_file, primary=True)
+        self.send_action_button = self._button("发送到绑定 Gmail", self.send_selected_file, primary=True)
         self.send_action_button.setEnabled(False)
         self.task_buttons.append(self.send_action_button)
         self.send_progress = QProgressBar()
@@ -842,7 +903,9 @@ class BridgeWindow(QMainWindow):
             "数据维护",
             "备份和扫描默认不删除用户数据；数据库恢复前会再次确认并自动备份当前库。",
         )
-        actions = QHBoxLayout()
+        actions = QGridLayout()
+        actions.setHorizontalSpacing(8)
+        actions.setVerticalSpacing(8)
         self.maintenance_refresh_button = self._button("刷新状态", self.refresh_maintenance)
         self.backup_button = self._button("创建备份", self.create_backup, primary=True)
         self.scan_button = self._button("一致性扫描", self.run_consistency_scan)
@@ -850,13 +913,13 @@ class BridgeWindow(QMainWindow):
         self.restore_backup_button = self._button("恢复备份", self.choose_restore_backup)
         self.open_backup_button = self._button("打开备份目录", self.open_backup_folder)
         self.export_maintenance_button = self._button("导出维护报告", self.export_maintenance_report)
-        for button in (
+        for index, button in enumerate((
             self.maintenance_refresh_button, self.backup_button, self.scan_button,
             self.verify_backup_button, self.restore_backup_button,
             self.open_backup_button, self.export_maintenance_button,
-        ):
-            actions.addWidget(button)
-        actions.addStretch(1)
+        )):
+            actions.addWidget(button, index // 4, index % 4)
+        actions.setColumnStretch(3, 1)
         layout.addLayout(actions)
         self.maintenance_summary = QTextEdit()
         self.maintenance_summary.setReadOnly(True)
@@ -937,15 +1000,18 @@ class BridgeWindow(QMainWindow):
 
     def choose_verify_backup(self) -> None:
         path = self._choose_backup_path("选择要验证的数据库备份")
-        if path:
-            self._run_task(
-                "正在验证数据库备份", lambda: self.service.verify_backup(path),
-                self._show_service_result, button=self.verify_backup_button,
-            )
+        if not path:
+            self.show_message("已取消验证备份", "normal")
+            return
+        self._run_task(
+            "正在验证数据库备份", lambda: self.service.verify_backup(path),
+            self._show_service_result, button=self.verify_backup_button,
+        )
 
     def choose_restore_backup(self) -> None:
         path = self._choose_backup_path("选择要恢复的数据库备份")
         if not path:
+            self.show_message("已取消恢复备份", "normal")
             return
         confirmation = QMessageBox.question(
             self, "确认恢复数据库",
@@ -964,8 +1030,13 @@ class BridgeWindow(QMainWindow):
 
     def open_backup_folder(self) -> None:
         folder = self.service.cfg.data_root_path / "backups"
-        folder.mkdir(parents=True, exist_ok=True)
-        os.startfile(str(folder))
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(folder))
+        except OSError as exc:
+            self.show_message(f"打开备份目录失败：{exc}", "error")
+            return
+        self.show_message("已打开备份目录", "success")
 
     def export_maintenance_report(self) -> None:
         destination, _ = QFileDialog.getSaveFileName(
@@ -973,13 +1044,15 @@ class BridgeWindow(QMainWindow):
             str(self.service.cfg.data_root_path / "maintenance-report.md"),
             "Markdown 文件 (*.md)",
         )
-        if destination:
-            self._run_task(
-                "正在导出脱敏维护报告",
-                lambda: self.service.export_maintenance_report(destination),
-                self._show_service_result,
-                button=self.export_maintenance_button,
-            )
+        if not destination:
+            self.show_message("已取消导出维护报告", "normal")
+            return
+        self._run_task(
+            "正在导出脱敏维护报告",
+            lambda: self.service.export_maintenance_report(destination),
+            self._show_service_result,
+            button=self.export_maintenance_button,
+        )
 
     def _build_agent_page(self) -> QWidget:
         page, layout = self._standard_page(
@@ -1081,10 +1154,10 @@ class BridgeWindow(QMainWindow):
         stats = QGridLayout()
         stats.setSpacing(9)
         self.stat_cards = {
-            "received": StatCard("statPurple", "M", "收取附件", PURPLE),
-            "saved": StatCard("statGreen", "✓", "保存文件", SUCCESS),
+            "received": StatCard("statPurple", "R", "收取附件", PURPLE),
+            "saved": StatCard("statGreen", "S", "保存文件", SUCCESS),
             "sent": StatCard("statBlue", "↑", "发送邮件", "#2394C8"),
-            "errors": StatCard("statRed", "⚠", "失败 / 错误", DANGER),
+            "errors": StatCard("statRed", "E", "失败 / 错误", DANGER),
         }
         stats.addWidget(self.stat_cards["received"], 0, 0)
         stats.addWidget(self.stat_cards["saved"], 0, 1)
@@ -1230,7 +1303,7 @@ class BridgeWindow(QMainWindow):
             header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
 
     def select_page(self, name: str) -> None:
-        target = "basic" if name == "dashboard" else name
+        target = name
         if target not in self.pages:
             target = "basic"
         current_name = self._current_page_name()
@@ -1277,7 +1350,15 @@ class BridgeWindow(QMainWindow):
         if self.auto_switch.isChecked():
             self.show_message("自动收取已开启，手动收取已禁用", "normal")
             return
-        self._run_task("正在收取邮件，请稍候", self.service.receive, self._show_receive_result)
+        sender = self.sender()
+        button = sender if isinstance(sender, QPushButton) else None
+        self._run_task(
+            "正在连接 Gmail 并检查新邮件",
+            self.service.receive,
+            self._show_receive_result,
+            button=button,
+            working_text="收取中…",
+        )
 
     def choose_and_send(self) -> None:
         if not self.choose_send_file():
@@ -1416,11 +1497,13 @@ class BridgeWindow(QMainWindow):
         self._preview_path(str(self.send_selection.path))
 
     def test_connection(self) -> None:
+        sender = self.sender()
+        button = sender if isinstance(sender, QPushButton) else None
         backend = self.backend_combo.currentData()
         if backend == "gmail_api" or (backend == "auto" and self.service.cfg.gmail_api_configured):
-            self._diagnose("正在测试 Gmail API 连接", self.service.diagnose_gmail_api)
+            self._diagnose("正在测试 Gmail API 连接", self.service.diagnose_gmail_api, button)
         else:
-            self._diagnose("正在测试 Gmail IMAP 连接", self.service.diagnose_imap)
+            self._diagnose("正在测试 Gmail IMAP 连接", self.service.diagnose_imap, button)
 
     def _diagnose(
         self,
@@ -1623,6 +1706,7 @@ class BridgeWindow(QMainWindow):
         self._populate_files(self.files_table, self.file_rows, actions=True)
         self._populate_files(self.inbox_table, self.file_rows, actions=False)
         self._populate_logs(self.logs_table, self.log_rows[:30])
+        self._populate_logs(self.dashboard_logs_table, self.log_rows[:20])
         self._populate_full_logs()
         self._populate_sent_history()
         self._populate_history()
@@ -1632,6 +1716,7 @@ class BridgeWindow(QMainWindow):
         refresh_text = f"最后刷新 {self.last_refresh_at.strftime('%H:%M:%S')}"
         self.home_refresh_label.setText(refresh_text)
         self.logs_refresh_label.setText(refresh_text)
+        self.dashboard_refresh_label.setText(refresh_text)
         self.show_message(f"状态已刷新，{self.last_refresh_at.strftime('%H:%M:%S')}", "success")
 
     def _apply_config_to_controls(self, status: dict) -> None:
@@ -1640,6 +1725,8 @@ class BridgeWindow(QMainWindow):
         try:
             self.gmail_card.email_label.setText(cfg.gmail_address or "未配置")
             self.qq_card.email_label.setText(cfg.qq_email or "未配置")
+            self.gmail_card.set_configured(bool(cfg.gmail_address))
+            self.qq_card.set_configured(bool(cfg.qq_email))
             self.recipient_edit.setText(cfg.owner_gmail or cfg.gmail_address)
             self._set_combo_data(self.backend_combo, cfg.gmail_receive_backend)
             self._set_combo_data(self.network_combo, cfg.gmail_network_mode)
@@ -1664,6 +1751,24 @@ class BridgeWindow(QMainWindow):
         backend = status.get("receive_backend", "—")
         oauth = status.get("gmail_api", {}).get("state", "—")
         qq = status.get("qq_smtp", "not_configured")
+        backend_text = {
+            "gmail_api": "Gmail API",
+            "imap": "Gmail IMAP",
+            "auto": "自动选择",
+        }.get(str(backend), str(backend))
+        oauth_key = str(oauth).upper()
+        oauth_text = {
+            "READY": "已授权",
+            "TOKEN_VALID": "已授权",
+            "TOKEN_EXPIRED_REFRESHABLE": "可安全刷新",
+            "TOKEN_EXPIRED": "需重新授权",
+            "NOT_CONFIGURED": "未配置",
+            "CREDENTIALS_MISSING": "未配置",
+            "TOKEN_MISSING": "未授权",
+        }.get(oauth_key)
+        if oauth_text is None:
+            oauth_text = "未配置" if "MISSING" in oauth_key else "需重新授权" if "EXPIRED" in oauth_key else "状态待检查"
+        qq_text_short = "已配置" if qq == "configured" else "未配置"
         self.service_rows["service"].set_value("● 运行中", success=True)
         self.service_rows["auto"].set_value("已开启" if self.auto_switch.isChecked() else "未开启", success=self.auto_switch.isChecked())
         qq_text = self.service.cfg.qq_email or "未配置"
@@ -1672,8 +1777,13 @@ class BridgeWindow(QMainWindow):
         send_time = self._latest_event_time(("send", "sent", "发件", "发送"))
         self.service_rows["receive"].set_value(receive_time)
         self.service_rows["send"].set_value(send_time)
-        self.title_bar.status_label.setText(f"服务已启动 · {backend}")
+        self.title_bar.status_label.setText(f"服务已启动 · {backend_text}")
         self.title_bar.status_label.setToolTip(f"Gmail API：{oauth}")
+        health_detail = (
+            f"收件：{backend_text} · Gmail 授权：{oauth_text} · QQ 发件：{qq_text_short}"
+        )
+        self.dashboard_health_detail.setText(health_detail)
+        self.dashboard_health_detail.setToolTip(health_detail)
 
         today = datetime.now().strftime("%Y-%m-%d")
         sent_today = sum(1 for row in self.history_rows.get("sent", []) if str(row.get("sent_at", "")).startswith(today) and row.get("status") in {"sent", "success"})
@@ -1682,6 +1792,13 @@ class BridgeWindow(QMainWindow):
         self.stat_cards["saved"].set_count(sum(1 for row in self.file_rows if row.get("status") in {"saved", "ok", "normal"}))
         self.stat_cards["sent"].set_count(sent_today)
         self.stat_cards["errors"].set_count(error_today)
+        for key, card in self.dashboard_stat_cards.items():
+            card.set_count({
+                "received": len(self.file_rows),
+                "saved": sum(1 for row in self.file_rows if row.get("status") in {"saved", "ok", "normal"}),
+                "sent": sent_today,
+                "errors": error_today,
+            }[key])
 
     def _populate_files(self, table: DataTable, rows: list[dict], *, actions: bool) -> None:
         table.setRowCount(0)
@@ -1693,7 +1810,7 @@ class BridgeWindow(QMainWindow):
                 format_size(row.get("size_bytes")),
                 path,
                 self._short_time(row.get("created_at") or row.get("received_at")),
-                "复制路径  ·  预览  ·  打开" if actions else str(row.get("status") or "saved"),
+                "复制路径" if actions else str(row.get("status") or "saved"),
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -1857,7 +1974,11 @@ class BridgeWindow(QMainWindow):
             completed_button.setText(self._active_task_button_text)
             completed_button.setEnabled(True)
             completed_button.setToolTip("")
-            completed_button.setProperty("taskState", "success" if result.ok else "error")
+            if result.status in {OperationStatus.PARTIAL, OperationStatus.DUPLICATE, OperationStatus.CANCELLED}:
+                task_state = "warning"
+            else:
+                task_state = "success" if result.ok else "error"
+            completed_button.setProperty("taskState", task_state)
             completed_button.style().unpolish(completed_button)
             completed_button.style().polish(completed_button)
             QTimer.singleShot(1200, lambda button=completed_button: self._reset_task_button_state(button))
@@ -1868,6 +1989,7 @@ class BridgeWindow(QMainWindow):
         self._task_refresh_on_finish = True
         if callback is not None:
             callback(result)
+        self._sync_manual_receive_actions()
         if self.pending_quit:
             self.pending_quit = False
             QTimer.singleShot(0, self._finalize_quit)
@@ -1894,7 +2016,8 @@ class BridgeWindow(QMainWindow):
                 message = summary
         else:
             message = result.message or result.status.value
-        self.show_message(message, "success" if result.ok else "error")
+        kind = "warning" if result.status == OperationStatus.PARTIAL else "success" if result.ok else "error"
+        self.show_message(message, kind)
         if not result.ok:
             self.last_error_details = self._redact_error_details(message)
             self.error_details_button.setEnabled(True)
@@ -1916,7 +2039,10 @@ class BridgeWindow(QMainWindow):
             message = messages.get(result.send_status, result.message or result.send_status)
         else:
             message = result.message or result.status.value
-        kind = "success" if result.ok or getattr(result, "send_status", "") == "sent_archive_failed" else "error"
+        if result.status in {OperationStatus.PARTIAL, OperationStatus.DUPLICATE} or getattr(result, "send_status", "") in {"sent_archive_failed", "duplicate"}:
+            kind = "warning"
+        else:
+            kind = "success" if result.ok else "error"
         self.show_message(message, kind)
         if kind == "error":
             self.last_error_details = self._redact_error_details(message)
@@ -1936,7 +2062,11 @@ class BridgeWindow(QMainWindow):
                 result.message or result.error_code or "无详细信息"
             )
             self.error_details_button.setEnabled(True)
-        self.show_message(message, "success" if result.ok else "error")
+        if result.status in {OperationStatus.PARTIAL, OperationStatus.DUPLICATE, OperationStatus.CANCELLED}:
+            kind = "warning"
+        else:
+            kind = "success" if result.ok else "error"
+        self.show_message(message, kind)
 
     def show_last_error_details(self) -> None:
         if not self.last_error_details:
@@ -2219,7 +2349,10 @@ class BridgeWindow(QMainWindow):
         self.tray_icon: QSystemTrayIcon | None = None
         if not self.tray_available:
             return
-        self.tray_icon = QSystemTrayIcon(self.style().standardIcon(self.style().StandardPixmap.SP_ComputerIcon), self)
+        tray_brand_icon = brand_icon()
+        if tray_brand_icon.isNull():
+            tray_brand_icon = self.style().standardIcon(self.style().StandardPixmap.SP_ComputerIcon)
+        self.tray_icon = QSystemTrayIcon(tray_brand_icon, self)
         menu = QMenu(self)
         show_action = QAction("显示主窗口", self)
         show_action.triggered.connect(self.show_from_tray)
@@ -2283,10 +2416,12 @@ class BridgeWindow(QMainWindow):
         QMessageBox.information(self, "帮助", "详细配置、诊断和安全说明请查看项目 README.md。")
 
     def _show_about(self) -> None:
+        logo_state = "最终 Logo 已接入" if find_brand_asset() else "Logo 接入结构已就绪，等待最终素材"
         QMessageBox.information(
             self,
             "关于 AgentMailBridge",
-            "AgentMailBridge v1.0.0\n\n本地优先、单用户的邮箱桥接工具。\n正式界面使用 PySide6，核心能力复用 ApplicationService。",
+            "AgentMailBridge v1.0.0\n\n本地优先、单用户的邮箱桥接工具。\n"
+            f"{logo_state}。\n正式界面使用 PySide6，核心能力复用 ApplicationService。",
         )
 
     @staticmethod

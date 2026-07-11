@@ -45,6 +45,7 @@ def test_formal_gui_uses_reference_three_column_layout(bridge_window):
     assert bridge_window.central_panel.width() >= 620
     assert set(bridge_window.pages) == {
         "basic", "inbox", "send", "advanced", "history", "logs", "maintenance", "agent"
+        , "dashboard"
     }
     assert set(bridge_window.tab_buttons) == {"basic", "inbox", "send", "advanced"}
     assert all(
@@ -54,6 +55,9 @@ def test_formal_gui_uses_reference_three_column_layout(bridge_window):
 
 
 def test_navigation_switches_real_pages(bridge_window):
+    bridge_window.select_page("dashboard")
+    assert bridge_window.page_stack.currentWidget() is bridge_window.pages["dashboard"]
+    assert bridge_window.nav_buttons["dashboard"].isChecked()
     bridge_window.select_page("send")
     assert bridge_window.page_stack.currentWidget() is bridge_window.pages["send"]
     assert bridge_window.tab_buttons["send"].isChecked()

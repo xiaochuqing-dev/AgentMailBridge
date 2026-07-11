@@ -46,6 +46,8 @@ def tmp_cfg(tmp_path: Path) -> AppConfig:
         qq_auth_code="testauthcode1234",
         owner_gmail="owner@gmail.com",
         data_root=tmp_path / "AgentMailBridgeData",
+        gmail_api_credentials_path=tmp_path / "credentials.json",
+        gmail_api_token_path=tmp_path / "token.json",
         max_attachment_mb=25,
         max_send_file_mb=25,
         log_level="DEBUG",
