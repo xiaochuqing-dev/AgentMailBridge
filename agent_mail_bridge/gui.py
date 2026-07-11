@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from agent_mail_bridge.application_service import ApplicationService
@@ -17,8 +18,13 @@ __all__ = ["BridgeWindow", "main"]
 
 
 def main() -> None:
+    # Qt 6 原生处理高 DPI；保留 125%/150% 精确比例，避免额外环境缩放叠加。
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("Agent 邮箱桥接工具")
+    app.setOrganizationName("AgentMailBridge")
     app.setFont(load_interface_font())
     app.setStyleSheet(build_stylesheet())
     cfg = load_config()

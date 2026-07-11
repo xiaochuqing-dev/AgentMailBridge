@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import smtplib
 import ssl
+import platform
+import sys
 import threading
 import uuid
 from datetime import datetime
@@ -422,6 +424,98 @@ class ApplicationService:
                 message=str(exc),
             )
 
+    def export_diagnostic_report(self, destination: str | Path) -> ServiceResult:
+        """导出不含凭据、邮件正文和私人绝对路径的诊断摘要。"""
+        self.initialize()
+        report_path = Path(destination)
+        if report_path.suffix.lower() != ".md":
+            report_path = report_path.with_suffix(".md")
+        if report_path.exists():
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="report_exists",
+                message="目标文件已存在，请选择新的文件名",
+            )
+        try:
+            from PySide6 import __version__ as pyside_version
+            from agent_mail_bridge import __version__ as app_version
+
+            oauth = get_oauth_state(self.cfg)
+            recent_events = query_recent_events(self.cfg.db_path, 100)
+            recent_errors = [
+                row for row in recent_events
+                if str(row.get("level", "")).upper() in {"ERROR", "FAILED"}
+            ][:10]
+            db_state = "正常" if self.cfg.db_path.exists() else "不存在"
+            log_files = list(self.cfg.logs_dir.glob("app.log*"))
+            report_lines = [
+                "# AgentMailBridge 脱敏诊断报告",
+                "",
+                f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                f"应用版本：{app_version}",
+                f"操作系统：{platform.system()} {platform.release()}",
+                f"Python：{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+                f"PySide6：{pyside_version}",
+                "",
+                "## 配置完整性",
+                "",
+                f"收件后端：{_effective_receive_backend(self.cfg)}",
+                f"Gmail 地址：{_mask_email(self.cfg.gmail_address)}",
+                f"QQ 地址：{_mask_email(self.cfg.qq_email)}",
+                f"Gmail API credentials：{'已配置' if self.cfg.gmail_api_credentials_path.exists() else '未配置'}",
+                f"Gmail API token：{'存在' if self.cfg.gmail_api_token_path.exists() else '不存在'}",
+                f"OAuth 状态：{oauth.get('state', 'UNKNOWN')}",
+                f"IMAP：{'已配置' if self.cfg.gmail_address and self.cfg.gmail_app_password else '未配置'}",
+                f"QQ SMTP：{'已配置' if self.cfg.qq_email and self.cfg.qq_auth_code else '未配置'}",
+                f"允许发送目录数量：{len(self.cfg.effective_allowed_send_roots)}",
+                "",
+                "## 本地运行状态",
+                "",
+                f"数据目录：{'可用' if self.cfg.data_root_path.exists() else '不存在'}（路径已隐藏）",
+                f"SQLite：{db_state}",
+                f"日志轮转文件数量：{len(log_files)}",
+                f"最近 100 条事件中的错误数：{len(recent_errors)}",
+                "",
+                "## 最近错误摘要",
+                "",
+            ]
+            if recent_errors:
+                for row in recent_errors:
+                    report_lines.append(
+                        f"- {str(row.get('created_at', ''))[:19]} "
+                        f"[{row.get('event_type', 'unknown')}]（详细内容已隐藏）"
+                    )
+            else:
+                report_lines.append("- 未发现错误事件")
+            report_lines.extend(
+                [
+                    "",
+                    "## 隐私说明",
+                    "",
+                    "本报告不包含密码、授权码、token、credentials 内容、邮件正文、附件内容或私人绝对路径。",
+                    "",
+                ]
+            )
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text("\n".join(report_lines), encoding="utf-8", errors="strict")
+        except OSError as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="report_write_failed",
+                message=f"诊断报告写入失败：{exc}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="report_failed",
+                message=f"诊断报告生成失败：{exc}",
+            )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            message=f"脱敏诊断报告已保存：{report_path.name}",
+            details={"report_path": str(report_path)},
+        )
+
 
 def _classify_receive_error(message: str) -> str:
     """把后端异常文案归入稳定错误代码。"""
@@ -442,6 +536,14 @@ def _classify_receive_error(message: str) -> str:
         if any(keyword in lowered for keyword in keywords):
             return code
     return "receive_failed"
+
+
+def _mask_email(value: str) -> str:
+    """诊断报告只保留邮箱首字符和域名。"""
+    local, separator, domain = value.partition("@")
+    if not local or not separator or not domain:
+        return "未配置"
+    return f"{local[:1]}***@{domain}"
 
 
 def _mcp_audit_status(result: SendResult) -> str:

@@ -20,15 +20,19 @@ DANGER = "#D84A56"
 
 
 def load_interface_font() -> QFont:
-    """显式加载中文字体，避免 Qt 离屏或精简环境显示方框。"""
+    """选择 Windows 原生清晰字体，避免重复加载造成字体回退不稳定。"""
     candidates = (
-        (Path("C:/Windows/Fonts/NotoSansSC-VF.ttf"), "Noto Sans SC"),
         (Path("C:/Windows/Fonts/msyh.ttc"), "Microsoft YaHei UI"),
+        (Path("C:/Windows/Fonts/NotoSansSC-VF.ttf"), "Noto Sans SC"),
     )
     for path, family in candidates:
         if path.exists() and QFontDatabase.addApplicationFont(str(path)) >= 0:
-            return QFont(family, 10)
-    return QFont("Microsoft YaHei UI", 10)
+            font = QFont(family, 10)
+            font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+            return font
+    font = QFont("Microsoft YaHei UI", 10)
+    font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+    return font
 
 
 def build_stylesheet(theme: str = "light") -> str:
@@ -90,8 +94,9 @@ def build_stylesheet(theme: str = "light") -> str:
     }}
     QLabel#fieldLabel {{
         color: #555A68;
-        font-size: 11px;
+        font-size: 12px;
     }}
+    QLabel#sendFileValue {{ font-size: 12px; font-weight: 600; }}
     QLabel#successText {{ color: {SUCCESS}; font-weight: 700; }}
     QLabel#errorText {{ color: {DANGER}; }}
     QLabel#purpleText {{ color: {PURPLE}; font-weight: 700; }}
@@ -154,7 +159,7 @@ def build_stylesheet(theme: str = "light") -> str:
         border: 1px solid #DDE0E8;
         border-radius: 6px;
         padding: 7px 13px;
-        font-size: 11px;
+        font-size: 12px;
     }}
     QPushButton:hover {{
         border-color: #BDB4F8;
@@ -165,6 +170,22 @@ def build_stylesheet(theme: str = "light") -> str:
         color: #AFB2BC;
         background: #F4F5F7;
         border-color: #E6E8ED;
+    }}
+    QPushButton[taskState="running"] {{
+        color: #FFFFFF;
+        border-color: #6750E8;
+        background: #6750E8;
+        font-weight: 700;
+    }}
+    QPushButton[taskState="success"] {{
+        color: #FFFFFF;
+        border-color: {SUCCESS};
+        background: {SUCCESS};
+    }}
+    QPushButton[taskState="error"] {{
+        color: #FFFFFF;
+        border-color: {DANGER};
+        background: {DANGER};
     }}
     QPushButton#primaryButton {{
         color: #FFFFFF;
@@ -234,12 +255,12 @@ def build_stylesheet(theme: str = "light") -> str:
         font-weight: 700;
     }}
     QLineEdit, QComboBox, QSpinBox {{
-        min-height: 33px;
+        min-height: 35px;
         background: #FFFFFF;
         border: 1px solid #E1E3E9;
         border-radius: 5px;
         padding: 0 10px;
-        font-size: 11px;
+        font-size: 12px;
         selection-background-color: {PURPLE};
     }}
     QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{
@@ -253,7 +274,7 @@ def build_stylesheet(theme: str = "light") -> str:
         selection-color: {PURPLE};
         padding: 4px;
     }}
-    QCheckBox {{ spacing: 8px; font-size: 11px; }}
+    QCheckBox {{ spacing: 8px; font-size: 12px; }}
     QCheckBox::indicator {{ width: 15px; height: 15px; }}
     QCheckBox::indicator:unchecked {{
         border: 1px solid #C7CAD3;
@@ -270,7 +291,7 @@ def build_stylesheet(theme: str = "light") -> str:
         alternate-background-color: #FBFBFD;
         border: none;
         gridline-color: #EEF0F4;
-        font-size: 10px;
+        font-size: 11px;
         selection-background-color: {PURPLE_SOFT};
         selection-color: {TEXT};
     }}
@@ -281,7 +302,7 @@ def build_stylesheet(theme: str = "light") -> str:
         border: none;
         border-bottom: 1px solid {BORDER};
         padding: 6px;
-        font-size: 10px;
+        font-size: 11px;
         font-weight: 600;
         text-align: left;
     }}
@@ -289,6 +310,16 @@ def build_stylesheet(theme: str = "light") -> str:
     QScrollBar::handle:vertical {{ background: #D7D9E1; border-radius: 3px; min-height: 28px; }}
     QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
     QScrollArea {{ border: none; background: #FFFFFF; }}
+    QProgressBar {{
+        border: none;
+        background: #EEEAFD;
+        border-radius: 2px;
+    }}
+    QProgressBar::chunk {{
+        border-radius: 2px;
+        background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {PURPLE}, stop:1 #2EA7E0);
+    }}
     QToolTip {{
         color: #FFFFFF;
         background: #2F3040;

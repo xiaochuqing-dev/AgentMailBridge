@@ -137,7 +137,13 @@ def test_background_task_completion_reaches_gui(bridge_window, qt_app):
     assert bridge_window._active_runner is None
     assert len(completed) == 1
     assert callback_on_gui_thread == [True]
-    assert all(button.isEnabled() for button in bridge_window.task_buttons)
+    assert all(
+        button.isEnabled()
+        for button in bridge_window.task_buttons
+        if button is not bridge_window.send_action_button
+    )
+    # 未明确选择文件时发送入口必须保持禁用。
+    assert not bridge_window.send_action_button.isEnabled()
 
 
 def test_receive_failure_message_contains_reason(bridge_window):

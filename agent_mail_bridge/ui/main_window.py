@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import os
 import subprocess
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QObject, QPoint, QRunnable, Qt, QThreadPool, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, QPoint, QRunnable, QSettings, Qt, QThreadPool, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QCloseEvent, QColor, QFont, QIcon, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QProgressBar,
     QScrollArea,
     QSystemTrayIcon,
     QMenu,
@@ -71,6 +73,27 @@ AUTO_RECEIVE_DEFAULT_MINUTES = 3  # 自动收件默认间隔，单位：分钟
 PREVIEW_MAX_BYTES = 128 * 1024  # 文本预览上限，单位：字节
 SAFE_TEXT_SUFFIXES = {".txt", ".md", ".csv", ".json", ".log", ".py", ".toml", ".ini"}
 SAFE_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}
+
+
+@dataclass(frozen=True)
+class SendFileSelection:
+    """记录用户本次明确选择的文件状态，防止页面残留和文件被替换。"""
+
+    path: Path
+    size: int
+    modified_ns: int
+
+    @classmethod
+    def capture(cls, path: Path) -> "SendFileSelection":
+        stat = path.stat()
+        return cls(path=path.resolve(), size=stat.st_size, modified_ns=stat.st_mtime_ns)
+
+    def is_unchanged(self) -> bool:
+        try:
+            current = self.path.stat()
+        except OSError:
+            return False
+        return current.st_size == self.size and current.st_mtime_ns == self.modified_ns
 
 
 def _fill_background(widget: QWidget, color: str) -> None:
@@ -234,6 +257,8 @@ class BridgeWindow(QMainWindow):
         self.task_buttons: list[QPushButton] = []
         self.manual_receive_buttons: list[QPushButton] = []
         self._active_task_button: QPushButton | None = None
+        self._active_task_button_text = ""
+        self._task_refresh_on_finish = True
         saved_theme = os.getenv("GUI_THEME", "light").strip().lower()
         self.theme_mode = saved_theme if saved_theme in {"light", "dark"} else "light"
         self.file_rows: list[dict] = []
@@ -241,6 +266,15 @@ class BridgeWindow(QMainWindow):
         self.history_rows: dict[str, list[dict]] = {"received": [], "sent": []}
         self.mcp_rows: list[dict] = []
         self.selected_send_path = ""
+        self.send_selection: SendFileSelection | None = None
+        self.last_refresh_at: datetime | None = None
+        self.last_error_details = ""
+        self._config_dirty = False
+        self._loading_controls = False
+        self.settings = QSettings("AgentMailBridge", "AgentMailBridge")
+        self.previous_exit_was_clean = self.settings.value("runtime/clean_exit", True, type=bool)
+        self.settings.setValue("runtime/clean_exit", False)
+        self.settings.sync()
         self.status_var = _ValueSink(lambda value: self.show_message(value, "working"))
         self.error_var = _ValueSink(lambda value: self.show_message(value, "error"))
         self.auto_timer = QTimer(self)
@@ -255,7 +289,20 @@ class BridgeWindow(QMainWindow):
         self.apply_theme(self.theme_mode)
         self._build_tray()
         self._load_auto_receive_preferences()
+        self._wire_config_change_tracking()
+        saved_geometry = self.settings.value("window/geometry")
+        if saved_geometry:
+            self.restoreGeometry(saved_geometry)
+        self.select_page(str(self.settings.value("window/last_page", "basic")))
         QTimer.singleShot(0, self.refresh)
+        if not self.previous_exit_was_clean:
+            QTimer.singleShot(
+                100,
+                lambda: self.show_message(
+                    "检测到上次未正常退出；临时发送文件未恢复，请重新选择文件",
+                    "error",
+                ),
+            )
 
     def _build(self) -> None:
         root = QWidget()
@@ -511,9 +558,17 @@ class BridgeWindow(QMainWindow):
         log_header = QHBoxLayout()
         log_title = QLabel("最近日志")
         log_title.setObjectName("sectionTitle")
+        self.home_refresh_label = QLabel("尚未刷新")
+        self.home_refresh_label.setObjectName("hint")
+        self.home_refresh_button = self._button("刷新", text_only=True)
+        self.home_refresh_button.clicked.connect(
+            lambda: self.request_refresh(self.home_refresh_button)
+        )
         more_logs = self._button("查看更多日志  →", lambda: self.select_page("logs"), text_only=True)
         log_header.addWidget(log_title)
         log_header.addStretch(1)
+        log_header.addWidget(self.home_refresh_label)
+        log_header.addWidget(self.home_refresh_button)
         log_header.addWidget(more_logs)
         layout.addLayout(log_header)
         self.logs_table = DataTable(["时间", "级别", "消息"])
@@ -531,12 +586,15 @@ class BridgeWindow(QMainWindow):
         self.inbox_search.setPlaceholderText("搜索文件名或路径")
         self.inbox_search.textChanged.connect(self._filter_inbox)
         receive = self._button("↓  立即收取", self.receive, primary=True)
-        refresh = self._button("刷新", self.refresh)
+        self.inbox_refresh_button = self._button("刷新")
+        self.inbox_refresh_button.clicked.connect(
+            lambda: self.request_refresh(self.inbox_refresh_button)
+        )
         self.task_buttons.append(receive)
         self.manual_receive_buttons.append(receive)
         tools.addWidget(self.inbox_search, 1)
         tools.addWidget(receive)
-        tools.addWidget(refresh)
+        tools.addWidget(self.inbox_refresh_button)
         layout.addLayout(tools)
         self.inbox_table = DataTable(["文件名", "大小", "保存路径", "收取时间", "状态"])
         self.inbox_table.cellDoubleClicked.connect(self._preview_inbox_file)
@@ -560,19 +618,63 @@ class BridgeWindow(QMainWindow):
         choose = self._button("选择文件", self.choose_send_file)
         source_row.addWidget(self.send_path_edit, 1)
         source_row.addWidget(choose)
+        file_actions = QHBoxLayout()
+        self.copy_send_path_button = self._button("复制路径", self.copy_selected_send_path, text_only=True)
+        self.reveal_send_file_button = self._button("打开所在文件夹", self.reveal_selected_send_file, text_only=True)
+        self.preview_send_file_button = self._button("安全预览", self.preview_selected_send_file, text_only=True)
+        for button in (
+            self.copy_send_path_button,
+            self.reveal_send_file_button,
+            self.preview_send_file_button,
+        ):
+            button.setEnabled(False)
+            file_actions.addWidget(button)
+        file_actions.addStretch(1)
+
+        details = QGridLayout()
+        details.setHorizontalSpacing(14)
+        details.setVerticalSpacing(6)
+        self.send_file_name_value = QLabel("未选择")
+        self.send_file_size_value = QLabel("—")
+        self.send_file_type_value = QLabel("—")
+        self.send_file_modified_value = QLabel("—")
+        detail_values = (
+            ("文件名", self.send_file_name_value),
+            ("大小", self.send_file_size_value),
+            ("类型", self.send_file_type_value),
+            ("最后修改", self.send_file_modified_value),
+        )
+        for index, (label, value) in enumerate(detail_values):
+            title = QLabel(label)
+            title.setObjectName("fieldLabel")
+            value.setObjectName("sendFileValue")
+            details.addWidget(title, index // 2 * 2, index % 2)
+            details.addWidget(value, index // 2 * 2 + 1, index % 2)
         self.subject_edit = QLineEdit()
         self.subject_edit.setPlaceholderText("可选；留空时使用默认主题")
         self.recipient_edit = QLineEdit(self.service.cfg.owner_gmail)
         self.recipient_edit.setReadOnly(True)
-        send = self._button("▷  发送到绑定 Gmail", self.send_selected_file, primary=True)
-        self.task_buttons.append(send)
+        self.send_action_button = self._button("▷  发送到绑定 Gmail", self.send_selected_file, primary=True)
+        self.send_action_button.setEnabled(False)
+        self.task_buttons.append(self.send_action_button)
+        self.send_progress = QProgressBar()
+        self.send_progress.setRange(0, 0)
+        self.send_progress.setTextVisible(False)
+        self.send_progress.setFixedHeight(4)
+        self.send_progress.hide()
+        self.send_status_label = QLabel("请选择本次要发送的文件")
+        self.send_status_label.setObjectName("hint")
         form.addWidget(source_label)
         form.addLayout(source_row)
+        form.addLayout(file_actions)
+        form.addLayout(details)
         form.addWidget(QLabel("邮件主题"))
         form.addWidget(self.subject_edit)
         form.addWidget(QLabel("固定收件人"))
         form.addWidget(self.recipient_edit)
-        form.addWidget(send, 0, Qt.AlignmentFlag.AlignLeft)
+        form.addWidget(self.send_action_button, 0, Qt.AlignmentFlag.AlignLeft)
+        form.addWidget(self.send_progress)
+        form.addWidget(self.send_status_label)
         layout.addWidget(card)
         history_title = QLabel("最近发送记录")
         history_title.setObjectName("sectionTitle")
@@ -620,12 +722,23 @@ class BridgeWindow(QMainWindow):
         self.startup_check.setChecked(StartupManager.is_enabled())
         layout.addWidget(self.startup_check)
 
+        self.secret_visibility_check = QCheckBox("临时显示密码和授权码")
+        self.secret_visibility_check.toggled.connect(self._toggle_secret_visibility)
+        layout.addWidget(self.secret_visibility_check)
+
+        self.unsaved_config_label = QLabel("配置未修改")
+        self.unsaved_config_label.setObjectName("hint")
+        layout.addWidget(self.unsaved_config_label)
+
         actions = QHBoxLayout()
         save = self._button("保存高级设置", self.save_advanced_config, primary=True)
         self.authorize_button = self._button("Gmail API 显式授权", self.authorize_gmail_api)
         self.imap_diagnose_button = self._button("诊断 IMAP")
         self.gmail_api_diagnose_button = self._button("诊断 Gmail API")
         self.smtp_diagnose_button = self._button("诊断 QQ SMTP")
+        self.export_diagnosis_button = self._button("导出脱敏诊断报告")
+        self.error_details_button = self._button("查看最近错误详情", self.show_last_error_details)
+        self.error_details_button.setEnabled(False)
         self.imap_diagnose_button.clicked.connect(
             lambda: self._diagnose("正在诊断 Gmail IMAP", self.service.diagnose_imap, self.imap_diagnose_button)
         )
@@ -639,8 +752,12 @@ class BridgeWindow(QMainWindow):
         imap = self.imap_diagnose_button
         api = self.gmail_api_diagnose_button
         smtp = self.smtp_diagnose_button
-        self.task_buttons.extend((auth, imap, api, smtp))
-        for button in (save, auth, imap, api, smtp):
+        self.export_diagnosis_button.clicked.connect(self.export_diagnostic_report)
+        self.task_buttons.extend((auth, imap, api, smtp, self.export_diagnosis_button))
+        for button in (
+            save, auth, imap, api, smtp,
+            self.export_diagnosis_button, self.error_details_button,
+        ):
             actions.addWidget(button)
         actions.addStretch(1)
         layout.addLayout(actions)
@@ -667,10 +784,16 @@ class BridgeWindow(QMainWindow):
         self.log_filter = QComboBox()
         self.log_filter.addItems(["全部级别", "INFO", "SUCCESS", "WARNING", "ERROR"])
         self.log_filter.currentTextChanged.connect(self._populate_full_logs)
-        refresh = self._button("刷新", self.refresh)
+        self.logs_refresh_button = self._button("刷新")
+        self.logs_refresh_button.clicked.connect(
+            lambda: self.request_refresh(self.logs_refresh_button)
+        )
+        self.logs_refresh_label = QLabel("尚未刷新")
+        self.logs_refresh_label.setObjectName("hint")
         tools.addWidget(self.log_filter)
         tools.addStretch(1)
-        tools.addWidget(refresh)
+        tools.addWidget(self.logs_refresh_label)
+        tools.addWidget(self.logs_refresh_button)
         layout.addLayout(tools)
         self.full_logs_table = DataTable(["时间", "级别", "事件", "消息"])
         self._configure_log_table(self.full_logs_table, full=True)
@@ -718,7 +841,11 @@ class BridgeWindow(QMainWindow):
         actions = QHBoxLayout()
         actions.addWidget(self._button("复制 Codex 配置", lambda: self._copy_mcp_config("codex")))
         actions.addWidget(self._button("复制 Claude Code 配置", lambda: self._copy_mcp_config("claude")))
-        actions.addWidget(self._button("刷新调用记录", self.refresh, primary=True))
+        self.mcp_refresh_button = self._button("刷新调用记录", primary=True)
+        self.mcp_refresh_button.clicked.connect(
+            lambda: self.request_refresh(self.mcp_refresh_button)
+        )
+        actions.addWidget(self.mcp_refresh_button)
         actions.addStretch(1)
         layout.addLayout(actions)
 
@@ -841,6 +968,47 @@ class BridgeWindow(QMainWindow):
         layout.addWidget(combo)
         return box, combo
 
+    def _wire_config_change_tracking(self) -> None:
+        """统一跟踪配置改动，避免用户误以为输入已自动生效。"""
+        for edit in (
+            self.gmail_email_edit,
+            self.gmail_password_edit,
+            self.qq_email_edit,
+            self.qq_auth_edit,
+        ):
+            edit.textChanged.connect(self._mark_config_dirty)
+        for combo in (self.backend_combo, self.network_combo, self.interval_combo):
+            combo.currentIndexChanged.connect(self._mark_config_dirty)
+        for spin in (self.fetch_limit_spin, self.send_limit_spin):
+            spin.valueChanged.connect(self._mark_config_dirty)
+        for check in (self.self_mail_check, self.startup_check):
+            check.toggled.connect(self._mark_config_dirty)
+
+    def _mark_config_dirty(self, *_args) -> None:
+        if self._loading_controls:
+            return
+        self._config_dirty = True
+        self.unsaved_config_label.setText("有未保存的配置修改")
+        self.unsaved_config_label.setObjectName("errorText")
+        self.unsaved_config_label.style().unpolish(self.unsaved_config_label)
+        self.unsaved_config_label.style().polish(self.unsaved_config_label)
+
+    def _set_config_clean(self) -> None:
+        self._config_dirty = False
+        self.unsaved_config_label.setText("配置已保存")
+        self.unsaved_config_label.setObjectName("successText")
+        self.unsaved_config_label.style().unpolish(self.unsaved_config_label)
+        self.unsaved_config_label.style().polish(self.unsaved_config_label)
+
+    def _toggle_secret_visibility(self, visible: bool) -> None:
+        mode = QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password
+        self.gmail_password_edit.setEchoMode(mode)
+        self.qq_auth_edit.setEchoMode(mode)
+        self.show_message(
+            "敏感字段已临时显示，请注意周围环境" if visible else "敏感字段已恢复隐藏",
+            "normal",
+        )
+
     def _button(
         self,
         label: str,
@@ -884,12 +1052,36 @@ class BridgeWindow(QMainWindow):
         target = "basic" if name == "dashboard" else name
         if target not in self.pages:
             target = "basic"
+        current_name = self._current_page_name()
+        if (
+            self._config_dirty
+            and current_name in {"basic", "advanced"}
+            and target != current_name
+        ):
+            choice = QMessageBox.question(
+                self,
+                "配置尚未保存",
+                "当前配置有未保存修改，离开页面会保留输入但不会生效。仍要离开吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if choice != QMessageBox.StandardButton.Yes:
+                return
         self.page_stack.setCurrentWidget(self.pages[target])
         for key, button in self.tab_buttons.items():
             button.setChecked(key == target)
         nav_target = name if name in self.nav_buttons else target
         for key, button in self.nav_buttons.items():
             button.setChecked(key == nav_target)
+
+    def _current_page_name(self) -> str:
+        if not hasattr(self, "page_stack"):
+            return "basic"
+        current = self.page_stack.currentWidget()
+        for name, page in self.pages.items():
+            if page is current:
+                return name
+        return "basic"
 
     def receive(self) -> None:
         if self.auto_switch.isChecked():
@@ -909,22 +1101,126 @@ class BridgeWindow(QMainWindow):
         if not path:
             self.show_message("已取消选择文件")
             return False
-        self.selected_send_path = path
-        self.send_path_edit.setText(path)
-        self.show_message("文件已选择，请确认主题后发送", "normal")
+        selected_path = Path(path)
+        try:
+            assert_within_allowed_roots(selected_path, self.service.cfg.effective_allowed_send_roots)
+            if not selected_path.is_file():
+                raise OSError("文件不存在或不是普通文件")
+            selection = SendFileSelection.capture(selected_path)
+        except (OSError, SecurityError) as exc:
+            self._clear_send_selection()
+            self.show_message(f"无法选择该文件：{exc}", "error")
+            return False
+        self.send_selection = selection
+        self.selected_send_path = str(selection.path)
+        self.send_path_edit.setText(str(selection.path))
+        self.send_path_edit.setToolTip(str(selection.path))
+        self.send_file_name_value.setText(selection.path.name)
+        self.send_file_name_value.setToolTip(selection.path.name)
+        self.send_file_size_value.setText(format_size(selection.size))
+        self.send_file_type_value.setText(selection.path.suffix.lower() or "无扩展名")
+        self.send_file_modified_value.setText(
+            datetime.fromtimestamp(selection.modified_ns / 1_000_000_000).strftime("%Y-%m-%d %H:%M:%S")
+        )
+        for button in (
+            self.copy_send_path_button,
+            self.reveal_send_file_button,
+            self.preview_send_file_button,
+            self.send_action_button,
+        ):
+            button.setEnabled(True)
+        self.send_status_label.setText("文件已锁定为本次选择；发送前还会检查是否被修改")
+        self.show_message("文件已选择，请核对文件名、大小、路径和主题", "success")
         return True
 
     def send_selected_file(self) -> None:
-        path = self.send_path_edit.text().strip() or self.selected_send_path
-        if not path:
+        if self.task_active:
+            self.show_message("已有后台任务正在运行，请等待完成后再发送", "working")
+            return
+        selection = self.send_selection
+        if selection is None:
             self.show_message("请先选择待发送文件", "error")
             return
+        if not selection.is_unchanged():
+            self._clear_send_selection()
+            self.show_message("文件已被删除、移动或修改，请重新选择后再发送", "error")
+            return
         subject = self.subject_edit.text().strip() or None
-        self._run_task(
-            "正在发送文件，请勿重复点击",
-            lambda: self.service.send_file(Path(path), subject=subject),
-            self._show_send_result,
+        subject_text = subject or f"AgentMailBridge 文件：{selection.path.name}"
+        confirmation = QMessageBox.question(
+            self,
+            "确认发送文件",
+            "请确认本次真实发送内容：\n\n"
+            f"附件：{selection.path.name}\n"
+            f"大小：{format_size(selection.size)}\n"
+            f"主题：{subject_text}\n"
+            f"固定收件人：{self.recipient_edit.text().strip() or '未配置'}\n\n"
+            "确认后才会连接 QQ SMTP。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            self.send_status_label.setText("已取消发送，当前文件仍保留供重新核对")
+            self.show_message("已取消发送，没有连接邮件服务器", "normal")
+            return
+        self.send_status_label.setText("正在校验文件并连接 QQ SMTP")
+        self.send_progress.show()
+        self._run_task(
+            "正在校验并发送文件，请勿重复点击",
+            lambda: self._send_unchanged_selection(selection, subject),
+            self._show_send_result,
+            button=self.send_action_button,
+            working_text="正在发送…",
+        )
+
+    def _send_unchanged_selection(
+        self, selection: SendFileSelection, subject: str | None
+    ) -> ServiceResult:
+        """后台发送前再次校验快照，缩小确认后文件被替换的窗口。"""
+        if not selection.is_unchanged():
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="file_changed",
+                message="确认后文件发生变化，已阻止发送",
+            )
+        return self.service.send_file(selection.path, subject=subject)
+
+    def _clear_send_selection(self) -> None:
+        self.send_selection = None
+        self.selected_send_path = ""
+        self.send_path_edit.clear()
+        self.send_path_edit.setToolTip("")
+        self.send_file_name_value.setText("未选择")
+        self.send_file_size_value.setText("—")
+        self.send_file_type_value.setText("—")
+        self.send_file_modified_value.setText("—")
+        for button in (
+            self.copy_send_path_button,
+            self.reveal_send_file_button,
+            self.preview_send_file_button,
+            self.send_action_button,
+        ):
+            button.setEnabled(False)
+        self.send_status_label.setText("请选择本次要发送的文件")
+
+    def copy_selected_send_path(self) -> None:
+        if self.send_selection is None:
+            self.show_message("当前没有已选择文件", "error")
+            return
+        QApplication.clipboard().setText(str(self.send_selection.path))
+        self.show_message("完整文件路径已复制", "success")
+
+    def reveal_selected_send_file(self) -> None:
+        if self.send_selection is None:
+            self.show_message("当前没有已选择文件", "error")
+            return
+        self._reveal_file(self.send_selection.path)
+
+    def preview_selected_send_file(self) -> None:
+        if self.send_selection is None:
+            self.show_message("当前没有已选择文件", "error")
+            return
+        self._preview_path(str(self.send_selection.path))
 
     def test_connection(self) -> None:
         backend = self.backend_combo.currentData()
@@ -983,6 +1279,7 @@ class BridgeWindow(QMainWindow):
         self.service.cfg.auto_receive_only_self_mail = self.self_mail_check.isChecked()
         self.recipient_edit.setText(email)
         self.refresh()
+        self._set_config_clean()
         self.show_message("配置已安全保存并在当前运行中生效", "success")
 
     def save_advanced_config(self) -> None:
@@ -995,6 +1292,15 @@ class BridgeWindow(QMainWindow):
             self.show_message("QQ 邮箱和 SMTP 授权码必须同时填写", "error")
             return
         network_mode = str(self.network_combo.currentData())
+        previous_startup = StartupManager.is_enabled()
+        desired_startup = self.startup_check.isChecked()
+        startup_changed = desired_startup != previous_startup
+        try:
+            if startup_changed:
+                StartupManager.set_enabled(desired_startup)
+        except OSError as exc:
+            self.show_message(f"开机启动设置失败，其他配置未写入：{exc}", "error")
+            return
         try:
             save_env_values(
                 {
@@ -1006,12 +1312,13 @@ class BridgeWindow(QMainWindow):
                 }
             )
         except OSError as exc:
-            self.show_message(f"保存高级设置失败：{exc}", "error")
-            return
-        try:
-            StartupManager.set_enabled(self.startup_check.isChecked())
-        except OSError as exc:
-            self.show_message(f"开机启动设置失败：{exc}", "error")
+            rollback_message = "开机启动状态已回滚"
+            try:
+                if startup_changed:
+                    StartupManager.set_enabled(previous_startup)
+            except OSError:
+                rollback_message = "开机启动状态回滚失败，请手动检查"
+            self.show_message(f"保存高级设置失败：{exc}；{rollback_message}", "error")
             return
         self.service.cfg.qq_email = qq_email
         self.service.cfg.qq_auth_code = qq_auth
@@ -1019,21 +1326,62 @@ class BridgeWindow(QMainWindow):
         self.service.cfg.max_fetch_limit = self.fetch_limit_spin.value()
         self.service.cfg.max_send_file_mb = self.send_limit_spin.value()
         self.refresh()
+        self._set_config_clean()
         self.show_message("高级设置已安全保存", "success")
 
     def refresh(self) -> None:
         if self.task_active:
             self.show_message("当前任务尚未完成", "working")
             return
+        self._apply_refresh_result(self._collect_refresh_result())
+
+    def request_refresh(self, button: QPushButton | None = None) -> None:
+        """手动刷新在线程池执行，避免数据库或文件扫描阻塞界面。"""
+        self._run_task(
+            "正在刷新页面数据",
+            self._collect_refresh_result,
+            self._apply_refresh_result,
+            button=button,
+            working_text="刷新中…",
+            refresh_on_finish=False,
+        )
+
+    def _collect_refresh_result(self) -> ServiceResult:
         try:
             status = self.service.get_config_and_connection_status().details
-            self.file_rows = self.service.get_today_files().details.get("files", [])
-            self.log_rows = self.service.get_recent_logs(100).details.get("events", [])
-            self.history_rows = self.service.get_history(100).details
-            self.mcp_rows = self.service.get_mcp_history(100).details.get("calls", [])
-        except Exception as exc:
-            self.show_message(f"刷新界面失败：{exc}", "error")
+            files = self.service.get_today_files().details.get("files", [])
+            logs = self.service.get_recent_logs(100).details.get("events", [])
+            logs.sort(key=lambda row: str(row.get("created_at", "")), reverse=True)
+            history = self.service.get_history(100).details
+            mcp = self.service.get_mcp_history(100).details.get("calls", [])
+        except Exception as exc:  # noqa: BLE001
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="refresh_failed",
+                message=f"刷新界面失败：{exc}",
+            )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            details={
+                "status": status,
+                "files": files,
+                "logs": logs,
+                "history": history,
+                "mcp": mcp,
+            },
+        )
+
+    def _apply_refresh_result(self, result: ServiceResult) -> None:
+        if not result.ok:
+            self.last_error_details = self._redact_error_details(result.message)
+            self.error_details_button.setEnabled(True)
+            self.show_message(self._friendly_result_message(result), "error")
             return
+        status = result.details.get("status", {})
+        self.file_rows = result.details.get("files", [])
+        self.log_rows = result.details.get("logs", [])
+        self.history_rows = result.details.get("history", {"received": [], "sent": []})
+        self.mcp_rows = result.details.get("mcp", [])
         self._apply_config_to_controls(status)
         self._populate_files(self.files_table, self.file_rows, actions=True)
         self._populate_files(self.inbox_table, self.file_rows, actions=False)
@@ -1043,26 +1391,34 @@ class BridgeWindow(QMainWindow):
         self._populate_history()
         self._populate_mcp_history()
         self._update_right_panel(status)
-        self.show_message("状态已刷新", "normal")
+        self.last_refresh_at = datetime.now()
+        refresh_text = f"最后刷新 {self.last_refresh_at.strftime('%H:%M:%S')}"
+        self.home_refresh_label.setText(refresh_text)
+        self.logs_refresh_label.setText(refresh_text)
+        self.show_message(f"状态已刷新，{self.last_refresh_at.strftime('%H:%M:%S')}", "success")
 
     def _apply_config_to_controls(self, status: dict) -> None:
         cfg = self.service.cfg
-        self.gmail_card.email_label.setText(cfg.gmail_address or "未配置")
-        self.qq_card.email_label.setText(cfg.qq_email or "未配置")
-        self.recipient_edit.setText(cfg.owner_gmail or cfg.gmail_address)
-        self._set_combo_data(self.backend_combo, cfg.gmail_receive_backend)
-        self._set_combo_data(self.network_combo, cfg.gmail_network_mode)
+        self._loading_controls = True
+        try:
+            self.gmail_card.email_label.setText(cfg.gmail_address or "未配置")
+            self.qq_card.email_label.setText(cfg.qq_email or "未配置")
+            self.recipient_edit.setText(cfg.owner_gmail or cfg.gmail_address)
+            self._set_combo_data(self.backend_combo, cfg.gmail_receive_backend)
+            self._set_combo_data(self.network_combo, cfg.gmail_network_mode)
+        finally:
+            self._loading_controls = False
         masked = status.get("config", {})
         summary_lines = [
             f"收件后端：{status.get('receive_backend', '—')}",
-            f"Gmail：{masked.get('gmail_address') or '未配置'}",
+            f"Gmail：{self._mask_email_for_display(str(masked.get('gmail_address') or ''))}",
             f"Gmail 密钥：{masked.get('gmail_app_password') or '未配置'}",
             f"Gmail API：{status.get('gmail_api', {}).get('state', '—')}",
-            f"QQ 邮箱：{masked.get('qq_email') or '未配置'}",
+            f"QQ 邮箱：{self._mask_email_for_display(str(masked.get('qq_email') or ''))}",
             f"QQ 授权码：{masked.get('qq_auth_code') or '未配置'}",
             f"网络模式：{masked.get('gmail_network_mode', '—')}",
-            f"数据目录：{masked.get('data_root', '—')}",
-            f"允许发送目录：{', '.join(masked.get('allowed_send_roots', []))}",
+            f"数据目录：{'可用' if cfg.data_root_path.exists() else '不存在'}（完整路径已隐藏）",
+            f"允许发送目录数量：{len(masked.get('allowed_send_roots', []))}",
             f"Gmail API 权限：{masked.get('gmail_api_scopes', '—')}",
         ]
         self.config_summary.setPlainText("\n".join(summary_lines))
@@ -1215,6 +1571,8 @@ class BridgeWindow(QMainWindow):
         *,
         button: QPushButton | None = None,
         operation_name: str | None = None,
+        working_text: str | None = None,
+        refresh_on_finish: bool = True,
     ) -> None:
         if not getattr(self, "accepting_tasks", True):
             self.error_var.set("程序正在退出，不再启动新任务")
@@ -1223,11 +1581,18 @@ class BridgeWindow(QMainWindow):
             self.error_var.set("已有任务正在运行，请勿重复点击")
             return
         self.task_active = True
+        self._task_refresh_on_finish = refresh_on_finish
         self.status_var.set(title)
         self._active_task_button = button
         if button is not None:
+            self._active_task_button_text = button.text()
             button.setEnabled(False)
             button.setToolTip("正在执行，请稍候")
+            button.setProperty("taskState", "running")
+            if working_text:
+                button.setText(working_text)
+            button.style().unpolish(button)
+            button.style().polish(button)
         runner = _TaskRunner(operation)
         if operation_name:
             self._task_callback = lambda result: self._show_operation_result(result, operation_name, callback)
@@ -1247,16 +1612,31 @@ class BridgeWindow(QMainWindow):
         if self.closed:
             return
         self.task_active = False
-        if self._active_task_button is not None:
-            self._active_task_button.setEnabled(True)
-            self._active_task_button.setToolTip("")
+        completed_button = self._active_task_button
+        if completed_button is not None:
+            completed_button.setText(self._active_task_button_text)
+            completed_button.setEnabled(True)
+            completed_button.setToolTip("")
+            completed_button.setProperty("taskState", "success" if result.ok else "error")
+            completed_button.style().unpolish(completed_button)
+            completed_button.style().polish(completed_button)
+            QTimer.singleShot(1200, lambda button=completed_button: self._reset_task_button_state(button))
         self._active_task_button = None
-        self.refresh()
+        self._active_task_button_text = ""
+        if self._task_refresh_on_finish:
+            self.refresh()
+        self._task_refresh_on_finish = True
         if callback is not None:
             callback(result)
         if self.pending_quit:
             self.pending_quit = False
             QTimer.singleShot(0, self._finalize_quit)
+
+    @staticmethod
+    def _reset_task_button_state(button: QPushButton) -> None:
+        button.setProperty("taskState", "idle")
+        button.style().unpolish(button)
+        button.style().polish(button)
 
     def _show_receive_result(self, result: ServiceResult) -> None:
         if isinstance(result, ReceiveResult):
@@ -1275,6 +1655,9 @@ class BridgeWindow(QMainWindow):
         else:
             message = result.message or result.status.value
         self.show_message(message, "success" if result.ok else "error")
+        if not result.ok:
+            self.last_error_details = self._redact_error_details(message)
+            self.error_details_button.setEnabled(True)
         if isinstance(result, ReceiveResult) and result.saved:
             self.notify("收到新邮件", f"已安全保存 {result.saved} 封邮件中的文件", "receive-success")
         elif isinstance(result, ReceiveResult) and not result.ok:
@@ -1282,6 +1665,7 @@ class BridgeWindow(QMainWindow):
             self.notify(title, "请打开主窗口查看具体原因", "receive-failure", 300)
 
     def _show_send_result(self, result: ServiceResult) -> None:
+        self.send_progress.hide()
         if isinstance(result, SendResult):
             messages = {
                 "sent": "邮件发送并归档成功",
@@ -1292,10 +1676,91 @@ class BridgeWindow(QMainWindow):
             message = messages.get(result.send_status, result.message or result.send_status)
         else:
             message = result.message or result.status.value
-        self.show_message(message, "success" if result.ok else "error")
+        kind = "success" if result.ok or getattr(result, "send_status", "") == "sent_archive_failed" else "error"
+        self.show_message(message, kind)
+        if kind == "error":
+            self.last_error_details = self._redact_error_details(message)
+            self.error_details_button.setEnabled(True)
+        self.send_status_label.setText(message)
+        if isinstance(result, SendResult) and result.send_status in {
+            "sent", "sent_archive_failed", "duplicate"
+        }:
+            self._clear_send_selection()
+            self.subject_edit.clear()
+            self.send_status_label.setText(message + "；已清空本次选择")
 
     def _show_service_result(self, result: ServiceResult) -> None:
-        self.show_message(result.message or result.status.value, "success" if result.ok else "error")
+        message = self._friendly_result_message(result)
+        if not result.ok:
+            self.last_error_details = self._redact_error_details(
+                result.message or result.error_code or "无详细信息"
+            )
+            self.error_details_button.setEnabled(True)
+        self.show_message(message, "success" if result.ok else "error")
+
+    def show_last_error_details(self) -> None:
+        if not self.last_error_details:
+            self.show_message("当前没有可查看的错误详情", "normal")
+            return
+        QMessageBox.warning(self, "最近错误详情（已脱敏）", self.last_error_details)
+
+    def _redact_error_details(self, value: str) -> str:
+        text = str(value)
+        replacements = {
+            self.service.cfg.gmail_app_password: "<Gmail 密钥已隐藏>",
+            self.service.cfg.qq_auth_code: "<QQ 授权码已隐藏>",
+            str(self.service.cfg.gmail_api_credentials_path): "<credentials 路径已隐藏>",
+            str(self.service.cfg.gmail_api_token_path): "<token 路径已隐藏>",
+            str(self.service.cfg.data_root_path): "<数据目录已隐藏>",
+        }
+        for original, replacement in replacements.items():
+            if original:
+                text = text.replace(original, replacement)
+        for email in (self.service.cfg.gmail_address, self.service.cfg.qq_email):
+            if email:
+                text = text.replace(email, self._mask_email_for_display(email))
+        return text
+
+    @staticmethod
+    def _mask_email_for_display(value: str) -> str:
+        local, separator, domain = value.partition("@")
+        if not local or not separator or not domain:
+            return "未配置"
+        return f"{local[:1]}***@{domain}"
+
+    @staticmethod
+    def _friendly_result_message(result: ServiceResult) -> str:
+        if result.ok:
+            return result.message or "操作完成"
+        messages = {
+            "oauth_failed": "Gmail 授权失败，请检查网络、credentials.json 后重试。",
+            "gmail_api_diagnose_failed": "Gmail API 当前不可用，请检查授权是否失效。",
+            "imap_diagnose_failed": "当前网络无法连接 Gmail IMAP 993，建议使用 Gmail API。",
+            "qq_smtp_diagnose_failed": "QQ SMTP 连接失败，请检查网络和 QQ 邮箱授权码。",
+            "file_changed": "文件在确认后发生变化，已阻止发送，请重新选择。",
+            "path_not_allowed": "该文件不在允许发送目录中。",
+            "receive_busy": "已有收件任务正在运行，请等待完成。",
+        }
+        return messages.get(result.error_code or "", result.message or "操作失败，请查看日志。")
+
+    def export_diagnostic_report(self) -> None:
+        destination, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存脱敏诊断报告",
+            str(self.service.cfg.data_root_path / "diagnostic-report.md"),
+            "Markdown 文件 (*.md)",
+        )
+        if not destination:
+            self.show_message("已取消导出诊断报告", "normal")
+            return
+        self._run_task(
+            "正在生成脱敏诊断报告",
+            lambda: self.service.export_diagnostic_report(Path(destination)),
+            self._show_service_result,
+            button=self.export_diagnosis_button,
+            operation_name="导出诊断报告",
+            working_text="正在导出…",
+        )
 
     def _show_operation_result(
         self,
@@ -1521,7 +1986,7 @@ class BridgeWindow(QMainWindow):
         receive_action = QAction("手动检查新邮件", self)
         receive_action.triggered.connect(self.receive)
         status_action = QAction("刷新最近状态", self)
-        status_action.triggered.connect(self.refresh)
+        status_action.triggered.connect(lambda: self.request_refresh())
         quit_action = QAction("退出程序", self)
         quit_action.triggered.connect(self.request_quit)
         for action in (show_action, receive_action, status_action):
@@ -1564,6 +2029,10 @@ class BridgeWindow(QMainWindow):
     def _finalize_quit(self) -> None:
         self.quitting = True
         self.thread_pool.waitForDone(1000)
+        self.settings.setValue("window/geometry", self.saveGeometry())
+        self.settings.setValue("window/last_page", self._current_page_name())
+        self.settings.setValue("runtime/clean_exit", True)
+        self.settings.sync()
         close_connection()
         if self.tray_icon is not None:
             self.tray_icon.hide()
@@ -1624,6 +2093,11 @@ class BridgeWindow(QMainWindow):
             return
         self.closed = True
         self.auto_timer.stop()
+        self.settings.setValue("window/geometry", self.saveGeometry())
+        self.settings.setValue("window/last_page", self._current_page_name())
+        if self.quitting or self.tray_icon is None:
+            self.settings.setValue("runtime/clean_exit", True)
+        self.settings.sync()
         event.accept()
 
     def resizeEvent(self, event) -> None:
