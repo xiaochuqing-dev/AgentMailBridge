@@ -28,6 +28,7 @@ def isolate_local_secrets(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     for name in sensitive_names:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("AGENT_MAIL_BRIDGE_DISABLE_DOTENV", "1")
+    monkeypatch.setenv("AGENT_MAIL_BRIDGE_DISABLE_CREDENTIAL_STORE", "1")
     monkeypatch.setenv("DATA_ROOT", str(tmp_path / "isolated_data"))
     monkeypatch.setenv(
         "GMAIL_API_CREDENTIALS_PATH", str(tmp_path / "credentials.json")

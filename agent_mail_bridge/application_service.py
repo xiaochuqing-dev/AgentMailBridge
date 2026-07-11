@@ -5,6 +5,7 @@ from __future__ import annotations
 import smtplib
 import ssl
 import platform
+import os
 import sys
 import threading
 import uuid
@@ -18,6 +19,13 @@ from agent_mail_bridge.config import (
     ConfigError,
     _effective_receive_backend,
     require_receive_config,
+)
+from agent_mail_bridge.credentials import (
+    CredentialError,
+    CredentialService,
+    GMAIL_IMAP_SECRET,
+    MemoryCredentialBackend,
+    QQ_SMTP_SECRET,
 )
 from agent_mail_bridge.database import (
     init_db,
@@ -54,6 +62,17 @@ class ApplicationService:
         self._receive_lock = threading.Lock()
         self._setup_lock = threading.Lock()
         self._ready = False
+        if os.getenv("AGENT_MAIL_BRIDGE_DISABLE_CREDENTIAL_STORE") == "1":
+            self._credentials = CredentialService(
+                MemoryCredentialBackend(
+                    {
+                        GMAIL_IMAP_SECRET: cfg.gmail_app_password,
+                        QQ_SMTP_SECRET: cfg.qq_auth_code,
+                    }
+                )
+            )
+        else:
+            self._credentials = CredentialService()
 
     def initialize(self) -> ServiceResult:
         """初始化安全目录、数据库和日志。"""
@@ -64,6 +83,102 @@ class ApplicationService:
                 setup_logging(self.cfg.logs_dir, self.cfg.log_level)
                 self._ready = True
         return ServiceResult(OperationStatus.SUCCESS, message="初始化完成")
+
+    def get_credential_status(self) -> ServiceResult:
+        """只返回已配置状态，不返回任何秘密值。"""
+        try:
+            states = self._credentials.status()
+        except CredentialError as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="credential_store_unavailable",
+                message=str(exc),
+            )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            details={
+                "gmail_imap": states[GMAIL_IMAP_SECRET],
+                "qq_smtp": states[QQ_SMTP_SECRET],
+            },
+        )
+
+    def set_credential(self, name: str, value: str) -> ServiceResult:
+        """保存或更新凭据，并同步当前进程配置。"""
+        if name not in {GMAIL_IMAP_SECRET, QQ_SMTP_SECRET}:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="invalid_credential_name",
+                message="不支持的凭据类型",
+            )
+        if not value.strip():
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="empty_credential",
+                message="凭据不能为空",
+            )
+        try:
+            self._credentials.set(name, value.strip())
+        except CredentialError as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="credential_write_failed",
+                message=str(exc),
+            )
+        if name == GMAIL_IMAP_SECRET:
+            self.cfg.gmail_app_password = value.strip()
+        else:
+            self.cfg.qq_auth_code = value.strip()
+        return ServiceResult(OperationStatus.SUCCESS, message="凭据已保存到 Windows 安全存储")
+
+    def delete_credential(self, name: str) -> ServiceResult:
+        """删除指定凭据，不影响其他配置。"""
+        if name not in {GMAIL_IMAP_SECRET, QQ_SMTP_SECRET}:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="invalid_credential_name",
+                message="不支持的凭据类型",
+            )
+        try:
+            self._credentials.delete(name)
+        except CredentialError as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="credential_delete_failed",
+                message=str(exc),
+            )
+        if name == GMAIL_IMAP_SECRET:
+            self.cfg.gmail_app_password = ""
+        else:
+            self.cfg.qq_auth_code = ""
+        return ServiceResult(OperationStatus.SUCCESS, message="凭据已删除")
+
+    def migrate_legacy_credentials(self, env_path: Path | None = None) -> ServiceResult:
+        """迁移旧 .env 明文；失败项保留原值。"""
+        if os.getenv("AGENT_MAIL_BRIDGE_DISABLE_CREDENTIAL_STORE") == "1":
+            return ServiceResult(
+                OperationStatus.CANCELLED,
+                error_code="credential_store_disabled",
+                message="测试环境已禁用真实凭据存储",
+            )
+        from agent_mail_bridge.config import PROJECT_ROOT
+        try:
+            result = CredentialService().migrate_env(env_path or PROJECT_ROOT / ".env")
+        except Exception as exc:  # noqa: BLE001
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="credential_migration_failed",
+                message=f"旧凭据迁移失败：{exc}",
+            )
+        status = OperationStatus.PARTIAL if result.failed else OperationStatus.SUCCESS
+        return ServiceResult(
+            status,
+            message=f"已迁移 {len(result.migrated)} 项，失败 {len(result.failed)} 项",
+            details={
+                "migrated": result.migrated,
+                "skipped": result.skipped,
+                "failed_keys": list(result.failed),
+            },
+        )
 
     def receive(
         self,

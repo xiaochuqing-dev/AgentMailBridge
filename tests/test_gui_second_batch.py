@@ -178,7 +178,8 @@ def test_basic_config_updates_runtime_without_core_rewrite(bridge_window, monkey
     assert bridge_window.service.cfg.gmail_address == "updated@gmail.com"
     assert bridge_window.service.cfg.owner_gmail == "updated@gmail.com"
     assert saved["GMAIL_RECEIVE_BACKEND"] == "imap"
-    assert saved["GMAIL_APP_PASSWORD"] == "dummy-app-password"
+    assert saved["GMAIL_APP_PASSWORD"] == ""
+    assert bridge_window.service.cfg.gmail_app_password == "dummy-app-password"
 
 
 def test_basic_config_save_failure_keeps_runtime_config(bridge_window, monkeypatch):

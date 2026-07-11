@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
 
 from agent_mail_bridge.application_service import ApplicationService
 from agent_mail_bridge.database import close_connection
+from agent_mail_bridge.credentials import GMAIL_IMAP_SECRET, QQ_SMTP_SECRET
 from agent_mail_bridge.desktop_runtime import StartupManager
 from agent_mail_bridge.models import OperationStatus, ReceiveResult, SendResult, ServiceResult
 from agent_mail_bridge.security import SecurityError, assert_within_allowed_roots
@@ -481,7 +482,10 @@ class BridgeWindow(QMainWindow):
         layout.addLayout(first_row)
 
         password_box, self.gmail_password_edit = self._field_edit(
-            "应用专用密码 / 授权状态", self.service.cfg.gmail_app_password, password=True
+            "应用专用密码（Windows 安全存储）", "", password=True
+        )
+        self.gmail_password_edit.setPlaceholderText(
+            "已配置；留空保持不变" if self.service.cfg.gmail_app_password else "未配置"
         )
         layout.addWidget(password_box)
 
@@ -525,6 +529,9 @@ class BridgeWindow(QMainWindow):
         actions.setSpacing(8)
         test_button = self._button("●  测试连接", self.test_connection, primary=True)
         save_button = self._button("□  保存配置", self.save_basic_config)
+        delete_password_button = self._button(
+            "删除 IMAP 凭据", lambda: self.delete_credential(GMAIL_IMAP_SECRET), text_only=True
+        )
         self.receive_button = self._button("↓  手动收取", self.receive)
         self.send_button = self._button("▷  手动选择发送", self.choose_and_send)
         mcp_button = self._button(
@@ -534,7 +541,10 @@ class BridgeWindow(QMainWindow):
         )
         self.task_buttons.extend((test_button, self.receive_button, self.send_button))
         self.manual_receive_buttons.append(self.receive_button)
-        for button in (test_button, save_button, self.receive_button, self.send_button, mcp_button):
+        for button in (
+            test_button, save_button, delete_password_button,
+            self.receive_button, self.send_button, mcp_button,
+        ):
             actions.addWidget(button)
         actions.addStretch(1)
         layout.addLayout(actions)
@@ -704,7 +714,10 @@ class BridgeWindow(QMainWindow):
         grid.setHorizontalSpacing(14)
         grid.setVerticalSpacing(10)
         qq_box, self.qq_email_edit = self._field_edit("QQ 邮箱（发件身份）", self.service.cfg.qq_email)
-        auth_box, self.qq_auth_edit = self._field_edit("QQ SMTP 授权码", self.service.cfg.qq_auth_code, password=True)
+        auth_box, self.qq_auth_edit = self._field_edit("QQ SMTP 授权码（Windows 安全存储）", "", password=True)
+        self.qq_auth_edit.setPlaceholderText(
+            "已配置；留空保持不变" if self.service.cfg.qq_auth_code else "未配置"
+        )
         network_box, self.network_combo = self._field_combo(
             "Gmail 网络模式", (("自动选择", "auto"), ("直连", "direct"), ("SOCKS5", "socks5"))
         )
@@ -755,6 +768,9 @@ class BridgeWindow(QMainWindow):
         self.smtp_diagnose_button = self._button("诊断 QQ SMTP")
         self.export_diagnosis_button = self._button("导出脱敏诊断报告")
         self.error_details_button = self._button("查看最近错误详情", self.show_last_error_details)
+        self.delete_qq_credential_button = self._button(
+            "删除 QQ 凭据", lambda: self.delete_credential(QQ_SMTP_SECRET)
+        )
         self.error_details_button.setEnabled(False)
         self.imap_diagnose_button.clicked.connect(
             lambda: self._diagnose("正在诊断 Gmail IMAP", self.service.diagnose_imap, self.imap_diagnose_button)
@@ -774,6 +790,7 @@ class BridgeWindow(QMainWindow):
         action_buttons = (
             save, auth, imap, api, smtp,
             self.export_diagnosis_button, self.error_details_button,
+            self.delete_qq_credential_button,
         )
         for index, button in enumerate(action_buttons):
             actions.addWidget(button, index // 4, index % 4)
@@ -1283,16 +1300,22 @@ class BridgeWindow(QMainWindow):
         if not self._valid_email(email):
             self.show_message("请输入有效的 Gmail 地址", "error")
             return
-        if backend == "imap" and not password.strip():
+        if backend == "imap" and not (password.strip() or self.service.cfg.gmail_app_password):
             self.show_message("IMAP 模式需要 Gmail 应用专用密码", "error")
             return
         minutes = int(self.interval_combo.currentData() or AUTO_RECEIVE_DEFAULT_MINUTES)
+        previous_password = self.service.cfg.gmail_app_password
+        if password.strip():
+            credential_result = self.service.set_credential(GMAIL_IMAP_SECRET, password)
+            if not credential_result.ok:
+                self.show_message(f"保存 IMAP 凭据失败：{credential_result.message}", "error")
+                return
         try:
             save_env_values(
                 {
                     "GMAIL_ADDRESS": email,
                     "OWNER_GMAIL": email,
-                    "GMAIL_APP_PASSWORD": password,
+                    "GMAIL_APP_PASSWORD": "",
                     "GMAIL_RECEIVE_BACKEND": backend,
                     "AUTO_RECEIVE_ONLY_SELF_MAIL": str(self.self_mail_check.isChecked()).lower(),
                     "GUI_AUTO_RECEIVE": str(self.auto_switch.isChecked()).lower(),
@@ -1300,11 +1323,17 @@ class BridgeWindow(QMainWindow):
                 }
             )
         except OSError as exc:
+            if password.strip():
+                if previous_password:
+                    self.service.set_credential(GMAIL_IMAP_SECRET, previous_password)
+                else:
+                    self.service.delete_credential(GMAIL_IMAP_SECRET)
             self.show_message(f"保存配置失败：{exc}", "error")
             return
         self.service.cfg.gmail_address = email
         self.service.cfg.owner_gmail = email
-        self.service.cfg.gmail_app_password = password
+        self.gmail_password_edit.clear()
+        self.gmail_password_edit.setPlaceholderText("已配置；留空保持不变")
         self.service.cfg.gmail_receive_backend = backend
         self.service.cfg.auto_receive_only_self_mail = self.self_mail_check.isChecked()
         self.recipient_edit.setText(email)
@@ -1318,13 +1347,19 @@ class BridgeWindow(QMainWindow):
         if qq_email and not self._valid_email(qq_email):
             self.show_message("请输入有效的 QQ 邮箱地址", "error")
             return
-        if bool(qq_email) != bool(qq_auth.strip()):
-            self.show_message("QQ 邮箱和 SMTP 授权码必须同时填写", "error")
+        if qq_email and not (qq_auth.strip() or self.service.cfg.qq_auth_code):
+            self.show_message("QQ 邮箱需要 SMTP 授权码", "error")
             return
         network_mode = str(self.network_combo.currentData())
         previous_startup = StartupManager.is_enabled()
         desired_startup = self.startup_check.isChecked()
         startup_changed = desired_startup != previous_startup
+        previous_auth = self.service.cfg.qq_auth_code
+        if qq_auth.strip():
+            credential_result = self.service.set_credential(QQ_SMTP_SECRET, qq_auth)
+            if not credential_result.ok:
+                self.show_message(f"保存 QQ 凭据失败：{credential_result.message}", "error")
+                return
         try:
             if startup_changed:
                 StartupManager.set_enabled(desired_startup)
@@ -1335,13 +1370,18 @@ class BridgeWindow(QMainWindow):
             save_env_values(
                 {
                     "QQ_EMAIL": qq_email,
-                    "QQ_AUTH_CODE": qq_auth,
+                    "QQ_AUTH_CODE": "",
                     "GMAIL_NETWORK_MODE": network_mode,
                     "MAX_FETCH_LIMIT": str(self.fetch_limit_spin.value()),
                     "MAX_SEND_FILE_MB": str(self.send_limit_spin.value()),
                 }
             )
         except OSError as exc:
+            if qq_auth.strip():
+                if previous_auth:
+                    self.service.set_credential(QQ_SMTP_SECRET, previous_auth)
+                else:
+                    self.service.delete_credential(QQ_SMTP_SECRET)
             rollback_message = "开机启动状态已回滚"
             try:
                 if startup_changed:
@@ -1351,13 +1391,34 @@ class BridgeWindow(QMainWindow):
             self.show_message(f"保存高级设置失败：{exc}；{rollback_message}", "error")
             return
         self.service.cfg.qq_email = qq_email
-        self.service.cfg.qq_auth_code = qq_auth
+        self.qq_auth_edit.clear()
+        self.qq_auth_edit.setPlaceholderText("已配置；留空保持不变")
         self.service.cfg.gmail_network_mode = network_mode
         self.service.cfg.max_fetch_limit = self.fetch_limit_spin.value()
         self.service.cfg.max_send_file_mb = self.send_limit_spin.value()
         self.refresh()
         self._set_config_clean()
         self.show_message("高级设置已安全保存", "success")
+
+    def delete_credential(self, name: str) -> None:
+        """明确确认后删除单项 Windows 凭据。"""
+        confirmation = QMessageBox.question(
+            self,
+            "确认删除凭据",
+            "删除后对应邮箱连接将不可用，是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            self.show_message("已取消删除凭据", "normal")
+            return
+        result = self.service.delete_credential(name)
+        if result.ok:
+            if name == GMAIL_IMAP_SECRET:
+                self.gmail_password_edit.setPlaceholderText("未配置")
+            else:
+                self.qq_auth_edit.setPlaceholderText("未配置")
+        self._show_service_result(result)
 
     def refresh(self) -> None:
         if self.task_active:

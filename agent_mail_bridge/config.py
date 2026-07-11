@@ -304,6 +304,9 @@ def load_config(env_path: Path | str | None = None) -> AppConfig:
         if env_file.exists():
             load_dotenv(env_file, override=False)
 
+    from agent_mail_bridge.credentials import load_secure_secrets
+    secure_secrets = load_secure_secrets()
+
     data_root_raw = os.getenv("DATA_ROOT", "./AgentMailBridgeData").strip()
     data_root = Path(data_root_raw)
     if not data_root.is_absolute():
@@ -316,7 +319,9 @@ def load_config(env_path: Path | str | None = None) -> AppConfig:
 
     cfg = AppConfig(
         gmail_address=os.getenv("GMAIL_ADDRESS", "").strip(),
-        gmail_app_password=os.getenv("GMAIL_APP_PASSWORD", "").strip(),
+        gmail_app_password=secure_secrets.get(
+            "GMAIL_APP_PASSWORD", os.getenv("GMAIL_APP_PASSWORD", "")
+        ).strip(),
         gmail_imap_host=os.getenv("GMAIL_IMAP_HOST", "imap.gmail.com").strip(),
         gmail_imap_port=_as_int(os.getenv("GMAIL_IMAP_PORT"), 993),
         gmail_network_mode=_parse_network_mode(
@@ -352,7 +357,9 @@ def load_config(env_path: Path | str | None = None) -> AppConfig:
         ),
         gmail_api_query=os.getenv("GMAIL_API_QUERY", "in:inbox").strip(),
         qq_email=os.getenv("QQ_EMAIL", "").strip(),
-        qq_auth_code=os.getenv("QQ_AUTH_CODE", "").strip(),
+        qq_auth_code=secure_secrets.get(
+            "QQ_AUTH_CODE", os.getenv("QQ_AUTH_CODE", "")
+        ).strip(),
         qq_smtp_host=os.getenv("QQ_SMTP_HOST", "smtp.qq.com").strip(),
         qq_smtp_port=_as_int(os.getenv("QQ_SMTP_PORT"), 465),
         qq_smtp_network_mode=_parse_network_mode(

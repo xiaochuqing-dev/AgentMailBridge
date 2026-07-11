@@ -246,6 +246,24 @@ def cmd_diagnose_qq_smtp(args, cfg) -> int:
     return 0 if result.ok else 1
 
 
+def cmd_credential_status(args, cfg) -> int:
+    """只显示凭据配置状态。"""
+    result = ApplicationService(cfg).get_credential_status()
+    if result.ok:
+        print(f"Gmail IMAP：{'已配置' if result.details['gmail_imap'] else '未配置'}")
+        print(f"QQ SMTP：{'已配置' if result.details['qq_smtp'] else '未配置'}")
+    else:
+        print(result.message, file=sys.stderr)
+    return 0 if result.ok else 1
+
+
+def cmd_migrate_credentials(args, cfg) -> int:
+    """迁移旧 .env 明文凭据。"""
+    result = ApplicationService(cfg).migrate_legacy_credentials()
+    print(result.message)
+    return 0 if result.ok else 1
+
+
 # ============================================================
 # 工具
 # ============================================================
@@ -314,6 +332,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     # diagnose-network
     sub.add_parser("diagnose-network", help="诊断整体网络环境")
+    sub.add_parser("credential-status", help="显示 Windows 凭据配置状态")
+    sub.add_parser("migrate-credentials", help="迁移旧 .env 凭据到 Windows 安全存储")
 
     return parser
 
@@ -347,6 +367,8 @@ def main(argv: list[str] | None = None) -> int:
         "scan-status": cmd_scan_status,
         "show-config": cmd_show_config,
         "gmail-api-auth": cmd_gmail_api_auth,
+        "credential-status": cmd_credential_status,
+        "migrate-credentials": cmd_migrate_credentials,
     }
     handler = handlers.get(args.command)
     if handler is None:
