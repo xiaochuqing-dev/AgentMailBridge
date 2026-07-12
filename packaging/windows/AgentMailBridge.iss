@@ -40,17 +40,17 @@ ChangesEnvironment=no
 LicenseFile=..\..\LICENSE
 
 [Tasks]
-Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务："; Flags: unchecked
+Name: "desktopicon"; Description: "在桌面创建 AgentMailBridge 快捷方式（仅主程序）"; GroupDescription: "快捷方式选项："; Flags: unchecked
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\AgentMailBridge"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"
-Name: "{autodesktop}\AgentMailBridge"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{group}\AgentMailBridge"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Comment: "本地优先的邮箱桥接工具"
+Name: "{autodesktop}\AgentMailBridge"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Comment: "本地优先的邮箱桥接工具"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "启动 AgentMailBridge"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Description: "启动 AgentMailBridge 邮箱桥接工具"; Flags: nowait postinstall skipifsilent
 
 [Code]
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

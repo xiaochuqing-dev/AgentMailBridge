@@ -2,7 +2,7 @@
 
 ## 安装
 
-运行 `AgentMailBridge-0.9.0-Setup.exe`。默认当前用户安装目录为 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需管理员权限。可选桌面快捷方式，开始菜单只显示主程序。
+运行 `AgentMailBridge-0.9.0-Setup.exe`。默认当前用户安装目录为 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需管理员权限。安装器“快捷方式选项”页可选择“在桌面创建 AgentMailBridge 快捷方式（仅主程序）”；开始菜单和桌面快捷方式均指向 `AgentMailBridge.exe`。
 
 安装完成后启动主程序并完成首次配置。内部 `AgentMailBridgeMCP.exe` 仅供 Agent 客户端按需调用，不要手动创建快捷方式或开机启动项。
 

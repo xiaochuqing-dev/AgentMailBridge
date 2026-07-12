@@ -175,3 +175,15 @@ def test_mcp_client_config_uses_internal_exe_when_frozen(monkeypatch, tmp_path: 
     rendered = generic_mcp_json()
     assert "AgentMailBridgeMCP.exe" in rendered
     assert "安装 目录" in rendered
+
+
+def test_installer_desktop_shortcut_targets_only_the_gui_exe():
+    installer = (
+        Path(__file__).resolve().parents[1]
+        / "packaging" / "windows" / "AgentMailBridge.iss"
+    ).read_text(encoding="utf-8")
+    assert "在桌面创建 AgentMailBridge 快捷方式（仅主程序）" in installer
+    assert 'Name: "{autodesktop}\\AgentMailBridge"' in installer
+    assert 'Filename: "{app}\\{#MyAppExeName}"' in installer
+    icon_section = installer.split("[Icons]", 1)[1].split("[Run]", 1)[0]
+    assert "AgentMailBridgeMCP.exe" not in icon_section
