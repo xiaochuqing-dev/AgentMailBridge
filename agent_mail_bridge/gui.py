@@ -6,7 +6,7 @@ import sys
 import uuid
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication
 
 from agent_mail_bridge.application_service import ApplicationService
 from agent_mail_bridge.config import load_config
@@ -42,10 +42,10 @@ def main() -> None:
     service.initialize()
     guard = SingleInstanceGuard(service.cfg.data_root_path)
     if not guard.acquire():
-        QMessageBox.information(None, "Agent 邮箱桥接工具", "程序已在运行，请从系统托盘打开主窗口。")
         raise SystemExit(0)
     window = BridgeWindow(service)
     window.instance_guard = guard
+    guard.set_activation_handler(window.show_from_tray)
     if "--background" in sys.argv and window.tray_available:
         window.hide()
     else:

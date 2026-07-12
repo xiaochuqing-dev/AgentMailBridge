@@ -140,6 +140,11 @@ def build_stylesheet(theme: str = "light") -> str:
         border: 1px solid {BORDER};
         border-radius: 10px;
     }}
+    QFrame#navCard {{
+        background: #FFFFFF;
+        border: 1px solid {BORDER};
+        border-radius: 10px;
+    }}
     QFrame#accountPanel, QFrame#credentialCard {{
         background: #FBFAFF;
         border: 1px solid #E4DFFF;
@@ -155,9 +160,8 @@ def build_stylesheet(theme: str = "light") -> str:
         letter-spacing: 2px;
     }}
     QFrame#heroCard {{
-        background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #F3F0FF, stop:0.58 #F7F5FF, stop:1 #EFF9FC);
-        border: 1px solid #E1DBFF;
+        background: #FFFFFF;
+        border: 1px solid {BORDER};
         border-radius: 10px;
     }}
     QFrame#statPurple {{
@@ -279,7 +283,7 @@ def build_stylesheet(theme: str = "light") -> str:
         text-align: left;
         border: none;
         border-radius: 7px;
-        padding: 9px 12px;
+        padding: 11px 14px;
         background: transparent;
         color: #4F5360;
         font-size: 12px;
@@ -290,6 +294,7 @@ def build_stylesheet(theme: str = "light") -> str:
         color: {PURPLE};
         font-weight: 700;
     }}
+    QFrame#navCard QPushButton#navButton {{ border-radius: 0; }}
     QPushButton#tabButton {{
         border: none;
         border-bottom: 2px solid transparent;
@@ -341,7 +346,8 @@ def build_stylesheet(theme: str = "light") -> str:
     QTableWidget {{
         background: #FFFFFF;
         alternate-background-color: #FBFBFD;
-        border: none;
+        border: 1px solid {BORDER};
+        border-radius: 8px;
         gridline-color: #EEF0F4;
         font-size: 11px;
         selection-background-color: {PURPLE_SOFT};
@@ -350,7 +356,7 @@ def build_stylesheet(theme: str = "light") -> str:
     QTableWidget::item {{ padding: 5px 6px; border-bottom: 1px solid #F0F1F4; }}
     QHeaderView::section {{
         color: #777C8B;
-        background: #FFFFFF;
+        background: #F4F5F8;
         border: none;
         border-bottom: 1px solid {BORDER};
         padding: 6px;
@@ -402,6 +408,8 @@ def build_stylesheet(theme: str = "light") -> str:
         background: #242736;
         border-color: #3A3E50;
     }}
+    QFrame#navCard {{ background: #222532; border-color: #3A3E50; }}
+    QFrame#separator {{ background: #343746; }}
     QTableWidget {{ alternate-background-color: #1D202C; gridline-color: #343746; }}
     QHeaderView::section {{ color: #BFC4D3; }}
     QPushButton {{ background: #292C3A; border-color: #42465A; }}

@@ -38,6 +38,16 @@ def brand_icon() -> QIcon:
     return QIcon(str(path)) if path is not None else QIcon()
 
 
+def provider_icon(name: str) -> QIcon:
+    """返回用户明确提供的邮箱服务图标。"""
+    filenames = {"gmail": "gmail.svg", "qq": "qqmail.webp"}
+    filename = filenames.get(name.strip().lower())
+    if not filename:
+        return QIcon()
+    path = get_runtime_paths().resource_root / "branding" / filename
+    return QIcon(str(path)) if path.is_file() else QIcon()
+
+
 def apply_brand_label(label: QLabel, fallback) -> bool:
     """将 Logo 放入品牌区域，返回是否已接入真实素材。"""
     path = find_brand_asset()

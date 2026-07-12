@@ -9,6 +9,12 @@ import sys
 import tempfile
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from agent_mail_bridge.version import __version__
+
 
 def main() -> int:
     executable = Path(sys.argv[1]).resolve()
@@ -67,7 +73,7 @@ def main() -> int:
         by_id = {item.get("id"): item for item in responses}
         if set(by_id) != {1, 2, 3, 4}:
             raise SystemExit("MCP stdout 含缺失或额外协议输出")
-        if by_id[1]["result"]["serverInfo"]["version"] != "0.9.0":
+        if by_id[1]["result"]["serverInfo"]["version"] != __version__:
             raise SystemExit("MCP 版本不一致")
         tools = by_id[3]["result"]["tools"]
         if [item["name"] for item in tools] != ["submit_result"]:

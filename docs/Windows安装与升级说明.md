@@ -1,23 +1,11 @@
 # Windows 安装、升级与卸载
 
-## 安装
+运行 `AgentMailBridge-1.0.0-Setup.exe`。默认安装到 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需管理员权限。开始菜单和可选桌面快捷方式只指向 `AgentMailBridge.exe`；内部 `AgentMailBridgeMCP.exe` 不创建快捷方式或开机启动项。
 
-运行 `AgentMailBridge-0.9.0-Setup.exe`。默认当前用户安装目录为 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需管理员权限。安装器“快捷方式选项”页可选择“在桌面创建 AgentMailBridge 快捷方式（仅主程序）”；开始菜单和桌面快捷方式均指向 `AgentMailBridge.exe`。
+升级前正常退出主窗口和托盘，再运行新版安装器覆盖安装。稳定 AppId 只替换程序文件；配置、OAuth、Credential Manager、DATA_ROOT、SQLite、received、send、sent 和 backups 位于安装目录外并保留。
 
-安装完成后启动主程序并完成首次配置。内部 `AgentMailBridgeMCP.exe` 仅供 Agent 客户端按需调用，不要手动创建快捷方式或开机启动项。
+从 Windows“已安装的应用”卸载时，程序、Qt、快捷方式、安装记录和失效开机启动值会删除；配置、OAuth、凭据和用户数据默认保留。重新安装后可继续识别。
 
-## 升级
+v1.0.0 发布验收必须覆盖：完整 pytest、clean build、主 EXE packaged self-test、MCP packaged smoke、秘密扫描、哈希、安装覆盖、数据保留、桌面快捷方式目标、快捷方式实际启动、版本、主导航、单实例、托盘、收发入口、历史记录、文件与数据、设置和发件内 MCP。
 
-关闭主窗口和托盘后运行新版安装器覆盖安装。安装器使用稳定 AppId，程序文件被替换；配置、OAuth、Credential Manager、DATA_ROOT、SQLite、received/send/sent 和 backups 位于安装目录外并保留。
-
-本轮已完成同版本覆盖/修复安装和隔离数据保留验证。由于没有保留真实旧候选安装器，0.8.x 到 0.9.0 的跨版本升级仍是发布前限制。
-
-## 卸载
-
-从 Windows“已安装的应用”卸载。卸载会删除程序、Qt、快捷方式、安装记录及指向已卸载 EXE 的开机启动值。默认保留配置、OAuth、Credential Manager 凭据和用户数据，重新安装后可继续使用。
-
-## 当前验收范围
-
-已在 Windows 11 当前用户环境验证：中文和空格安装路径、无源码路径依赖、主 EXE packaged self-test、Credential Manager 写读删、Gmail API 只读诊断、QQ SMTP 认证诊断、MCP stdio、覆盖安装、卸载和数据保留。
-
-通过缩减 PATH 启动验证了 frozen 运行不调用系统 Python，但本机仍安装了 Python，因此不能等同于真正干净 Windows Sandbox/VM。正式公开发布前必须补做独立无 Python 环境安装、托盘、单实例、DPI 和卸载复核。
+安装器和 EXE 未签名时可能触发 SmartScreen。公开发布仍需独立无 Python Windows 环境和最终第三方许可复核；不得因此自动创建 GitHub Release。

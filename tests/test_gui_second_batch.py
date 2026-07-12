@@ -41,11 +41,15 @@ def bridge_window(qt_app, tmp_cfg):
 
 
 def test_formal_gui_uses_reference_three_column_layout(bridge_window):
-    assert bridge_window.sidebar.width() == 230
-    assert bridge_window.right_panel.width() == 306
+    assert bridge_window.sidebar.width() == 238
+    assert bridge_window.right_panel.width() == 330
     assert bridge_window.central_panel.width() >= 620
-    assert set(bridge_window.pages) == {"inbox", "send", "advanced", "maintenance", "agent"}
-    assert set(bridge_window.tab_buttons) == {"inbox", "send", "advanced"}
+    assert set(bridge_window.pages) == {
+        "inbox", "send", "history", "files_data", "settings", "advanced",
+        "logs", "maintenance", "agent", "about",
+    }
+    assert set(bridge_window.tab_buttons) == {"inbox", "send"}
+    assert set(bridge_window.nav_buttons) == {"history", "files_data", "settings", "about"}
     assert all(
         row.value_label.minimumWidth() >= 126
         for row in bridge_window.service_rows.values()
@@ -60,10 +64,10 @@ def test_navigation_switches_real_pages(bridge_window):
     assert bridge_window.tab_buttons["send"].isChecked()
     bridge_window.select_page("agent")
     assert bridge_window.page_stack.currentWidget() is bridge_window.pages["agent"]
-    assert bridge_window.tab_buttons["advanced"].isChecked()
+    assert bridge_window.tab_buttons["send"].isChecked()
     bridge_window.select_page("advanced")
     assert bridge_window.page_stack.currentWidget() is bridge_window.pages["advanced"]
-    assert bridge_window.tab_buttons["advanced"].isChecked()
+    assert bridge_window.nav_buttons["settings"].isChecked()
 
 
 def test_agent_page_exposes_safe_stdio_configuration(bridge_window):

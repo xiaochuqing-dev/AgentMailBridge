@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from PySide6.QtCore import QCoreApplication
 
 from agent_mail_bridge import __version__
 from agent_mail_bridge.credentials import (
@@ -16,7 +17,7 @@ from agent_mail_bridge.credentials import (
 from agent_mail_bridge.mcp_server import SERVER_VERSION
 from agent_mail_bridge.oauth_storage import OAuthImportError, import_oauth_credentials
 from agent_mail_bridge.runtime_paths import discover_runtime_paths
-from agent_mail_bridge.desktop_runtime import StartupManager
+from agent_mail_bridge.desktop_runtime import SingleInstanceGuard, StartupManager
 from agent_mail_bridge.mcp_client_config import generic_mcp_json, mcp_launch
 from agent_mail_bridge.ui.settings_store import import_legacy_env, save_env_values
 
@@ -141,8 +142,24 @@ def test_oauth_credentials_are_validated_and_copied_atomically(tmp_path: Path):
 
 
 def test_product_version_is_shared_with_mcp():
-    assert __version__ == "0.9.0"
+    assert __version__ == "1.0.0"
     assert SERVER_VERSION == __version__
+
+
+def test_packaged_smoke_uses_single_version_source():
+    script = (Path(__file__).resolve().parents[1] / "scripts" / "packaged_smoke.py").read_text(encoding="utf-8")
+    assert "from agent_mail_bridge.version import __version__" in script
+    assert '!= __version__' in script
+
+
+def test_windows_version_resources_match_product_version():
+    root = Path(__file__).resolve().parents[1]
+    for name in ("version_info.txt", "version_info_mcp.txt"):
+        content = (root / "packaging" / "windows" / name).read_text(encoding="utf-8")
+        assert "filevers=(1, 0, 0, 0)" in content
+        assert "prodvers=(1, 0, 0, 0)" in content
+        assert "u'FileVersion', u'1.0.0'" in content
+        assert "u'ProductVersion', u'1.0.0'" in content
 
 
 def test_startup_command_supports_source_and_frozen(monkeypatch, tmp_path: Path):
@@ -157,6 +174,21 @@ def test_startup_command_supports_source_and_frozen(monkeypatch, tmp_path: Path)
     source_command = StartupManager.command()
     assert "agent_mail_bridge.gui" in source_command
     assert "-m" in source_command
+
+
+def test_second_instance_notifies_existing_window(tmp_path: Path, monkeypatch):
+    QCoreApplication.instance() or QCoreApplication([])
+    first = SingleInstanceGuard(tmp_path / "data")
+    second = SingleInstanceGuard(tmp_path / "data")
+    notified: list[str] = []
+    assert first.acquire()
+    try:
+        monkeypatch.setattr(second, "_notify_existing", lambda: notified.append("ipc"))
+        monkeypatch.setattr(second, "_activate_existing_window", lambda: notified.append("window"))
+        assert not second.acquire()
+        assert notified == ["ipc", "window"]
+    finally:
+        first.release()
 
 
 def test_mcp_client_config_uses_internal_exe_when_frozen(monkeypatch, tmp_path: Path):

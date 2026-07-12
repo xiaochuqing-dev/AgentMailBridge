@@ -22,13 +22,18 @@ Use `runtime_paths.py`. Frozen program files are read-only under the install dir
 
 ## Frontend information architecture
 
-- Account configuration belongs only in account management, reached from the add-account action or account cards.
+- The top-level work area contains only Receive and Send.
+- The lower sidebar contains only History, Files & Data, Settings and About.
+- Existing account configuration belongs only to Gmail and QQ account cards.
+- Add mailbox account is only a future-extension demo and must not route to an existing account editor.
 - The receive page must not contain account secrets or OAuth configuration.
 - The send page must not contain QQ account configuration.
-- Advanced settings must not contain account-level authentication.
+- Agent/MCP belongs only to Send and must not appear as another primary route or in Settings.
+- Advanced Settings is a secondary page reached from Settings and must not contain account-level authentication.
+- History records business actions; Files & Data manages stored objects and maintenance. Do not duplicate either list.
 - Gmail API and Gmail IMAP must use separate conditional authentication views.
 - Do not add duplicate routes for an existing account or application capability.
-- Every new backend capability must be assigned to account, receive, send, advanced, automatic, or CLI-only ownership before adding UI.
+- Every new backend capability must be assigned to account, receive, send, files/data, settings, advanced, automatic, or CLI-only ownership before adding UI.
 
 ## Development commands
 

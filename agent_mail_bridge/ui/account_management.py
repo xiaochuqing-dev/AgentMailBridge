@@ -269,8 +269,8 @@ class GmailAccountDialog(_AccountDialog):
         mode_label.setObjectName("fieldLabel")
         root.addWidget(mode_label)
         mode_row = QHBoxLayout()
-        self.api_mode_button = QPushButton("Gmail API  ·  推荐\nOAuth 授权 · HTTPS · 不使用 IMAP 密码")
-        self.imap_mode_button = QPushButton("Gmail IMAP\n需要 Google 生成的应用专用密码")
+        self.api_mode_button = QPushButton("Gmail API（OAuth 授权）")
+        self.imap_mode_button = QPushButton("Gmail IMAP（配置简单）")
         for button in (self.api_mode_button, self.imap_mode_button):
             button.setCheckable(True)
             button.setMinimumHeight(64)
@@ -577,42 +577,56 @@ class QQAccountDialog(_AccountDialog):
 
 
 class AccountTypeDialog(QDialog):
-    """添加邮箱账号时先选择账号用途，避免把不同协议塞进长表单。"""
+    """v1.0.0 的邮箱扩展说明，不复用已有账号编辑路由。"""
 
     GMAIL = "gmail"
     QQ = "qq"
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self.selected_type = ""
         self.setWindowTitle("添加邮箱账号")
         self.setModal(True)
-        self.setMinimumSize(560, 330)
+        self.setMinimumSize(620, 430)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 22, 24, 20)
         layout.setSpacing(12)
         title = QLabel("添加邮箱账号")
         title.setObjectName("pageTitle")
-        hint = QLabel("先选择账号用途，下一步只显示该账号需要的配置。")
+        hint = QLabel("这是未来邮箱扩展入口，不会修改当前 Gmail 或 QQ 邮箱账号。")
         hint.setObjectName("hint")
+        hint.setWordWrap(True)
         layout.addWidget(title)
         layout.addWidget(hint)
-        gmail = QPushButton("Gmail 收件账号\nGmail API（推荐）或 Gmail IMAP")
-        qq = QPushButton("QQ 发件账号\n通过 QQ SMTP 向固定 Gmail 发送文件")
-        for button in (gmail, qq):
-            button.setObjectName("accountChoice")
-            button.setMinimumHeight(76)
-        gmail.clicked.connect(lambda: self._choose(self.GMAIL))
-        qq.clicked.connect(lambda: self._choose(self.QQ))
-        layout.addWidget(gmail)
-        layout.addWidget(qq)
-        cancel = QPushButton("取消")
-        cancel.clicked.connect(self.reject)
-        layout.addWidget(cancel, 0, Qt.AlignmentFlag.AlignRight)
 
-    def _choose(self, account_type: str) -> None:
-        self.selected_type = account_type
-        self.accept()
+        current = QFrame()
+        current.setObjectName("accountPanel")
+        current_layout = QVBoxLayout(current)
+        current_layout.setContentsMargins(16, 14, 16, 14)
+        current_title = QLabel("当前已支持")
+        current_title.setObjectName("sectionTitle")
+        current_layout.addWidget(current_title)
+        current_layout.addWidget(QLabel("✓ Gmail 收件：通过左侧 Gmail 账号卡片管理已有账号"))
+        current_layout.addWidget(QLabel("✓ QQ 发件：通过左侧 QQ 账号卡片管理已有账号"))
+        layout.addWidget(current)
+
+        future = QFrame()
+        future.setObjectName("card")
+        future_layout = QVBoxLayout(future)
+        future_layout.setContentsMargins(16, 14, 16, 14)
+        future_title = QLabel("未来可扩展")
+        future_title.setObjectName("sectionTitle")
+        future_layout.addWidget(future_title)
+        future_layout.addWidget(QLabel("Outlook · 163 邮箱 · 企业邮箱 · 更多邮箱服务"))
+        future_note = QLabel("当前 v1.0.0 暂不支持新增第二个同类型账号或其他邮箱服务。")
+        future_note.setObjectName("hint")
+        future_note.setWordWrap(True)
+        future_layout.addWidget(future_note)
+        layout.addWidget(future)
+        layout.addStretch(1)
+        close = QPushButton("我知道了")
+        close.setObjectName("primaryButton")
+        close.clicked.connect(self.accept)
+        layout.addWidget(close, 0, Qt.AlignmentFlag.AlignRight)
 
 
 def open_account_dialog(
@@ -633,7 +647,5 @@ def open_account_dialog(
 def open_add_account_dialog(
     service: ApplicationService, parent: QWidget | None = None
 ) -> bool:
-    chooser = AccountTypeDialog(parent)
-    if chooser.exec() != QDialog.DialogCode.Accepted:
-        return False
-    return open_account_dialog(service, chooser.selected_type, parent)
+    del service
+    return AccountTypeDialog(parent).exec() == QDialog.DialogCode.Accepted

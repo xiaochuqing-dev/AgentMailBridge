@@ -200,12 +200,13 @@ def test_oauth_replace_keeps_token_and_requires_confirmation(tmp_cfg, tmp_path, 
     assert "token 已保留" in dialog.result_label.text()
 
 
-def test_main_workspace_has_only_three_primary_tabs(account_qt_app, tmp_cfg):
+def test_main_workspace_has_only_two_primary_tabs(account_qt_app, tmp_cfg):
     window = BridgeWindow(ApplicationService(tmp_cfg))
     window.show()
     account_qt_app.processEvents()
-    assert list(window.tab_buttons) == ["inbox", "send", "advanced"]
-    assert [button.text() for button in window.tab_buttons.values()] == ["收件", "发件", "高级设置"]
+    assert list(window.tab_buttons) == ["inbox", "send"]
+    assert [button.text() for button in window.tab_buttons.values()] == ["收件", "发件"]
+    assert list(window.nav_buttons) == ["history", "files_data", "settings", "about"]
     assert window.page_stack.currentWidget() is window.pages["inbox"]
     assert "basic" not in window.pages
     assert "设置发件身份" not in _all_text(window)

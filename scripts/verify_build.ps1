@@ -23,8 +23,8 @@ $leaks = Get-ChildItem -LiteralPath $DistPath -Recurse -File | Where-Object {
 if ($leaks) { throw "Forbidden files found in build: $($leaks.FullName -join ', ')" }
 
 if (-not $SkipSelfTests) {
-    & $GuiExe --packaged-self-test
-    if ($LASTEXITCODE -ne 0) { throw "GUI packaged self-test failed: $LASTEXITCODE" }
+    $GuiSelfTest = Start-Process -FilePath $GuiExe -ArgumentList "--packaged-self-test" -Wait -PassThru -WindowStyle Hidden
+    if ($GuiSelfTest.ExitCode -ne 0) { throw "GUI packaged self-test failed: $($GuiSelfTest.ExitCode)" }
     & python (Join-Path $PSScriptRoot "packaged_smoke.py") $McpExe
     if ($LASTEXITCODE -ne 0) { throw "MCP packaged smoke failed: $LASTEXITCODE" }
 }

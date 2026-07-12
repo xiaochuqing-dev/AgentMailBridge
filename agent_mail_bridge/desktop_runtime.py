@@ -6,8 +6,10 @@ import hashlib
 import subprocess
 import sys
 from pathlib import Path
+from typing import Callable
 
 from PySide6.QtCore import QLockFile, QStandardPaths
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 APP_RUN_VALUE = "AgentMailBridge"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -21,11 +23,65 @@ class SingleInstanceGuard:
         temp_dir = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.TempLocation))
         self.lock = QLockFile(str(temp_dir / f"agent-mail-bridge-{digest}.lock"))
         self.lock.setStaleLockTime(30_000)  # 30 秒后允许回收异常退出的旧锁。
+        self.server_name = f"agent-mail-bridge-{digest}"
+        self.server: QLocalServer | None = None
+        self.activation_handler: Callable[[], None] | None = None
 
     def acquire(self) -> bool:
-        return self.lock.tryLock(0)
+        if not self.lock.tryLock(0):
+            self._notify_existing()
+            self._activate_existing_window()
+            return False
+        QLocalServer.removeServer(self.server_name)
+        self.server = QLocalServer()
+        if not self.server.listen(self.server_name):
+            self.lock.unlock()
+            self.server = None
+            return False
+        self.server.newConnection.connect(self._handle_activation)
+        return True
+
+    def set_activation_handler(self, handler: Callable[[], None]) -> None:
+        self.activation_handler = handler
+
+    def _notify_existing(self) -> None:
+        socket = QLocalSocket()
+        socket.connectToServer(self.server_name)
+        if socket.waitForConnected(1_000):
+            socket.write(b"activate")
+            socket.flush()
+            socket.waitForBytesWritten(1_000)
+            socket.disconnectFromServer()
+
+    @staticmethod
+    def _activate_existing_window() -> None:
+        """Windows 下直接恢复已存在的隐藏主窗口，避免第二实例弹框停留。"""
+        if sys.platform != "win32":
+            return
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        handle = user32.FindWindowW(None, "Agent 邮箱桥接工具")
+        if handle:
+            user32.ShowWindow(handle, 9)  # SW_RESTORE
+            user32.SetForegroundWindow(handle)
+
+    def _handle_activation(self) -> None:
+        if self.server is None:
+            return
+        while self.server.hasPendingConnections():
+            connection = self.server.nextPendingConnection()
+            connection.waitForReadyRead(200)
+            if bytes(connection.readAll()).startswith(b"activate") and self.activation_handler:
+                self.activation_handler()
+            connection.disconnectFromServer()
+            connection.deleteLater()
 
     def release(self) -> None:
+        if self.server is not None:
+            self.server.close()
+            QLocalServer.removeServer(self.server_name)
+            self.server = None
         if self.lock.isLocked():
             self.lock.unlock()
 

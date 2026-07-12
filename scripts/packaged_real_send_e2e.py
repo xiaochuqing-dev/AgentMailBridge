@@ -7,8 +7,15 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import uuid
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from agent_mail_bridge.version import __version__
 
 
 def file_hash(path: Path) -> str:
@@ -38,13 +45,13 @@ def main() -> int:
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tools/call",
-            "params": {"name": "submit_result", "arguments": {"file_path": str(source), "title": "AgentMailBridge 0.9.0 packaged E2E", "request_id": request_id}},
+            "params": {"name": "submit_result", "arguments": {"file_path": str(source), "title": f"AgentMailBridge {__version__} packaged E2E", "request_id": request_id}},
         },
         {
             "jsonrpc": "2.0",
             "id": 3,
             "method": "tools/call",
-            "params": {"name": "submit_result", "arguments": {"file_path": str(source), "title": "AgentMailBridge 0.9.0 packaged E2E", "request_id": request_id}},
+            "params": {"name": "submit_result", "arguments": {"file_path": str(source), "title": f"AgentMailBridge {__version__} packaged E2E", "request_id": request_id}},
         },
     ]
     env = os.environ.copy()

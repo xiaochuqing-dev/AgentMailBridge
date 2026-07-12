@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
     QAbstractButton,
     QFrame,
@@ -59,6 +59,84 @@ def format_size(size_bytes: int | str | None) -> str:
     return f"{value / (1024 * 1024):.1f} MB"
 
 
+def tinted_icon_pixmap(icon: QIcon, size: int, color: str) -> QPixmap:
+    """将 Qt 系统图标统一为参考图使用的单色线性视觉。"""
+    source = icon.pixmap(size, size)
+    result = QPixmap(source.size())
+    result.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(result)
+    painter.drawPixmap(0, 0, source)
+    painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+    painter.fillRect(result.rect(), QColor(color))
+    painter.end()
+    return result
+
+
+def line_icon_pixmap(kind: str, size: int = 20, color: str = PURPLE) -> QPixmap:
+    """绘制参考图风格的轻量线性图标，不替代邮箱品牌 Logo。"""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor(color), max(1.4, size / 12), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    pad = size * 0.16
+    rect = QRectF(pad, pad, size - 2 * pad, size - 2 * pad)
+    if kind in {"mail", "envelope"}:
+        painter.drawRoundedRect(rect, size * 0.09, size * 0.09)
+        painter.drawLine(rect.topLeft(), QPointF(size / 2, size * 0.56))
+        painter.drawLine(rect.topRight(), QPointF(size / 2, size * 0.56))
+    elif kind == "calendar":
+        painter.drawRoundedRect(rect, size * 0.09, size * 0.09)
+        painter.drawLine(QPointF(rect.left(), size * 0.38), QPointF(rect.right(), size * 0.38))
+        painter.drawLine(QPointF(size * 0.34, size * 0.1), QPointF(size * 0.34, size * 0.28))
+        painter.drawLine(QPointF(size * 0.66, size * 0.1), QPointF(size * 0.66, size * 0.28))
+        painter.drawLine(QPointF(size * 0.34, size * 0.59), QPointF(size * 0.46, size * 0.7))
+        painter.drawLine(QPointF(size * 0.46, size * 0.7), QPointF(size * 0.7, size * 0.48))
+    elif kind == "send":
+        painter.drawPolygon(QPolygonF([
+            QPointF(size * 0.12, size * 0.47), QPointF(size * 0.88, size * 0.14),
+            QPointF(size * 0.64, size * 0.86), QPointF(size * 0.46, size * 0.58),
+        ]))
+        painter.drawLine(QPointF(size * 0.46, size * 0.58), QPointF(size * 0.88, size * 0.14))
+    elif kind == "warning":
+        painter.drawPolygon(QPolygonF([
+            QPointF(size / 2, size * 0.1), QPointF(size * 0.9, size * 0.84), QPointF(size * 0.1, size * 0.84),
+        ]))
+        painter.drawLine(QPointF(size / 2, size * 0.36), QPointF(size / 2, size * 0.59))
+        painter.drawPoint(QPointF(size / 2, size * 0.72))
+    elif kind == "shield":
+        path = QPainterPath(QPointF(size / 2, size * 0.08))
+        path.lineTo(size * 0.84, size * 0.22)
+        path.lineTo(size * 0.78, size * 0.66)
+        path.quadTo(size / 2, size * 0.92, size * 0.22, size * 0.66)
+        path.lineTo(size * 0.16, size * 0.22)
+        path.closeSubpath()
+        painter.drawPath(path)
+        painter.drawLine(QPointF(size * 0.32, size * 0.48), QPointF(size * 0.45, size * 0.61))
+        painter.drawLine(QPointF(size * 0.45, size * 0.61), QPointF(size * 0.69, size * 0.35))
+    elif kind == "clock":
+        painter.drawEllipse(rect)
+        painter.drawLine(QPointF(size / 2, size / 2), QPointF(size / 2, size * 0.29))
+        painter.drawLine(QPointF(size / 2, size / 2), QPointF(size * 0.67, size * 0.6))
+    elif kind == "database":
+        painter.drawEllipse(QRectF(pad, pad, size - 2 * pad, size * 0.28))
+        painter.drawLine(QPointF(pad, size * 0.3), QPointF(pad, size * 0.73))
+        painter.drawLine(QPointF(size - pad, size * 0.3), QPointF(size - pad, size * 0.73))
+        painter.drawArc(QRectF(pad, size * 0.58, size - 2 * pad, size * 0.28), 180 * 16, 180 * 16)
+    elif kind == "settings":
+        painter.drawEllipse(QRectF(size * 0.35, size * 0.35, size * 0.3, size * 0.3))
+        for x1, y1, x2, y2 in ((0.5, 0.12, 0.5, 0.28), (0.5, 0.72, 0.5, 0.88), (0.12, 0.5, 0.28, 0.5), (0.72, 0.5, 0.88, 0.5), (0.23, 0.23, 0.34, 0.34), (0.66, 0.66, 0.77, 0.77), (0.77, 0.23, 0.66, 0.34), (0.34, 0.66, 0.23, 0.77)):
+            painter.drawLine(QPointF(size * x1, size * y1), QPointF(size * x2, size * y2))
+    elif kind == "info":
+        painter.drawEllipse(rect)
+        painter.drawLine(QPointF(size / 2, size * 0.44), QPointF(size / 2, size * 0.72))
+        painter.drawPoint(QPointF(size / 2, size * 0.3))
+    painter.end()
+    return pixmap
+
+
 class ToggleSwitch(QAbstractButton):
     """带动画感的轻量开关。"""
 
@@ -90,22 +168,26 @@ class AccountCard(QFrame):
 
     clicked = Signal()
 
-    def __init__(self, symbol: str, title: str, email: str, description: str, color: str):
+    def __init__(self, symbol: QIcon | str, title: str, email: str, description: str, color: str):
         super().__init__()
         self.setObjectName("card")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedHeight(84)
+        self.setFixedHeight(108)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 9, 9, 8)
-        layout.setSpacing(9)
+        layout.setContentsMargins(14, 13, 12, 12)
+        layout.setSpacing(12)
 
-        icon = QLabel(symbol)
+        icon = QLabel(symbol if isinstance(symbol, str) else "")
         icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        icon.setFixedSize(30, 30)
-        icon.setStyleSheet(
-            f"color: {color}; background: #FFFFFF; border: 1px solid {BORDER};"
-            "border-radius: 8px; font-size: 17px; font-weight: 800;"
-        )
+        icon.setFixedSize(40, 40)
+        if isinstance(symbol, QIcon) and not symbol.isNull():
+            icon.setPixmap(symbol.pixmap(36, 36))
+            icon.setStyleSheet("background: transparent; border: none;")
+        else:
+            icon.setStyleSheet(
+                f"color: {color}; background: #FFFFFF; border: 1px solid {BORDER};"
+                "border-radius: 8px; font-size: 17px; font-weight: 800;"
+            )
         layout.addWidget(icon, 0, Qt.AlignmentFlag.AlignTop)
 
         text_area = QVBoxLayout()
@@ -152,19 +234,24 @@ class NavButton(QPushButton):
         self.setCheckable(True)
         self.setAutoExclusive(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedHeight(38)
+        self.setFixedHeight(46)
 
 
 class StatusRow(QWidget):
     """右侧服务状态行。"""
 
-    def __init__(self, icon: str, label: str, value: str = "—"):
+    def __init__(self, icon: QIcon | QPixmap | str, label: str, value: str = "—"):
         super().__init__()
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 3, 0, 3)
         layout.setSpacing(8)
-        icon_label = QLabel(icon)
-        icon_label.setStyleSheet(f"color: {PURPLE}; font-size: 14px;")
+        icon_label = QLabel(icon if isinstance(icon, str) else "")
+        if isinstance(icon, QPixmap) and not icon.isNull():
+            icon_label.setPixmap(icon)
+        elif isinstance(icon, QIcon) and not icon.isNull():
+            icon_label.setPixmap(tinted_icon_pixmap(icon, 16, PURPLE))
+        else:
+            icon_label.setStyleSheet(f"color: {PURPLE}; font-size: 14px;")
         icon_label.setFixedWidth(18)
         name = QLabel(label)
         name.setObjectName("statusName")
@@ -191,7 +278,7 @@ class StatusRow(QWidget):
 class StatCard(QFrame):
     """今日统计卡片。"""
 
-    def __init__(self, object_name: str, icon: str, title: str, color: str):
+    def __init__(self, object_name: str, icon: QIcon | QPixmap | str, title: str, color: str):
         super().__init__()
         self.setObjectName(object_name)
         self.setMinimumSize(116, 82)
@@ -199,8 +286,13 @@ class StatCard(QFrame):
         layout.setContentsMargins(15, 12, 12, 10)
         layout.setSpacing(4)
         number_row = QHBoxLayout()
-        icon_label = QLabel(icon)
-        icon_label.setStyleSheet(f"color: {color}; font-size: 21px;")
+        icon_label = QLabel(icon if isinstance(icon, str) else "")
+        if isinstance(icon, QPixmap) and not icon.isNull():
+            icon_label.setPixmap(icon)
+        elif isinstance(icon, QIcon) and not icon.isNull():
+            icon_label.setPixmap(tinted_icon_pixmap(icon, 25, color))
+        else:
+            icon_label.setStyleSheet(f"color: {color}; font-size: 21px;")
         self.number = QLabel("0")
         self.number.setObjectName("statNumber")
         self.number.setStyleSheet("font-size: 24px; font-weight: 500;")
@@ -221,15 +313,18 @@ class StatCard(QFrame):
 class TipRow(QWidget):
     """右侧快捷提示。"""
 
-    def __init__(self, icon: str, text: str, color: str):
+    def __init__(self, icon: QIcon | str, text: str, color: str):
         super().__init__()
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 3, 0, 3)
         layout.setSpacing(9)
-        icon_label = QLabel(icon)
+        icon_label = QLabel(icon if isinstance(icon, str) else "")
         icon_label.setFixedWidth(19)
         icon_label.setAlignment(Qt.AlignmentFlag.AlignTop)
-        icon_label.setStyleSheet(f"color: {color}; font-size: 15px;")
+        if isinstance(icon, QIcon) and not icon.isNull():
+            icon_label.setPixmap(icon.pixmap(15, 15))
+        else:
+            icon_label.setStyleSheet(f"color: {color}; font-size: 15px;")
         label = QLabel(text)
         label.setObjectName("tipText")
         label.setWordWrap(True)
@@ -252,7 +347,9 @@ class DataTable(QTableWidget):
         self.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.verticalHeader().setDefaultSectionSize(30)
+        self.verticalHeader().setDefaultSectionSize(36)
+        self.setVerticalScrollMode(QTableWidget.ScrollMode.ScrollPerPixel)
+        self.setHorizontalScrollMode(QTableWidget.ScrollMode.ScrollPerPixel)
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
