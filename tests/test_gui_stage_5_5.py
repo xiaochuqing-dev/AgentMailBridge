@@ -208,7 +208,7 @@ def test_manual_refresh_runs_in_background_and_updates_time(
     assert time.monotonic() - started_at < 0.04
     assert stage_window.task_active
     assert not stage_window.logs_refresh_button.isEnabled()
-    assert stage_window.imap_diagnose_button.isEnabled()
+    assert stage_window.all_diagnose_button.isEnabled()
     _wait_for_task(stage_window, stage_qt_app)
     assert stage_window.last_refresh_at is not None
     assert "最后刷新" in stage_window.logs_refresh_label.text()
@@ -222,14 +222,14 @@ def test_config_change_marks_unsaved_and_successful_save_clears_state(
         "agent_mail_bridge.ui.main_window.save_env_values",
         lambda values: saved.update(values),
     )
-    stage_window.gmail_email_edit.setText("changed@gmail.com")
+    stage_window._set_combo_data(stage_window.network_combo, "direct")
     assert stage_window._config_dirty
     assert "未保存" in stage_window.unsaved_config_label.text()
 
-    stage_window.save_basic_config()
+    stage_window.save_advanced_config()
 
     assert not stage_window._config_dirty
-    assert saved["GMAIL_ADDRESS"] == "changed@gmail.com"
+    assert saved["GMAIL_NETWORK_MODE"] == "direct"
 
 
 def test_advanced_save_rolls_back_startup_when_env_write_fails(

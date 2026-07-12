@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QApplication
 from agent_mail_bridge.application_service import ApplicationService
 from agent_mail_bridge.models import OperationStatus, ReceiveResult, ServiceResult
 from agent_mail_bridge.ui.main_window import AUTO_RECEIVE_DEFAULT_MINUTES, BridgeWindow
+from agent_mail_bridge.ui.account_management import AccountSettingsController
 from agent_mail_bridge.ui.settings_store import save_env_values
 from agent_mail_bridge.ui.theme import build_stylesheet, load_interface_font
 from agent_mail_bridge.ui.widgets import format_size
@@ -43,11 +44,8 @@ def test_formal_gui_uses_reference_three_column_layout(bridge_window):
     assert bridge_window.sidebar.width() == 230
     assert bridge_window.right_panel.width() == 306
     assert bridge_window.central_panel.width() >= 620
-    assert set(bridge_window.pages) == {
-        "basic", "inbox", "send", "advanced", "history", "logs", "maintenance", "agent"
-        , "dashboard"
-    }
-    assert set(bridge_window.tab_buttons) == {"basic", "inbox", "send", "advanced"}
+    assert set(bridge_window.pages) == {"inbox", "send", "advanced", "maintenance", "agent"}
+    assert set(bridge_window.tab_buttons) == {"inbox", "send", "advanced"}
     assert all(
         row.value_label.minimumWidth() >= 126
         for row in bridge_window.service_rows.values()
@@ -55,23 +53,17 @@ def test_formal_gui_uses_reference_three_column_layout(bridge_window):
 
 
 def test_navigation_switches_real_pages(bridge_window):
-    bridge_window.select_page("dashboard")
-    assert bridge_window.page_stack.currentWidget() is bridge_window.pages["dashboard"]
-    assert bridge_window.nav_buttons["dashboard"].isChecked()
+    assert bridge_window.page_stack.currentWidget() is bridge_window.pages["inbox"]
+    assert bridge_window.tab_buttons["inbox"].isChecked()
     bridge_window.select_page("send")
     assert bridge_window.page_stack.currentWidget() is bridge_window.pages["send"]
     assert bridge_window.tab_buttons["send"].isChecked()
-    bridge_window.select_page("logs")
-    assert bridge_window.page_stack.currentWidget() is bridge_window.pages["logs"]
-    assert bridge_window.nav_buttons["logs"].isChecked()
     bridge_window.select_page("agent")
     assert bridge_window.page_stack.currentWidget() is bridge_window.pages["agent"]
-    assert bridge_window.nav_buttons["agent"].isChecked()
-    assert not any(button.isChecked() for button in bridge_window.tab_buttons.values())
+    assert bridge_window.tab_buttons["advanced"].isChecked()
     bridge_window.select_page("advanced")
     assert bridge_window.page_stack.currentWidget() is bridge_window.pages["advanced"]
     assert bridge_window.tab_buttons["advanced"].isChecked()
-    assert bridge_window.nav_buttons["basic"].isChecked()
 
 
 def test_agent_page_exposes_safe_stdio_configuration(bridge_window):
@@ -108,19 +100,17 @@ def test_diagnose_only_disables_clicked_button_and_announces_recovery(bridge_win
     bridge_window._diagnose(
         "正在诊断 Gmail IMAP",
         lambda: ServiceResult(OperationStatus.SUCCESS, message="连接正常"),
-        bridge_window.imap_diagnose_button,
+        bridge_window.all_diagnose_button,
     )
-    assert not bridge_window.imap_diagnose_button.isEnabled()
-    assert bridge_window.authorize_button.isEnabled()
-    assert bridge_window.gmail_api_diagnose_button.isEnabled()
-    assert bridge_window.smtp_diagnose_button.isEnabled()
+    assert not bridge_window.all_diagnose_button.isEnabled()
+    assert bridge_window.export_diagnosis_button.isEnabled()
 
     deadline = time.monotonic() + 2
     while bridge_window.task_active and time.monotonic() < deadline:
         qt_app.processEvents()
         time.sleep(0.01)
 
-    assert bridge_window.imap_diagnose_button.isEnabled()
+    assert bridge_window.all_diagnose_button.isEnabled()
     assert "按钮已恢复可用" in bridge_window.message_bar.label.text()
 
 
@@ -172,13 +162,13 @@ def test_receive_failure_message_contains_reason(bridge_window):
 def test_basic_config_updates_runtime_without_core_rewrite(bridge_window, monkeypatch):
     saved: dict[str, str] = {}
     monkeypatch.setattr(
-        "agent_mail_bridge.ui.main_window.save_env_values",
+        "agent_mail_bridge.ui.account_management.save_env_values",
         lambda values: saved.update(values),
     )
-    bridge_window.gmail_email_edit.setText("updated@gmail.com")
-    bridge_window.gmail_password_edit.setText("dummy-app-password")
-    bridge_window._set_combo_data(bridge_window.backend_combo, "imap")
-    bridge_window.save_basic_config()
+    result = AccountSettingsController(bridge_window.service).save_gmail(
+        "updated@gmail.com", "imap", "dummy-app-password"
+    )
+    assert result.ok
     assert bridge_window.service.cfg.gmail_address == "updated@gmail.com"
     assert bridge_window.service.cfg.owner_gmail == "updated@gmail.com"
     assert saved["GMAIL_RECEIVE_BACKEND"] == "imap"
@@ -197,11 +187,11 @@ def test_basic_config_save_failure_keeps_runtime_config(bridge_window, monkeypat
     def fail_save(_values):
         raise OSError("只读文件")
 
-    monkeypatch.setattr("agent_mail_bridge.ui.main_window.save_env_values", fail_save)
-    bridge_window.gmail_email_edit.setText("not-saved@gmail.com")
-    bridge_window.gmail_password_edit.setText("not-saved-password")
-    bridge_window._set_combo_data(bridge_window.backend_combo, "imap")
-    bridge_window.save_basic_config()
+    monkeypatch.setattr("agent_mail_bridge.ui.account_management.save_env_values", fail_save)
+    result = AccountSettingsController(bridge_window.service).save_gmail(
+        "not-saved@gmail.com", "imap", "not-saved-password"
+    )
+    assert not result.ok
 
     current = (
         bridge_window.service.cfg.gmail_address,
@@ -225,8 +215,6 @@ def test_advanced_config_save_failure_keeps_runtime_config(bridge_window, monkey
         raise OSError("只读文件")
 
     monkeypatch.setattr("agent_mail_bridge.ui.main_window.save_env_values", fail_save)
-    bridge_window.qq_email_edit.setText("not-saved@qq.com")
-    bridge_window.qq_auth_edit.setText("not-saved-auth")
     bridge_window._set_combo_data(bridge_window.network_combo, "direct")
     bridge_window.fetch_limit_spin.setValue(7)
     bridge_window.send_limit_spin.setValue(8)

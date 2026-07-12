@@ -1,22 +1,23 @@
-"""首次使用的简洁配置向导。"""
+"""首次使用向导，复用正式账号管理组件与业务逻辑。"""
 
 from __future__ import annotations
 
 from pathlib import Path
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
-    QFormLayout,
-    QLineEdit,
+    QLabel,
     QMessageBox,
     QPushButton,
     QVBoxLayout,
 )
 
+from agent_mail_bridge.application_service import ApplicationService
 from agent_mail_bridge.config import AppConfig
-from agent_mail_bridge.credentials import CredentialError, CredentialService, QQ_SMTP_SECRET
-from agent_mail_bridge.ui.settings_store import import_legacy_env, save_env_values
+from agent_mail_bridge.ui.account_management import AccountTypeDialog, open_account_dialog
+from agent_mail_bridge.ui.settings_store import import_legacy_env
 
 
 def needs_setup(cfg: AppConfig) -> bool:
@@ -24,33 +25,70 @@ def needs_setup(cfg: AppConfig) -> bool:
 
 
 class SetupWizard(QDialog):
-    """只收集首次必需配置，其他高级项可稍后在主窗口完成。"""
+    """首次启动只负责引导，账号保存与后续编辑使用同一套实现。"""
 
     def __init__(self, cfg: AppConfig) -> None:
         super().__init__()
         self.cfg = cfg
+        self.service = ApplicationService(cfg)
         self.setWindowTitle("首次配置向导")
+        self.setMinimumSize(620, 430)
         layout = QVBoxLayout(self)
-        form = QFormLayout()
-        self.data_root = QLineEdit(str(cfg.data_root_path))
-        self.gmail = QLineEdit(cfg.gmail_address)
-        self.backend = QLineEdit(cfg.gmail_receive_backend)
-        self.qq = QLineEdit(cfg.qq_email)
-        self.qq_auth = QLineEdit()
-        self.qq_auth.setEchoMode(QLineEdit.EchoMode.Password)
-        self.qq_auth.setPlaceholderText("已配置则留空；不会回显旧授权码")
-        form.addRow("数据目录", self.data_root)
-        form.addRow("Gmail 收件邮箱", self.gmail)
-        form.addRow("收件方式", self.backend)
-        form.addRow("QQ 发件邮箱（可稍后填写）", self.qq)
-        form.addRow("QQ 授权码（可稍后填写）", self.qq_auth)
-        layout.addLayout(form)
-        save = QPushButton("保存并进入主界面")
-        save.clicked.connect(self.accept)
-        layout.addWidget(save)
-        migrate = QPushButton("导入旧版 .env")
+        layout.setContentsMargins(28, 25, 28, 22)
+        layout.setSpacing(13)
+
+        title = QLabel("欢迎使用 AgentMailBridge")
+        title.setObjectName("pageTitle")
+        hint = QLabel("先配置 Gmail 收件账号；QQ 发件账号可以现在配置，也可以稍后从主界面左侧账号区添加。")
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(hint)
+
+        self.gmail_status = QLabel()
+        self.qq_status = QLabel()
+        layout.addWidget(self.gmail_status)
+        gmail = QPushButton("配置 Gmail 收件账号")
+        gmail.setObjectName("primaryButton")
+        gmail.setMinimumHeight(48)
+        gmail.clicked.connect(lambda: self.configure(AccountTypeDialog.GMAIL))
+        layout.addWidget(gmail)
+        layout.addWidget(self.qq_status)
+        qq = QPushButton("配置 QQ 发件账号（可选）")
+        qq.setObjectName("outlinePurple")
+        qq.setMinimumHeight(44)
+        qq.clicked.connect(lambda: self.configure(AccountTypeDialog.QQ))
+        layout.addWidget(qq)
+
+        migrate = QPushButton("从旧版 .env 迁移配置")
+        migrate.setObjectName("textButton")
         migrate.clicked.connect(self.import_legacy_config)
-        layout.addWidget(migrate)
+        layout.addWidget(migrate, 0, Qt.AlignmentFlag.AlignLeft)
+        layout.addStretch(1)
+        enter = QPushButton("完成并进入主界面")
+        enter.setObjectName("primaryButton")
+        enter.clicked.connect(self.accept)
+        layout.addWidget(enter, 0, Qt.AlignmentFlag.AlignRight)
+        self.refresh_status()
+
+    def refresh_status(self) -> None:
+        gmail_ready = bool(self.cfg.gmail_address and self.cfg.owner_gmail)
+        qq_ready = bool(self.cfg.qq_email and self.cfg.qq_auth_code)
+        self.gmail_status.setText(
+            f"✓ Gmail 收件账号：{self.cfg.gmail_address}" if gmail_ready else "○ Gmail 收件账号：未配置（必需）"
+        )
+        self.gmail_status.setObjectName("successText" if gmail_ready else "hint")
+        self.qq_status.setText(
+            f"✓ QQ 发件账号：{self.cfg.qq_email}" if qq_ready else "○ QQ 发件账号：未配置（可选）"
+        )
+        self.qq_status.setObjectName("successText" if qq_ready else "hint")
+        for label in (self.gmail_status, self.qq_status):
+            label.style().unpolish(label)
+            label.style().polish(label)
+
+    def configure(self, account_type: str) -> None:
+        open_account_dialog(self.service, account_type, self)
+        self.refresh_status()
 
     def import_legacy_config(self) -> None:
         source, _ = QFileDialog.getOpenFileName(
@@ -74,26 +112,7 @@ class SetupWizard(QDialog):
         super().accept()
 
     def accept(self) -> None:
-        email = self.gmail.text().strip()
-        if not email or "@" not in email:
-            return
-        qq_auth = self.qq_auth.text().strip()
-        if qq_auth:
-            try:
-                CredentialService().set(QQ_SMTP_SECRET, qq_auth)
-            except CredentialError as exc:
-                QMessageBox.warning(self, "凭据保存失败", str(exc))
-                return
-        try:
-            save_env_values({
-                "DATA_ROOT": self.data_root.text().strip(),
-                "GMAIL_ADDRESS": email,
-                "OWNER_GMAIL": email,
-                "GMAIL_RECEIVE_BACKEND": self.backend.text().strip() or "gmail_api",
-                "QQ_EMAIL": self.qq.text().strip(),
-                "QQ_AUTH_CODE": "",
-            })
-        except OSError as exc:
-            QMessageBox.warning(self, "配置保存失败", str(exc))
+        if not (self.cfg.gmail_address and self.cfg.owner_gmail):
+            QMessageBox.warning(self, "尚未完成", "请先配置 Gmail 收件账号。")
             return
         super().accept()

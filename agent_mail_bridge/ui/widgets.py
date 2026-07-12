@@ -277,8 +277,8 @@ class MessageBar(QFrame):
         layout.setContentsMargins(10, 0, 10, 0)
         self.label = QLabel("就绪")
         self.label.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 10px;")
-        layout.addWidget(self.label)
-        layout.addStretch()
+        self.label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        layout.addWidget(self.label, 1)
         self.set_message("就绪")
 
     def set_message(self, text: str, kind: str = "normal") -> None:

@@ -52,10 +52,15 @@ from agent_mail_bridge.mcp_client_config import (
     mcp_launch,
 )
 from agent_mail_bridge.runtime_paths import get_runtime_paths
-from agent_mail_bridge.oauth_storage import import_oauth_credentials
 from agent_mail_bridge.models import OperationStatus, ReceiveResult, SendResult, ServiceResult
 from agent_mail_bridge.security import SecurityError, assert_within_allowed_roots
 from agent_mail_bridge.ui.settings_store import save_env_values
+from agent_mail_bridge.ui.settings_store import import_legacy_env
+from agent_mail_bridge.ui.account_management import (
+    AccountTypeDialog,
+    open_account_dialog,
+    open_add_account_dialog,
+)
 from agent_mail_bridge.ui.branding import apply_brand_label, brand_icon, find_brand_asset
 from agent_mail_bridge.ui.theme import (
     DANGER,
@@ -318,7 +323,8 @@ class BridgeWindow(QMainWindow):
         saved_geometry = self.settings.value("window/geometry")
         if saved_geometry:
             self.restoreGeometry(saved_geometry)
-        self.select_page(str(self.settings.value("window/last_page", "dashboard")))
+        # 高频收件工作台始终作为启动首页，避免旧版本页面状态恢复到已删除路由。
+        self.select_page("inbox")
         QTimer.singleShot(0, self.refresh)
         if not self.previous_exit_was_clean:
             QTimer.singleShot(
@@ -371,56 +377,34 @@ class BridgeWindow(QMainWindow):
         layout.setContentsMargins(10, 14, 10, 12)
         layout.setSpacing(8)
 
-        add_account = QPushButton("＋  添加邮箱账号")
-        add_account.setObjectName("primaryButton")
-        add_account.setFixedHeight(40)
-        add_account.clicked.connect(lambda: self.show_message("当前版本支持一个 Gmail 收件账号和一个 QQ 发件账号"))
-        layout.addWidget(add_account)
+        self.add_account_button = QPushButton("＋  添加邮箱账号")
+        self.add_account_button.setObjectName("primaryButton")
+        self.add_account_button.setFixedHeight(40)
+        self.add_account_button.clicked.connect(self.open_add_account)
+        layout.addWidget(self.add_account_button)
         layout.addSpacing(3)
 
         label = QLabel("我的邮箱账号")
         label.setObjectName("fieldLabel")
         layout.addWidget(label)
-        self.gmail_card = AccountCard("M", "Gmail（收件邮箱）", "未配置", "作为主要收件邮箱｜自动收取", "#EA4335")
-        self.qq_card = AccountCard("Q", "QQ 邮箱（发件）", "未配置", "用于发送邮件附件", "#21A4E8")
-        self.gmail_card.clicked.connect(lambda: self.select_page("basic"))
-        self.qq_card.clicked.connect(lambda: self.select_page("advanced"))
+        self.gmail_card = AccountCard("M", "Gmail（收件）", "未配置", "主要收件邮箱｜自动收取", "#EA4335")
+        self.qq_card = AccountCard("Q", "QQ（发件）", "未配置", "QQ 邮箱｜发送邮件附件", "#21A4E8")
+        self.gmail_card.clicked.connect(lambda: self.open_account(AccountTypeDialog.GMAIL))
+        self.qq_card.clicked.connect(lambda: self.open_account(AccountTypeDialog.QQ))
         layout.addWidget(self.gmail_card)
         layout.addWidget(self.qq_card)
-
-        identity = QPushButton("设置发件身份  ›")
-        identity.setObjectName("outlinePurple")
-        identity.setFixedHeight(42)
-        identity.clicked.connect(lambda: self.select_page("advanced"))
-        layout.addWidget(identity)
         layout.addSpacing(12)
-
-        self.nav_buttons: dict[str, NavButton] = {}
-        standard = QStyle.StandardPixmap
-        nav_items = (
-            ("dashboard", standard.SP_DesktopIcon, "仪表盘"),
-            ("basic", standard.SP_FileDialogDetailedView, "账号与配置"),
-            ("inbox", standard.SP_ArrowDown, "收邮箱"),
-            ("send", standard.SP_ArrowUp, "发邮件"),
-            ("history", standard.SP_BrowserReload, "历史记录"),
-            ("logs", standard.SP_FileIcon, "日志"),
-            ("maintenance", standard.SP_DriveHDIcon, "数据维护"),
-            ("agent", standard.SP_ComputerIcon, "Agent 接口"),
-        )
-        for key, standard_icon, text in nav_items:
-            button = NavButton(self.style().standardIcon(standard_icon), text)
-            button.clicked.connect(lambda checked=False, page=key: self.select_page(page))
-            self.nav_buttons[key] = button
-            layout.addWidget(button)
-        self.nav_buttons["dashboard"].setChecked(True)
+        account_hint = QLabel("账号配置统一从上方入口或账号卡片进入。")
+        account_hint.setObjectName("hint")
+        account_hint.setWordWrap(True)
+        layout.addWidget(account_hint)
         layout.addStretch(1)
 
-        settings = NavButton(self.style().standardIcon(standard.SP_FileDialogDetailedView), "设置")
-        about = NavButton(self.style().standardIcon(standard.SP_MessageBoxInformation), "关于")
-        settings.clicked.connect(lambda: self.select_page("advanced"))
+        about = QPushButton("关于 AgentMailBridge")
+        about.setObjectName("textButton")
         about.clicked.connect(self._show_about)
-        layout.addWidget(settings)
         layout.addWidget(about)
+        self.nav_buttons: dict[str, NavButton] = {}
         return panel
 
     def _build_central_panel(self) -> QWidget:
@@ -442,7 +426,7 @@ class BridgeWindow(QMainWindow):
         tab_layout.setContentsMargins(23, 0, 0, 0)
         tab_layout.setSpacing(4)
         self.tab_buttons: dict[str, QPushButton] = {}
-        for key, text in (("basic", "基础配置"), ("inbox", "收邮箱"), ("send", "发邮件"), ("advanced", "高级设置")):
+        for key, text in (("inbox", "收件"), ("send", "发件"), ("advanced", "高级设置")):
             button = QPushButton(text)
             button.setObjectName("tabButton")
             button.setCheckable(True)
@@ -450,19 +434,15 @@ class BridgeWindow(QMainWindow):
             button.clicked.connect(lambda checked=False, page=key: self.select_page(page))
             self.tab_buttons[key] = button
             tab_layout.addWidget(button)
-        self.tab_buttons["basic"].setChecked(True)
+        self.tab_buttons["inbox"].setChecked(True)
         tab_layout.addStretch(1)
         layout.addWidget(tabs)
 
         self.page_stack = QStackedWidget()
         self.pages = {
-            "dashboard": self._build_dashboard_page(),
-            "basic": self._build_basic_page(),
             "inbox": self._build_inbox_page(),
             "send": self._build_send_page(),
             "advanced": self._build_advanced_page(),
-            "history": self._build_history_page(),
-            "logs": self._build_logs_page(),
             "maintenance": self._build_maintenance_page(),
             "agent": self._build_agent_page(),
         }
@@ -674,26 +654,112 @@ class BridgeWindow(QMainWindow):
         return scroll
 
     def _build_inbox_page(self) -> QWidget:
-        page, layout = self._standard_page("收邮箱", "查看今日接收文件，并可安全预览或定位到目录。")
+        page, layout = self._standard_page(
+            "收件",
+            "日常收件工作台；邮箱地址、OAuth 和 IMAP 凭据请通过左侧 Gmail 账号卡片管理。",
+        )
+        status_card = QFrame()
+        status_card.setObjectName("heroCard")
+        status_layout = QHBoxLayout(status_card)
+        status_layout.setContentsMargins(16, 12, 16, 12)
+        status_layout.setSpacing(10)
+        status_text = QVBoxLayout()
+        self.receive_account_label = QLabel(self.service.cfg.gmail_address or "尚未配置 Gmail 收件账号")
+        self.receive_account_label.setObjectName("minorTitle")
+        self.dashboard_health_detail = QLabel("正在读取当前连接状态…")
+        self.dashboard_health_detail.setObjectName("hint")
+        status_text.addWidget(self.receive_account_label)
+        status_text.addWidget(self.dashboard_health_detail)
+        status_layout.addLayout(status_text, 1)
+        manage = self._button(
+            "管理 Gmail 账号",
+            lambda: self.open_account(AccountTypeDialog.GMAIL),
+            outline=True,
+        )
+        status_layout.addWidget(manage)
+        layout.addWidget(status_card)
+
         tools = QHBoxLayout()
-        self.inbox_search = QLineEdit()
-        self.inbox_search.setPlaceholderText("搜索文件名或路径")
-        self.inbox_search.textChanged.connect(self._filter_inbox)
+        tools.setSpacing(9)
+        tools.addWidget(QLabel("自动收取"))
+        self.auto_switch = ToggleSwitch()
+        self.auto_switch.toggled.connect(self._toggle_auto_receive)
+        tools.addWidget(self.auto_switch)
+        tools.addSpacing(5)
+        tools.addWidget(QLabel("检查间隔"))
+        self.interval_combo = QComboBox()
+        for minutes in (1, 3, 5, 10, 30):
+            suffix = "（推荐）" if minutes == AUTO_RECEIVE_DEFAULT_MINUTES else ""
+            self.interval_combo.addItem(f"每 {minutes} 分钟{suffix}", minutes)
+        self.interval_combo.setFixedWidth(160)
+        self.interval_combo.currentIndexChanged.connect(self._reschedule_auto_receive)
+        tools.addWidget(self.interval_combo)
+        tools.addStretch(1)
+        self.inbox_test_button = self._button("测试当前连接", self.test_connection)
         receive = self._button("立即收取", self.receive, primary=True)
+        self.receive_button = receive
         self.inbox_refresh_button = self._button("刷新")
+        self.logs_refresh_button = self.inbox_refresh_button
         self.inbox_refresh_button.clicked.connect(
             lambda: self.request_refresh(self.inbox_refresh_button)
         )
-        self.task_buttons.append(receive)
+        self.task_buttons.extend((self.inbox_test_button, receive))
         self.manual_receive_buttons.append(receive)
-        tools.addWidget(self.inbox_search, 1)
+        tools.addWidget(self.inbox_test_button)
         tools.addWidget(receive)
         tools.addWidget(self.inbox_refresh_button)
         layout.addLayout(tools)
-        self.inbox_table = DataTable(["文件名", "大小", "保存路径", "收取时间", "状态"])
-        self.inbox_table.cellDoubleClicked.connect(self._preview_inbox_file)
-        self._configure_file_table(self.inbox_table)
-        layout.addWidget(self.inbox_table, 1)
+
+        self.self_mail_check = QCheckBox("仅收取本人 Gmail 且重要的邮件")
+        self.self_mail_check.setChecked(self.service.cfg.auto_receive_only_self_mail)
+        self.self_mail_check.setToolTip("避免结果邮件形成循环；修改后点击保存收件偏好")
+        preference_row = QHBoxLayout()
+        preference_row.addWidget(self.self_mail_check)
+        preference_row.addStretch(1)
+        preference_row.addWidget(self._button("保存收件偏好", self.save_receive_preferences, text_only=True))
+        layout.addLayout(preference_row)
+
+        self.message_bar = MessageBar()
+        layout.addWidget(self.message_bar)
+        file_header = QHBoxLayout()
+        file_title = QLabel("今日收到文件")
+        file_title.setObjectName("sectionTitle")
+        self.inbox_search = QLineEdit()
+        self.inbox_search.setPlaceholderText("搜索文件名或保存路径")
+        self.inbox_search.setMaximumWidth(260)
+        self.inbox_search.textChanged.connect(self._filter_inbox)
+        open_button = self._button("打开今日接收文件夹", self.open_today_folder)
+        file_header.addWidget(file_title)
+        file_header.addStretch(1)
+        file_header.addWidget(self.inbox_search)
+        file_header.addWidget(open_button)
+        layout.addLayout(file_header)
+        self.files_table = DataTable(["文件名", "大小", "保存路径", "收取时间", "状态 / 操作"])
+        self.files_table.setMinimumHeight(250)
+        self.files_table.cellDoubleClicked.connect(self._preview_table_file)
+        self.files_table.cellClicked.connect(self._file_action_clicked)
+        self._configure_file_table(self.files_table)
+        self.inbox_table = self.files_table
+        layout.addWidget(self.files_table, 3)
+
+        log_header = QHBoxLayout()
+        log_title = QLabel("最近日志")
+        log_title.setObjectName("sectionTitle")
+        self.home_refresh_label = QLabel("尚未刷新")
+        self.home_refresh_label.setObjectName("hint")
+        self.home_refresh_label.setMinimumWidth(130)
+        self.home_refresh_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        log_header.addWidget(log_title)
+        log_header.addStretch(1)
+        log_header.addWidget(self.home_refresh_label)
+        layout.addLayout(log_header)
+        self.logs_table = DataTable(["时间", "级别", "消息"])
+        self.logs_table.setMinimumHeight(120)
+        self.logs_table.setMaximumHeight(190)
+        self._configure_log_table(self.logs_table)
+        self.logs_refresh_label = self.home_refresh_label
+        self.dashboard_refresh_label = self.home_refresh_label
+        layout.addWidget(self.logs_table, 1)
         return page
 
     def _build_send_page(self) -> QWidget:
@@ -780,24 +846,32 @@ class BridgeWindow(QMainWindow):
         return page
 
     def _build_advanced_page(self) -> QWidget:
-        page, layout = self._standard_page("高级设置", "配置 QQ 发件身份、网络模式和 Gmail API 授权。")
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        page = QWidget()
+        page.setObjectName("pageSurface")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(24, 20, 22, 20)
+        layout.setSpacing(12)
+        title = QLabel("高级设置")
+        title.setObjectName("pageTitle")
+        hint = QLabel("应用级、网络级、本地路径、全局诊断与迁移设置；账号认证统一在左侧账号卡片管理。")
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(hint)
+        layout.addWidget(horizontal_line())
+
+        run_title = QLabel("运行设置")
+        run_title.setObjectName("sectionTitle")
+        layout.addWidget(run_title)
         grid = QGridLayout()
         grid.setHorizontalSpacing(14)
         grid.setVerticalSpacing(10)
-        qq_box, self.qq_email_edit = self._field_edit("QQ 邮箱（发件身份）", self.service.cfg.qq_email)
-        auth_box, self.qq_auth_edit = self._field_edit("QQ SMTP 授权码（Windows 安全存储）", "", password=True)
-        self.qq_auth_edit.setPlaceholderText(
-            "已配置；留空保持不变" if self.service.cfg.qq_auth_code else "未配置"
-        )
         network_box, self.network_combo = self._field_combo(
             "Gmail 网络模式", (("自动选择", "auto"), ("直连", "direct"), ("SOCKS5", "socks5"))
         )
-        data_box, self.data_root_edit = self._field_edit("本地数据目录（只读）", str(self.service.cfg.data_root_path))
-        self.data_root_edit.setReadOnly(True)
-        grid.addWidget(qq_box, 0, 0)
-        grid.addWidget(auth_box, 0, 1)
-        grid.addWidget(network_box, 1, 0)
-        grid.addWidget(data_box, 1, 1)
+        grid.addWidget(network_box, 0, 0, 1, 2)
         layout.addLayout(grid)
 
         limits = QHBoxLayout()
@@ -820,64 +894,83 @@ class BridgeWindow(QMainWindow):
         self.startup_check = QCheckBox("Windows 开机后在后台启动（默认关闭）")
         self.startup_check.setChecked(StartupManager.is_enabled())
         layout.addWidget(self.startup_check)
-
-        self.secret_visibility_check = QCheckBox("临时显示密码和授权码")
-        self.secret_visibility_check.toggled.connect(self._toggle_secret_visibility)
-        layout.addWidget(self.secret_visibility_check)
-
         self.unsaved_config_label = QLabel("配置未修改")
         self.unsaved_config_label.setObjectName("hint")
         layout.addWidget(self.unsaved_config_label)
-
-        actions = QGridLayout()
-        actions.setHorizontalSpacing(8)
-        actions.setVerticalSpacing(8)
         save = self._button("保存高级设置", self.save_advanced_config, primary=True)
-        self.authorize_button = self._button("Gmail API 显式授权", self.authorize_gmail_api)
-        self.import_oauth_button = self._button("导入 OAuth JSON", self.import_oauth_json)
-        self.imap_diagnose_button = self._button("诊断 IMAP")
-        self.gmail_api_diagnose_button = self._button("诊断 Gmail API")
-        self.smtp_diagnose_button = self._button("诊断 QQ SMTP")
-        self.export_diagnosis_button = self._button("导出脱敏诊断报告")
-        self.error_details_button = self._button("查看最近错误详情", self.show_last_error_details)
-        self.delete_qq_credential_button = self._button(
-            "删除 QQ 凭据", lambda: self.delete_credential(QQ_SMTP_SECRET)
-        )
-        self.error_details_button.setEnabled(False)
-        self.imap_diagnose_button.clicked.connect(
-            lambda: self._diagnose("正在诊断 Gmail IMAP", self.service.diagnose_imap, self.imap_diagnose_button)
-        )
-        self.gmail_api_diagnose_button.clicked.connect(
-            lambda: self._diagnose("正在诊断 Gmail API", self.service.diagnose_gmail_api, self.gmail_api_diagnose_button)
-        )
-        self.smtp_diagnose_button.clicked.connect(
-            lambda: self._diagnose("正在诊断 QQ SMTP", self.service.diagnose_qq_smtp, self.smtp_diagnose_button)
-        )
-        auth = self.authorize_button
-        imap = self.imap_diagnose_button
-        api = self.gmail_api_diagnose_button
-        smtp = self.smtp_diagnose_button
-        self.export_diagnosis_button.clicked.connect(self.export_diagnostic_report)
-        self.task_buttons.extend((auth, imap, api, smtp, self.export_diagnosis_button))
-        action_buttons = (
-            save, self.import_oauth_button, auth, imap, api, smtp,
-            self.export_diagnosis_button, self.error_details_button,
-            self.delete_qq_credential_button,
-        )
-        for index, button in enumerate(action_buttons):
-            actions.addWidget(button, index // 4, index % 4)
-        actions.setColumnStretch(3, 1)
-        layout.addLayout(actions)
+        layout.addWidget(save, 0, Qt.AlignmentFlag.AlignLeft)
         layout.addWidget(horizontal_line())
 
-        status_title = QLabel("当前脱敏配置")
+        path_title = QLabel("本地数据与路径")
+        path_title.setObjectName("sectionTitle")
+        layout.addWidget(path_title)
+        path_hint = QLabel("内部路径由程序管理；普通使用只需查看状态或打开对应目录。")
+        path_hint.setObjectName("hint")
+        layout.addWidget(path_hint)
+        runtime_paths = get_runtime_paths()
+        path_grid = QGridLayout()
+        path_specs = (
+            ("数据目录", self.service.cfg.data_root_path),
+            ("配置目录", runtime_paths.user_config_root),
+            ("OAuth 目录", runtime_paths.oauth_root),
+            ("缓存目录", runtime_paths.cache_root),
+            ("备份目录", self.service.cfg.data_root_path / "backups"),
+        )
+        self.path_status_labels: dict[str, QLabel] = {}
+        for row, (name, path) in enumerate(path_specs):
+            name_label = QLabel(name)
+            name_label.setObjectName("fieldLabel")
+            status = QLabel("✓ 可用" if path.exists() else "○ 尚未创建")
+            status.setObjectName("successText" if path.exists() else "hint")
+            button = self._button("打开目录", lambda checked=False, target=path: self.open_managed_directory(target))
+            self.path_status_labels[name] = status
+            path_grid.addWidget(name_label, row, 0)
+            path_grid.addWidget(status, row, 1)
+            path_grid.addWidget(button, row, 2)
+        path_grid.setColumnStretch(1, 1)
+        layout.addLayout(path_grid)
+        layout.addWidget(horizontal_line())
+
+        diagnostics_title = QLabel("诊断与错误")
+        diagnostics_title.setObjectName("sectionTitle")
+        layout.addWidget(diagnostics_title)
+        diagnostics_hint = QLabel("账号页提供单项连接测试；这里仅保留全局诊断与脱敏报告。")
+        diagnostics_hint.setObjectName("hint")
+        layout.addWidget(diagnostics_hint)
+        diagnostic_actions = QHBoxLayout()
+        self.all_diagnose_button = self._button("运行全部连接诊断", self.run_all_connection_diagnostics)
+        self.export_diagnosis_button = self._button("导出脱敏诊断报告")
+        self.error_details_button = self._button("查看最近错误详情", self.show_last_error_details)
+        self.error_details_button.setEnabled(False)
+        self.export_diagnosis_button.clicked.connect(self.export_diagnostic_report)
+        self.task_buttons.extend((self.all_diagnose_button, self.export_diagnosis_button))
+        diagnostic_actions.addWidget(self.all_diagnose_button)
+        diagnostic_actions.addWidget(self.export_diagnosis_button)
+        diagnostic_actions.addWidget(self.error_details_button)
+        diagnostic_actions.addStretch(1)
+        layout.addLayout(diagnostic_actions)
+        layout.addWidget(horizontal_line())
+
+        migration_title = QLabel("配置与迁移")
+        migration_title.setObjectName("sectionTitle")
+        layout.addWidget(migration_title)
+        migration_actions = QHBoxLayout()
+        migration_actions.addWidget(self._button("导入旧版 .env", self.import_legacy_configuration))
+        migration_actions.addWidget(self._button("数据维护与备份", lambda: self.select_page("maintenance")))
+        migration_actions.addWidget(self._button("Agent 接口配置", lambda: self.select_page("agent")))
+        migration_actions.addStretch(1)
+        layout.addLayout(migration_actions)
+
+        status_title = QLabel("当前脱敏状态")
         status_title.setObjectName("sectionTitle")
         layout.addWidget(status_title)
         self.config_summary = QTextEdit()
         self.config_summary.setReadOnly(True)
-        self.config_summary.setMinimumHeight(220)
-        layout.addWidget(self.config_summary, 1)
-        return page
+        self.config_summary.setMinimumHeight(170)
+        layout.addWidget(self.config_summary)
+        layout.addStretch(1)
+        scroll.setWidget(page)
+        return scroll
 
     def _build_history_page(self) -> QWidget:
         page, layout = self._standard_page("历史记录", "汇总最近接收与发送记录，越界旧路径不会开放。")
@@ -1244,18 +1337,11 @@ class BridgeWindow(QMainWindow):
 
     def _wire_config_change_tracking(self) -> None:
         """统一跟踪配置改动，避免用户误以为输入已自动生效。"""
-        for edit in (
-            self.gmail_email_edit,
-            self.gmail_password_edit,
-            self.qq_email_edit,
-            self.qq_auth_edit,
-        ):
-            edit.textChanged.connect(self._mark_config_dirty)
-        for combo in (self.backend_combo, self.network_combo, self.interval_combo):
+        for combo in (self.network_combo,):
             combo.currentIndexChanged.connect(self._mark_config_dirty)
         for spin in (self.fetch_limit_spin, self.send_limit_spin):
             spin.valueChanged.connect(self._mark_config_dirty)
-        for check in (self.self_mail_check, self.startup_check):
+        for check in (self.startup_check,):
             check.toggled.connect(self._mark_config_dirty)
 
     def _mark_config_dirty(self, *_args) -> None:
@@ -1325,11 +1411,11 @@ class BridgeWindow(QMainWindow):
     def select_page(self, name: str) -> None:
         target = name
         if target not in self.pages:
-            target = "basic"
+            target = "inbox"
         current_name = self._current_page_name()
         if (
             self._config_dirty
-            and current_name in {"basic", "advanced"}
+            and current_name == "advanced"
             and target != current_name
         ):
             choice = QMessageBox.question(
@@ -1342,18 +1428,17 @@ class BridgeWindow(QMainWindow):
             if choice != QMessageBox.StandardButton.Yes:
                 return
         self.page_stack.setCurrentWidget(self.pages[target])
-        self._set_exclusive_checked(self.tab_buttons, target)
-        nav_target = "basic" if target == "advanced" else name if name in self.nav_buttons else target
-        self._set_exclusive_checked(self.nav_buttons, nav_target)
+        tab_target = "advanced" if target in {"maintenance", "agent"} else target
+        self._set_exclusive_checked(self.tab_buttons, tab_target)
 
     def _current_page_name(self) -> str:
         if not hasattr(self, "page_stack"):
-            return "basic"
+            return "inbox"
         current = self.page_stack.currentWidget()
         for name, page in self.pages.items():
             if page is current:
                 return name
-        return "basic"
+        return "inbox"
 
     @staticmethod
     def _set_exclusive_checked(buttons: dict[str, QPushButton], selected: str) -> None:
@@ -1365,6 +1450,34 @@ class BridgeWindow(QMainWindow):
             buttons[selected].setChecked(True)
         for button in buttons.values():
             button.setAutoExclusive(True)
+
+    def open_add_account(self) -> None:
+        if open_add_account_dialog(self.service, self):
+            self.refresh()
+            self.show_message("邮箱账号已保存", "success")
+        else:
+            self.show_message("账号添加已取消", "normal")
+
+    def open_account(self, account_type: str) -> None:
+        if open_account_dialog(self.service, account_type, self):
+            self.refresh()
+            self.show_message("邮箱账号配置已更新", "success")
+
+    def save_receive_preferences(self) -> None:
+        minutes = self._auto_minutes()
+        try:
+            save_env_values(
+                {
+                    "AUTO_RECEIVE_ONLY_SELF_MAIL": str(self.self_mail_check.isChecked()).lower(),
+                    "GUI_AUTO_RECEIVE": str(self.auto_switch.isChecked()).lower(),
+                    "GUI_AUTO_RECEIVE_INTERVAL_MINUTES": str(minutes),
+                }
+            )
+        except OSError as exc:
+            self.show_message(f"保存收件偏好失败：{exc}", "error")
+            return
+        self.service.cfg.auto_receive_only_self_mail = self.self_mail_check.isChecked()
+        self.show_message("收件偏好已保存", "success")
 
     def receive(self) -> None:
         if self.auto_switch.isChecked():
@@ -1519,7 +1632,7 @@ class BridgeWindow(QMainWindow):
     def test_connection(self) -> None:
         sender = self.sender()
         button = sender if isinstance(sender, QPushButton) else None
-        backend = self.backend_combo.currentData()
+        backend = self.service.cfg.gmail_receive_backend
         if backend == "gmail_api" or (backend == "auto" and self.service.cfg.gmail_api_configured):
             self._diagnose("正在测试 Gmail API 连接", self.service.diagnose_gmail_api, button)
         else:
@@ -1538,7 +1651,7 @@ class BridgeWindow(QMainWindow):
             "正在进行 Gmail API 授权",
             self.service.authorize_gmail_api,
             self._show_service_result,
-            button=self.authorize_button,
+            button=getattr(self, "authorize_button", None),
             operation_name="授权",
         )
 
@@ -1561,10 +1674,9 @@ class BridgeWindow(QMainWindow):
             ) == QMessageBox.StandardButton.Yes
             if not replace:
                 return
-        try:
-            import_oauth_credentials(Path(source), destination=target, replace=replace)
-        except (OSError, ValueError) as exc:
-            self.show_message(f"OAuth 配置导入失败：{exc}", "error")
+        result = self.service.import_oauth_credentials(Path(source), replace=replace)
+        if not result.ok:
+            self._show_service_result(result)
             return
         self.refresh()
         self.show_message("OAuth 客户端配置已复制到受控用户目录", "success")
@@ -1618,24 +1730,10 @@ class BridgeWindow(QMainWindow):
         self.show_message("配置已安全保存并在当前运行中生效", "success")
 
     def save_advanced_config(self) -> None:
-        qq_email = self.qq_email_edit.text().strip()
-        qq_auth = self.qq_auth_edit.text()
-        if qq_email and not self._valid_email(qq_email):
-            self.show_message("请输入有效的 QQ 邮箱地址", "error")
-            return
-        if qq_email and not (qq_auth.strip() or self.service.cfg.qq_auth_code):
-            self.show_message("QQ 邮箱需要 SMTP 授权码", "error")
-            return
         network_mode = str(self.network_combo.currentData())
         previous_startup = StartupManager.is_enabled()
         desired_startup = self.startup_check.isChecked()
         startup_changed = desired_startup != previous_startup
-        previous_auth = self.service.cfg.qq_auth_code
-        if qq_auth.strip():
-            credential_result = self.service.set_credential(QQ_SMTP_SECRET, qq_auth)
-            if not credential_result.ok:
-                self.show_message(f"保存 QQ 凭据失败：{credential_result.message}", "error")
-                return
         try:
             if startup_changed:
                 StartupManager.set_enabled(desired_startup)
@@ -1645,19 +1743,12 @@ class BridgeWindow(QMainWindow):
         try:
             save_env_values(
                 {
-                    "QQ_EMAIL": qq_email,
-                    "QQ_AUTH_CODE": "",
                     "GMAIL_NETWORK_MODE": network_mode,
                     "MAX_FETCH_LIMIT": str(self.fetch_limit_spin.value()),
                     "MAX_SEND_FILE_MB": str(self.send_limit_spin.value()),
                 }
             )
         except OSError as exc:
-            if qq_auth.strip():
-                if previous_auth:
-                    self.service.set_credential(QQ_SMTP_SECRET, previous_auth)
-                else:
-                    self.service.delete_credential(QQ_SMTP_SECRET)
             rollback_message = "开机启动状态已回滚"
             try:
                 if startup_changed:
@@ -1666,15 +1757,85 @@ class BridgeWindow(QMainWindow):
                 rollback_message = "开机启动状态回滚失败，请手动检查"
             self.show_message(f"保存高级设置失败：{exc}；{rollback_message}", "error")
             return
-        self.service.cfg.qq_email = qq_email
-        self.qq_auth_edit.clear()
-        self.qq_auth_edit.setPlaceholderText("已配置；留空保持不变")
         self.service.cfg.gmail_network_mode = network_mode
         self.service.cfg.max_fetch_limit = self.fetch_limit_spin.value()
         self.service.cfg.max_send_file_mb = self.send_limit_spin.value()
         self.refresh()
         self._set_config_clean()
         self.show_message("高级设置已安全保存", "success")
+
+    def open_managed_directory(self, path: Path) -> None:
+        """创建并打开应用受控目录，不要求用户复制或记忆内部路径。"""
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            allowed = [get_runtime_paths().user_root, self.service.cfg.data_root_path]
+            assert_within_allowed_roots(path, allowed)
+            os.startfile(str(path))
+        except (OSError, SecurityError) as exc:
+            self.show_message(f"打开目录失败：{exc}", "error")
+            return
+        self.show_message("目录已打开", "success")
+
+    def run_all_connection_diagnostics(self) -> None:
+        self._run_task(
+            "正在运行全部连接诊断",
+            self._collect_all_connection_diagnostics,
+            self._show_service_result,
+            button=self.all_diagnose_button,
+            operation_name="全局诊断",
+        )
+
+    def _collect_all_connection_diagnostics(self) -> ServiceResult:
+        backend = self.service.cfg.gmail_receive_backend
+        receive_result = (
+            self.service.diagnose_gmail_api()
+            if backend == "gmail_api" or (backend == "auto" and self.service.cfg.gmail_api_configured)
+            else self.service.diagnose_imap()
+        )
+        results = [("Gmail 收件", receive_result)]
+        if self.service.cfg.qq_email:
+            results.append(("QQ 发件", self.service.diagnose_qq_smtp()))
+        failed = [(name, result) for name, result in results if not result.ok]
+        details = {name: result.to_dict() for name, result in results}
+        if failed:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="global_diagnosis_failed",
+                message="；".join(f"{name}：{result.message}" for name, result in failed),
+                details=details,
+            )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            message="全部已配置连接诊断通过",
+            details=details,
+        )
+
+    def import_legacy_configuration(self) -> None:
+        source, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择旧版 .env",
+            "",
+            "环境配置 (.env *.env);;所有文件 (*)",
+        )
+        if not source:
+            self.show_message("已取消配置迁移", "normal")
+            return
+        confirmation = QMessageBox.question(
+            self,
+            "导入旧版配置",
+            "程序将迁移非敏感配置和 Windows 凭据，失败时回滚。是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            self.show_message("已取消配置迁移", "normal")
+            return
+        try:
+            result = import_legacy_env(Path(source))
+        except Exception as exc:  # noqa: BLE001
+            self.show_message(f"配置迁移失败：{exc}", "error")
+            return
+        self.show_message(f"配置迁移完成：已导入 {len(result.imported_keys)} 项", "success")
 
     def delete_credential(self, name: str) -> None:
         """明确确认后删除单项 Windows 凭据。"""
@@ -1690,9 +1851,9 @@ class BridgeWindow(QMainWindow):
             return
         result = self.service.delete_credential(name)
         if result.ok:
-            if name == GMAIL_IMAP_SECRET:
+            if name == GMAIL_IMAP_SECRET and hasattr(self, "gmail_password_edit"):
                 self.gmail_password_edit.setPlaceholderText("未配置")
-            else:
+            elif name == QQ_SMTP_SECRET and hasattr(self, "qq_auth_edit"):
                 self.qq_auth_edit.setPlaceholderText("未配置")
         self._show_service_result(result)
 
@@ -1751,13 +1912,12 @@ class BridgeWindow(QMainWindow):
         self.mcp_rows = result.details.get("mcp", [])
         self._apply_config_to_controls(status)
         self._populate_files(self.files_table, self.file_rows, actions=True)
-        self._populate_files(self.inbox_table, self.file_rows, actions=False)
         self._populate_logs(self.logs_table, self.log_rows[:30])
-        self._populate_logs(self.dashboard_logs_table, self.log_rows[:20])
-        self._populate_full_logs()
         self._populate_sent_history()
-        self._populate_history()
-        self._populate_mcp_history()
+        if hasattr(self, "history_received_table"):
+            self._populate_history()
+        if hasattr(self, "mcp_table"):
+            self._populate_mcp_history()
         self._update_right_panel(status)
         self.last_refresh_at = datetime.now()
         refresh_text = f"最后刷新 {self.last_refresh_at.strftime('%H:%M:%S')}"
@@ -1774,8 +1934,8 @@ class BridgeWindow(QMainWindow):
             self.qq_card.email_label.setText(cfg.qq_email or "未配置")
             self.gmail_card.set_configured(bool(cfg.gmail_address))
             self.qq_card.set_configured(bool(cfg.qq_email))
+            self.receive_account_label.setText(cfg.gmail_address or "尚未配置 Gmail 收件账号")
             self.recipient_edit.setText(cfg.owner_gmail or cfg.gmail_address)
-            self._set_combo_data(self.backend_combo, cfg.gmail_receive_backend)
             self._set_combo_data(self.network_combo, cfg.gmail_network_mode)
         finally:
             self._loading_controls = False
@@ -1824,7 +1984,7 @@ class BridgeWindow(QMainWindow):
         send_time = self._latest_event_time(("send", "sent", "发件", "发送"))
         self.service_rows["receive"].set_value(receive_time)
         self.service_rows["send"].set_value(send_time)
-        self.title_bar.status_label.setText(f"服务已启动 · {backend_text}")
+        self.title_bar.status_label.setText("服务已启动")
         self.title_bar.status_label.setToolTip(f"Gmail API：{oauth}")
         health_detail = (
             f"收件：{backend_text} · Gmail 授权：{oauth_text} · QQ 发件：{qq_text_short}"
@@ -1839,13 +1999,6 @@ class BridgeWindow(QMainWindow):
         self.stat_cards["saved"].set_count(sum(1 for row in self.file_rows if row.get("status") in {"saved", "ok", "normal"}))
         self.stat_cards["sent"].set_count(sent_today)
         self.stat_cards["errors"].set_count(error_today)
-        for key, card in self.dashboard_stat_cards.items():
-            card.set_count({
-                "received": len(self.file_rows),
-                "saved": sum(1 for row in self.file_rows if row.get("status") in {"saved", "ok", "normal"}),
-                "sent": sent_today,
-                "errors": error_today,
-            }[key])
 
     def _populate_files(self, table: DataTable, rows: list[dict], *, actions: bool) -> None:
         table.setRowCount(0)
@@ -1965,7 +2118,7 @@ class BridgeWindow(QMainWindow):
                 if keyword in str(row.get("saved_filename", "")).lower()
                 or keyword in str(row.get("saved_path", "")).lower()
             ]
-        self._populate_files(self.inbox_table, rows, actions=False)
+        self._populate_files(self.inbox_table, rows, actions=True)
 
     def _run_task(
         self,

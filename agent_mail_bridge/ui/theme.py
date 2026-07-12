@@ -140,6 +140,20 @@ def build_stylesheet(theme: str = "light") -> str:
         border: 1px solid {BORDER};
         border-radius: 10px;
     }}
+    QFrame#accountPanel, QFrame#credentialCard {{
+        background: #FBFAFF;
+        border: 1px solid #E4DFFF;
+        border-radius: 10px;
+    }}
+    QLabel#credentialMask {{
+        color: #3E4350;
+        background: #F0F1F5;
+        border: 1px solid #E0E2E8;
+        border-radius: 5px;
+        padding: 7px 11px;
+        font-family: "Segoe UI";
+        letter-spacing: 2px;
+    }}
     QFrame#heroCard {{
         background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
                     stop:0 #F3F0FF, stop:0.58 #F7F5FF, stop:1 #EFF9FC);
@@ -217,6 +231,26 @@ def build_stylesheet(theme: str = "light") -> str:
         font-weight: 700;
         border: 1px solid #8F7CF2;
         background: #FFFFFF;
+    }}
+    QPushButton#accountChoice {{
+        text-align: left;
+        color: #353945;
+        border: 1px solid #DED9F8;
+        border-radius: 10px;
+        background: #FFFFFF;
+        padding: 12px 16px;
+        font-size: 12px;
+        font-weight: 600;
+    }}
+    QPushButton#accountChoice:hover {{
+        color: {PURPLE};
+        border-color: #9E8EF5;
+        background: #FAF9FF;
+    }}
+    QPushButton#accountChoice:checked {{
+        color: {PURPLE};
+        border: 2px solid {PURPLE};
+        background: {PURPLE_SOFT};
     }}
     QPushButton#textButton {{
         color: {PURPLE};

@@ -501,6 +501,36 @@ class ApplicationService:
             details=state,
         )
 
+    def import_oauth_credentials(
+        self, source: str | Path, *, replace: bool = False
+    ) -> ServiceResult:
+        """验证并把 OAuth 客户端配置导入当前用户的受控目录。"""
+        from agent_mail_bridge.oauth_storage import import_oauth_credentials
+
+        try:
+            target = import_oauth_credentials(
+                Path(source),
+                destination=self.cfg.gmail_api_credentials_path,
+                replace=replace,
+            )
+        except FileExistsError as exc:
+            return ServiceResult(
+                OperationStatus.CANCELLED,
+                error_code="oauth_credentials_exists",
+                message=str(exc),
+            )
+        except (OSError, ValueError) as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="oauth_import_failed",
+                message=str(exc),
+            )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            message="OAuth 客户端配置已安全导入",
+            details={"credentials_path": str(target)},
+        )
+
     def authorize_gmail_api(self) -> ServiceResult:
         """显式执行浏览器 OAuth 授权。"""
         self.initialize()

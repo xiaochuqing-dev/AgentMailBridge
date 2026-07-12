@@ -44,11 +44,10 @@ def _wait(window: BridgeWindow, app: QApplication) -> None:
         time.sleep(0.01)
 
 
-def test_dashboard_is_real_page_with_refresh_feedback(product_window, product_qt_app):
-    product_window.select_page("dashboard")
-    assert product_window.page_stack.currentWidget() is product_window.pages["dashboard"]
-    product_window.request_refresh(product_window.dashboard_refresh_button)
-    assert not product_window.dashboard_refresh_button.isEnabled()
+def test_inbox_is_default_workspace_with_refresh_feedback(product_window, product_qt_app):
+    assert product_window.page_stack.currentWidget() is product_window.pages["inbox"]
+    product_window.request_refresh(product_window.inbox_refresh_button)
+    assert not product_window.inbox_refresh_button.isEnabled()
     _wait(product_window, product_qt_app)
 
 
