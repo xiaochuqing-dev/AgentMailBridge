@@ -1,17 +1,16 @@
 # AgentMailBridge GUI 使用说明
 
-AgentMailBridge 0.9.0 的普通用户入口只有 `AgentMailBridge.exe`。首次启动完成 Gmail、固定收件人、数据目录及可选 QQ 发件配置；秘密值进入 Windows Credential Manager，输入框不会回显旧值。
+AgentMailBridge 0.9.0 的普通用户入口只有 `AgentMailBridge.exe`。首次启动与主窗口后续编辑复用同一套账号管理界面；秘密值进入 Windows Credential Manager，界面只显示固定掩码和配置状态，不回显旧值。
 
 主要页面：
 
-- 仪表盘：账号、OAuth、自动收件、最近状态和快捷操作。
-- 收邮件：Gmail API/IMAP 收取和历史记录。
-- 发邮件：用户明确选择的全局文件；该能力不会扩大 MCP 白名单。
-- 高级设置：QQ 授权码、网络、开机启动、OAuth JSON 导入、显式授权和诊断。
-- Agent 接口：内部 MCP 安装状态、固定收件人、允许目录、调用记录及 Codex/Claude/通用 JSON 配置复制。
-- 数据维护：数据库状态、备份、一致性检查和脱敏报告。
+- 收件：默认首页，显示当前 Gmail 与连接方式、自动收取、检查间隔、当前连接测试、立即收取、今日收到文件和最近日志。今日文件是页面主体。
+- 发件：选择文件、核对信息、固定收件人、主题、进度、结果和最近发送记录；不放 QQ 邮箱或授权码配置。
+- 高级设置：运行限制、网络模式、开机启动、本地路径、全局诊断、配置迁移、数据维护和 Agent 接口；不放账号级认证。
 
-安装版点击“导入 OAuth JSON”会验证 Desktop OAuth 文件并复制到当前用户受控 OAuth 目录；替换必须明确确认，现有 token 不会静默删除。首次向导的“导入旧版 .env”只处理用户主动选择的文件。
+左上角“添加邮箱账号”先选择 Gmail 收件账号或 QQ 发件账号。点击已有 Gmail 卡片直接进入当前 API/IMAP 编辑页，点击 QQ 卡片进入 QQ SMTP 编辑页。已删除“设置发件身份”和“基础配置”等重复入口。
+
+Gmail API 专属页只显示 Gmail 地址、OAuth 客户端配置、授权和 API 测试；Gmail IMAP 专属页只显示 Gmail 地址、Google 生成的应用专用密码及 IMAP 测试；QQ 专属页只显示 QQ 邮箱、QQ SMTP 授权码及测试。安装版选择 OAuth JSON 后会验证并自动复制到当前用户受控目录；替换必须明确确认，现有 token 不会静默删除。
 
 关闭主窗口默认进入托盘；托盘可恢复或正常退出。开机启动默认关闭，启用后使用 `AgentMailBridge.exe --background`。内部 MCP 不显示 GUI、托盘或开机启动项。
 

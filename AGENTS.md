@@ -20,6 +20,16 @@ Do not expand the project into SaaS, multi-tenant infrastructure, a general emai
 
 Use `runtime_paths.py`. Frozen program files are read-only under the install directory. Installed configuration, OAuth and data are current-user writable paths under `%LOCALAPPDATA%\AgentMailBridge`. Source mode continues to support the repository `.env`. Do not depend on the current working directory or hard-code a user name or drive.
 
+## Frontend information architecture
+
+- Account configuration belongs only in account management, reached from the add-account action or account cards.
+- The receive page must not contain account secrets or OAuth configuration.
+- The send page must not contain QQ account configuration.
+- Advanced settings must not contain account-level authentication.
+- Gmail API and Gmail IMAP must use separate conditional authentication views.
+- Do not add duplicate routes for an existing account or application capability.
+- Every new backend capability must be assigned to account, receive, send, advanced, automatic, or CLI-only ownership before adding UI.
+
 ## Development commands
 
 ```powershell
