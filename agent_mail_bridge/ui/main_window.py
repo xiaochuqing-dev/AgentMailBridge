@@ -173,6 +173,34 @@ class _TaskRunner(QRunnable):
         self.signals.finished.emit(result)
 
 
+class _VerticalResizeHandle(QWidget):
+    """无边框窗口底边的垂直拉伸手柄。"""
+
+    def __init__(self, window: QMainWindow, parent: QWidget):
+        super().__init__(parent)
+        self.window_ref = window
+        self.start_global_y = 0.0
+        self.start_height = 0
+        self.setObjectName("verticalResizeHandle")
+        self.setCursor(Qt.CursorShape.SizeVerCursor)
+        self.setFixedHeight(6)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.start_global_y = event.globalPosition().y()
+            self.start_height = self.window_ref.height()
+            event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            delta = int(event.globalPosition().y() - self.start_global_y)
+            self.window_ref.resize(
+                self.window_ref.width(),
+                max(self.window_ref.minimumHeight(), self.start_height + delta),
+            )
+            event.accept()
+
+
 class TitleBar(QWidget):
     """参考设计图实现的无边框窗口标题栏。"""
 
@@ -322,7 +350,7 @@ class BridgeWindow(QMainWindow):
         self.setWindowTitle("Agent 邮箱桥接工具")
         self.setWindowIcon(brand_icon())
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
-        self.resize(1240, 680)
+        self.resize(1240, 960)
         self.setMinimumSize(1160, 660)
         self._build()
         self.apply_theme(self.theme_mode)
@@ -346,19 +374,20 @@ class BridgeWindow(QMainWindow):
             )
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        """让文件表格上的垂直滚轮驱动收件页，避免嵌套滚动阻断下方日志。"""
+        """紧凑窗口中让文件表格滚轮优先移动页面，以保证日志可达。"""
         if (
             watched is getattr(self, "_inbox_page_wheel_source", None)
             and event.type() == QEvent.Type.Wheel
             and hasattr(self, "inbox_page_scroll")
         ):
-            pixel_delta = event.pixelDelta().y()
-            page_delta = pixel_delta or int(event.angleDelta().y() / 120 * 72)
-            if page_delta:
-                bar = self.inbox_page_scroll.verticalScrollBar()
-                bar.setValue(bar.value() - page_delta)
-                event.accept()
-                return True
+            bar = self.inbox_page_scroll.verticalScrollBar()
+            if bar.maximum() > 0:
+                pixel_delta = event.pixelDelta().y()
+                page_delta = pixel_delta or int(event.angleDelta().y() / 120 * 72)
+                if page_delta:
+                    bar.setValue(bar.value() - page_delta)
+                    event.accept()
+                    return True
         return super().eventFilter(watched, event)
 
     def _build(self) -> None:
@@ -392,6 +421,8 @@ class BridgeWindow(QMainWindow):
         self.size_grip = QSizeGrip(root)
         self.size_grip.setFixedSize(16, 16)
         self.size_grip.raise_()
+        self.vertical_resize_handle = _VerticalResizeHandle(self, root)
+        self.vertical_resize_handle.raise_()
 
     def _fit_to_available_screen(self) -> None:
         """限制恢复后的旧窗口几何，确保 150% DPI 下不超出可用桌面。"""
@@ -400,7 +431,8 @@ class BridgeWindow(QMainWindow):
             return
         available = screen.availableGeometry()
         target_width = min(self.width(), available.width())
-        target_height = min(self.height(), available.height())
+        preferred_height = min(1020, available.height())
+        target_height = min(max(self.height(), preferred_height), available.height())
         self.resize(max(self.minimumWidth(), target_width), max(self.minimumHeight(), target_height))
         frame = self.frameGeometry()
         x = min(max(frame.x(), available.left()), available.right() - frame.width() + 1)
@@ -716,7 +748,7 @@ class BridgeWindow(QMainWindow):
             "日常收件工作台；邮箱地址、OAuth 和 IMAP 凭据请通过左侧 Gmail 账号卡片管理。",
             header_action_label="刷新",
         )
-        # 收件页不使用外层滚动，避免文件表格截获滚轮后无法到达最近日志。
+        # 高内容页在当前屏幕可用高度足够时整页显示，较矮窗口保留滚动兜底。
         layout.setContentsMargins(24, 20, 22, 24)
         layout.setSpacing(12)
         self.inbox_refresh_button = page.header_action_button
@@ -799,6 +831,7 @@ class BridgeWindow(QMainWindow):
 
         self.message_bar = MessageBar()
         layout.addWidget(self.message_bar)
+
         file_header = QHBoxLayout()
         file_title = QLabel("今日收到文件")
         file_title.setObjectName("sectionTitle")
@@ -847,12 +880,12 @@ class BridgeWindow(QMainWindow):
         self.logs_refresh_label = self.home_refresh_label
         self.dashboard_refresh_label = self.home_refresh_label
         layout.addWidget(self.logs_table, 1)
-        page.setMinimumHeight(1050)
+        page.setMinimumHeight(900)
         scroll = QScrollArea()
         scroll.setObjectName("pageScroll")
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setWidget(page)
         self.inbox_page_scroll = scroll
         self._inbox_page_wheel_source = self.files_table.viewport()
@@ -3565,4 +3598,6 @@ class BridgeWindow(QMainWindow):
     def resizeEvent(self, event) -> None:
         if hasattr(self, "size_grip"):
             self.size_grip.move(self.width() - 16, self.height() - 16)
+        if hasattr(self, "vertical_resize_handle"):
+            self.vertical_resize_handle.setGeometry(0, self.height() - 6, self.width() - 16, 6)
         super().resizeEvent(event)

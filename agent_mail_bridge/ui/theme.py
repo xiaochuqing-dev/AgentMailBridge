@@ -431,6 +431,8 @@ def build_stylesheet(theme: str = "light") -> str:
     QScrollBar:horizontal {{ height: 9px; background: #F5F6F9; margin: 1px; }}
     QScrollBar::handle:horizontal {{ background: #C9CCD6; border-radius: 4px; min-width: 32px; }}
     QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
+    QWidget#verticalResizeHandle {{ background: transparent; }}
+    QWidget#verticalResizeHandle:hover {{ background: {PURPLE}; }}
     QScrollArea {{ border: none; background: #FFFFFF; }}
     QProgressBar {{
         border: none;

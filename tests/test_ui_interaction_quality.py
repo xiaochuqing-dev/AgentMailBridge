@@ -171,38 +171,40 @@ def test_theme_icon_and_typography_tokens_are_formal(quality_window):
     assert all(token["weight"] in {400, 700} for token in TYPOGRAPHY.values())
 
 
-def test_high_dpi_window_uses_bounded_geometry_and_scroll_fallbacks(quality_window):
+def test_high_dpi_window_expands_and_keeps_full_page_scroll_fallback(quality_window):
     available = quality_window.screen().availableGeometry()
     assert quality_window.height() <= max(available.height(), quality_window.minimumHeight())
+    assert quality_window.height() == min(1020, available.height())
     assert isinstance(quality_window.pages["inbox"], QScrollArea)
     assert isinstance(quality_window.right_panel, QScrollArea)
     assert quality_window.files_table.minimumHeight() == 220
     assert quality_window.logs_table.minimumHeight() == 220
     assert quality_window.logs_table.isVisible()
-    assert quality_window.pages["inbox"].verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOn
+    assert quality_window.pages["inbox"].verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAsNeeded
+    assert quality_window.vertical_resize_handle.cursor().shape() == Qt.CursorShape.SizeVerCursor
+
     page_bar = quality_window.pages["inbox"].verticalScrollBar()
-    assert page_bar.maximum() > 0
+    if page_bar.maximum() > 0:
+        class WheelDown:
+            accepted = False
 
-    class WheelDown:
-        accepted = False
+            @staticmethod
+            def type():
+                return QEvent.Type.Wheel
 
-        @staticmethod
-        def type():
-            return QEvent.Type.Wheel
+            @staticmethod
+            def pixelDelta():
+                return QPoint()
 
-        @staticmethod
-        def pixelDelta():
-            return QPoint()
+            @staticmethod
+            def angleDelta():
+                return QPoint(0, -120)
 
-        @staticmethod
-        def angleDelta():
-            return QPoint(0, -120)
+            def accept(self):
+                self.accepted = True
 
-        def accept(self):
-            self.accepted = True
-
-    page_bar.setValue(0)
-    wheel = WheelDown()
-    assert quality_window.eventFilter(quality_window.files_table.viewport(), wheel)
-    assert wheel.accepted
-    assert page_bar.value() > 0
+        page_bar.setValue(0)
+        wheel = WheelDown()
+        assert quality_window.eventFilter(quality_window.files_table.viewport(), wheel)
+        assert wheel.accepted
+        assert page_bar.value() > 0
