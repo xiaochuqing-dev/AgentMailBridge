@@ -323,7 +323,7 @@ class BridgeWindow(QMainWindow):
         self.setWindowIcon(brand_icon())
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
         self.resize(1240, 680)
-        self.setMinimumSize(1160, 640)
+        self.setMinimumSize(1160, 660)
         self._build()
         self.apply_theme(self.theme_mode)
         self._build_tray()
@@ -700,6 +700,9 @@ class BridgeWindow(QMainWindow):
             "日常收件工作台；邮箱地址、OAuth 和 IMAP 凭据请通过左侧 Gmail 账号卡片管理。",
             header_action_label="刷新",
         )
+        # 收件页不使用外层滚动，避免文件表格截获滚轮后无法到达最近日志。
+        layout.setContentsMargins(24, 12, 22, 12)
+        layout.setSpacing(8)
         self.inbox_refresh_button = page.header_action_button
         self.inbox_refresh_button.clicked.connect(
             lambda: self.request_refresh(self.inbox_refresh_button)
@@ -707,7 +710,7 @@ class BridgeWindow(QMainWindow):
         status_card = QFrame()
         status_card.setObjectName("heroCard")
         status_layout = QHBoxLayout(status_card)
-        status_layout.setContentsMargins(16, 12, 16, 12)
+        status_layout.setContentsMargins(14, 8, 14, 8)
         status_layout.setSpacing(10)
         account_icon = QLabel()
         account_icon.setFixedSize(46, 46)
@@ -762,7 +765,7 @@ class BridgeWindow(QMainWindow):
         preference_card.setObjectName("card")
         preference_row = QHBoxLayout()
         preference_card.setLayout(preference_row)
-        preference_row.setContentsMargins(14, 10, 14, 10)
+        preference_row.setContentsMargins(14, 7, 14, 7)
         preference_text = QVBoxLayout()
         preference_title = QLabel("当前收件偏好")
         preference_title.setObjectName("fieldLabel")
@@ -801,7 +804,7 @@ class BridgeWindow(QMainWindow):
         file_header.addWidget(open_button)
         layout.addLayout(file_header)
         self.files_table = DataTable(["文件名", "大小", "保存路径", "收取时间", "操作"])
-        self.files_table.setMinimumHeight(250)
+        self.files_table.setMinimumHeight(110)
         self.files_table.cellDoubleClicked.connect(self._preview_table_file)
         self._configure_file_table(self.files_table)
         self.inbox_table = self.files_table
@@ -821,19 +824,13 @@ class BridgeWindow(QMainWindow):
         log_header.addWidget(manage_logs)
         layout.addLayout(log_header)
         self.logs_table = DataTable(["时间", "级别", "消息"])
-        self.logs_table.setMinimumHeight(165)
-        self.logs_table.setMaximumHeight(235)
+        self.logs_table.setMinimumHeight(85)
+        self.logs_table.setMaximumHeight(180)
         self._configure_log_table(self.logs_table)
         self.logs_refresh_label = self.home_refresh_label
         self.dashboard_refresh_label = self.home_refresh_label
         layout.addWidget(self.logs_table, 1)
-        page.setMinimumHeight(850)
-        scroll = QScrollArea()
-        scroll.setObjectName("pageScroll")
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setWidget(page)
-        return scroll
+        return page
 
     def _build_send_page(self) -> QWidget:
         page, layout = self._standard_page("发邮件", "用户可手动选择任意位置的普通文件；MCP 和 CLI 仍受目录限制。")

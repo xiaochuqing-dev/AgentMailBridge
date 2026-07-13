@@ -9,7 +9,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QPoint, Qt
 from PySide6.QtWidgets import QApplication, QPushButton, QScrollArea
 
 from agent_mail_bridge.application_service import ApplicationService
@@ -168,6 +168,10 @@ def test_theme_icon_and_typography_tokens_are_formal(quality_window):
 def test_high_dpi_window_uses_bounded_geometry_and_scroll_fallbacks(quality_window):
     available = quality_window.screen().availableGeometry()
     assert quality_window.height() <= max(available.height(), quality_window.minimumHeight())
-    assert isinstance(quality_window.pages["inbox"], QScrollArea)
+    assert not isinstance(quality_window.pages["inbox"], QScrollArea)
     assert isinstance(quality_window.right_panel, QScrollArea)
-    assert quality_window.pages["inbox"].horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    assert quality_window.files_table.minimumHeight() == 110
+    assert quality_window.logs_table.minimumHeight() == 85
+    assert quality_window.logs_table.isVisible()
+    logs_bottom = quality_window.logs_table.mapTo(quality_window, QPoint(0, 0)).y() + quality_window.logs_table.height()
+    assert logs_bottom <= quality_window.height()

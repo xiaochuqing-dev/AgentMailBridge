@@ -72,7 +72,7 @@ def build_stylesheet(theme: str = "light") -> str:
     }}
     QWidget#titleBar, QWidget#sidebar, QWidget#rightPanelContent,
     QWidget#centralPanel, QWidget#pageSurface, QWidget#bodySurface,
-    QWidget#tabBar, QScrollArea#rightPanel, QScrollArea#pageScroll {{
+    QWidget#tabBar, QScrollArea#rightPanel {{
         background: #FFFFFF;
     }}
     QScrollArea#rightPanel, QWidget#rightPanelContent {{
