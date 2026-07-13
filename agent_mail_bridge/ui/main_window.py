@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QObject, QPoint, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, Signal, Slot
+from PySide6.QtCore import QEvent, QObject, QPoint, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QCloseEvent, QColor, QFont, QIcon, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -345,6 +345,22 @@ class BridgeWindow(QMainWindow):
                 ),
             )
 
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        """让文件表格上的垂直滚轮驱动收件页，避免嵌套滚动阻断下方日志。"""
+        if (
+            watched is getattr(self, "_inbox_page_wheel_source", None)
+            and event.type() == QEvent.Type.Wheel
+            and hasattr(self, "inbox_page_scroll")
+        ):
+            pixel_delta = event.pixelDelta().y()
+            page_delta = pixel_delta or int(event.angleDelta().y() / 120 * 72)
+            if page_delta:
+                bar = self.inbox_page_scroll.verticalScrollBar()
+                bar.setValue(bar.value() - page_delta)
+                event.accept()
+                return True
+        return super().eventFilter(watched, event)
+
     def _build(self) -> None:
         root = QWidget()
         root.setObjectName("windowRoot")
@@ -396,7 +412,7 @@ class BridgeWindow(QMainWindow):
         panel.setObjectName("sidebar")
         panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         _fill_background(panel, "#FFFFFF")
-        panel.setFixedWidth(238)
+        panel.setFixedWidth(220)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(10, 14, 10, 12)
         layout.setSpacing(8)
@@ -701,8 +717,8 @@ class BridgeWindow(QMainWindow):
             header_action_label="刷新",
         )
         # 收件页不使用外层滚动，避免文件表格截获滚轮后无法到达最近日志。
-        layout.setContentsMargins(24, 12, 22, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(24, 20, 22, 24)
+        layout.setSpacing(12)
         self.inbox_refresh_button = page.header_action_button
         self.inbox_refresh_button.clicked.connect(
             lambda: self.request_refresh(self.inbox_refresh_button)
@@ -710,7 +726,7 @@ class BridgeWindow(QMainWindow):
         status_card = QFrame()
         status_card.setObjectName("heroCard")
         status_layout = QHBoxLayout(status_card)
-        status_layout.setContentsMargins(14, 8, 14, 8)
+        status_layout.setContentsMargins(16, 12, 16, 12)
         status_layout.setSpacing(10)
         account_icon = QLabel()
         account_icon.setFixedSize(46, 46)
@@ -763,10 +779,10 @@ class BridgeWindow(QMainWindow):
         self.self_mail_check.hide()
         preference_card = QFrame()
         preference_card.setObjectName("card")
-        preference_row = QHBoxLayout()
-        preference_card.setLayout(preference_row)
-        preference_row.setContentsMargins(14, 7, 14, 7)
+        preference_row = QHBoxLayout(preference_card)
+        preference_row.setContentsMargins(16, 12, 16, 12)
         preference_text = QVBoxLayout()
+        preference_text.setSpacing(4)
         preference_title = QLabel("当前收件偏好")
         preference_title.setObjectName("fieldLabel")
         self.preference_summary_label = QLabel()
@@ -804,11 +820,12 @@ class BridgeWindow(QMainWindow):
         file_header.addWidget(open_button)
         layout.addLayout(file_header)
         self.files_table = DataTable(["文件名", "大小", "保存路径", "收取时间", "操作"])
-        self.files_table.setMinimumHeight(110)
+        self.files_table.setMinimumHeight(220)
+        self.files_table.setMaximumHeight(320)
         self.files_table.cellDoubleClicked.connect(self._preview_table_file)
         self._configure_file_table(self.files_table)
         self.inbox_table = self.files_table
-        layout.addWidget(self.files_table, 3)
+        layout.addWidget(self.files_table, 1)
 
         log_header = QHBoxLayout()
         log_title = QLabel("最近日志")
@@ -824,13 +841,23 @@ class BridgeWindow(QMainWindow):
         log_header.addWidget(manage_logs)
         layout.addLayout(log_header)
         self.logs_table = DataTable(["时间", "级别", "消息"])
-        self.logs_table.setMinimumHeight(85)
-        self.logs_table.setMaximumHeight(180)
+        self.logs_table.setMinimumHeight(220)
+        self.logs_table.setMaximumHeight(320)
         self._configure_log_table(self.logs_table)
         self.logs_refresh_label = self.home_refresh_label
         self.dashboard_refresh_label = self.home_refresh_label
         layout.addWidget(self.logs_table, 1)
-        return page
+        page.setMinimumHeight(1050)
+        scroll = QScrollArea()
+        scroll.setObjectName("pageScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        scroll.setWidget(page)
+        self.inbox_page_scroll = scroll
+        self._inbox_page_wheel_source = self.files_table.viewport()
+        self._inbox_page_wheel_source.installEventFilter(self)
+        return scroll
 
     def _build_send_page(self) -> QWidget:
         page, layout = self._standard_page("发邮件", "用户可手动选择任意位置的普通文件；MCP 和 CLI 仍受目录限制。")
@@ -1541,7 +1568,7 @@ class BridgeWindow(QMainWindow):
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setFixedWidth(350)
+        scroll.setFixedWidth(315)
         panel = QWidget()
         panel.setObjectName("rightPanelContent")
         panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
@@ -1659,9 +1686,12 @@ class BridgeWindow(QMainWindow):
             heading_row.addWidget(page.header_action_button)
         hint = QLabel(description)
         hint.setObjectName("hint")
+        separator = horizontal_line()
+        page.description_label = hint
+        page.header_separator = separator
         layout.addLayout(heading_row)
         layout.addWidget(hint)
-        layout.addWidget(horizontal_line())
+        layout.addWidget(separator)
         return page, layout
 
     def _field_edit(self, label: str, value: str, *, password: bool = False) -> tuple[QWidget, QLineEdit]:
@@ -1753,17 +1783,17 @@ class BridgeWindow(QMainWindow):
 
     def _configure_file_table(self, table: DataTable) -> None:
         header = table.horizontalHeader()
-        header.setMinimumSectionSize(80)
+        header.setMinimumSectionSize(55)
         header.setStretchLastSection(False)
         for column in range(5):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
-        table.setColumnWidth(0, 210)
-        table.setColumnWidth(1, 88)
-        table.setColumnWidth(2, 430)
-        table.setColumnWidth(3, 150)
-        table.setColumnWidth(4, 180)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        table.setColumnWidth(0, 155)
+        table.setColumnWidth(1, 60)
+        table.setColumnWidth(3, 125)
+        table.setColumnWidth(4, 150)
         table.setTextElideMode(Qt.TextElideMode.ElideNone)
-        table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
     def _configure_log_table(self, table: DataTable, *, full: bool = False) -> None:
         header = table.horizontalHeader()
@@ -2562,17 +2592,20 @@ class BridgeWindow(QMainWindow):
         for row_index, row in enumerate(rows):
             table.insertRow(row_index)
             path = str(row.get("path_display") or row.get("saved_path") or row.get("body_file_path") or "")
+            path_text = self._compact_table_path(path) if actions else path
             values = [
                 str(row.get("saved_filename") or Path(path).name or "未命名文件"),
                 format_size(row.get("size_now") if row.get("size_now") is not None else row.get("size_bytes")),
-                path,
+                path_text,
                 self._short_time(row.get("created_at") or row.get("received_at"), include_date=True),
                 "" if actions else str(row.get("status") or "saved"),
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setData(Qt.ItemDataRole.UserRole, path)
-                if column in {0, 2, 3}:
+                if column == 2:
+                    item.setToolTip(path)
+                elif column in {0, 3}:
                     item.setToolTip(value)
                 table.setItem(row_index, column, item)
             if actions:
@@ -2596,14 +2629,10 @@ class BridgeWindow(QMainWindow):
                 action_layout.addWidget(copy_button)
                 table.setCellWidget(row_index, 4, action_widget)
         if rows:
-            table.resizeColumnToContents(0)
-            table.resizeColumnToContents(1)
-            table.resizeColumnToContents(2)
-            table.resizeColumnToContents(3)
-            table.setColumnWidth(0, max(180, table.columnWidth(0)))
-            table.setColumnWidth(2, max(360, table.columnWidth(2)))
-            table.setColumnWidth(3, max(145, table.columnWidth(3)))
-            table.setColumnWidth(4, 180)
+            table.setColumnWidth(0, 155)
+            table.setColumnWidth(1, 60)
+            table.setColumnWidth(3, 125)
+            table.setColumnWidth(4, 150)
 
     def _populate_logs(self, table: DataTable, rows: list[dict]) -> None:
         table.setRowCount(0)
@@ -3484,6 +3513,17 @@ class BridgeWindow(QMainWindow):
         if include_date:
             return text[:19]
         return text[11:19] if len(text) >= 19 else text
+
+    @staticmethod
+    def _compact_table_path(value: str, visible_ratio: float = 0.30) -> str:
+        """表格仅显示约 30% 路径；完整值仍保留在数据、提示和操作中。"""
+        text = str(value or "")
+        if len(text) <= 30:
+            return text
+        keep = min(21, max(16, int(len(text) * visible_ratio)))
+        left = max(8, int(keep * 0.55))
+        right = max(6, keep - left)
+        return f"{text[:left]}…{text[-right:]}"
 
     @staticmethod
     def _level_color(level: str) -> str:

@@ -41,8 +41,8 @@ def bridge_window(qt_app, tmp_cfg):
 
 
 def test_formal_gui_uses_reference_three_column_layout(bridge_window):
-    assert bridge_window.sidebar.width() == 238
-    assert bridge_window.right_panel.width() == 350
+    assert bridge_window.sidebar.width() == 220
+    assert bridge_window.right_panel.width() == 315
     assert bridge_window.central_panel.width() >= 620
     assert set(bridge_window.pages) == {
         "inbox", "send", "history", "files_data", "settings", "advanced",

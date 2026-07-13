@@ -9,7 +9,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QEvent, QPoint, Qt
 from PySide6.QtWidgets import QApplication, QPushButton, QScrollArea
 
 from agent_mail_bridge.application_service import ApplicationService
@@ -70,7 +70,7 @@ def test_inbox_has_one_refresh_in_title_and_no_recent_log_refresh(quality_window
     assert not quality_window.inbox_refresh_button.icon().isNull()
 
 
-def test_file_table_keeps_complete_values_and_real_actions(quality_window, quality_app, tmp_path, monkeypatch):
+def test_file_table_compacts_path_but_keeps_complete_value_and_real_actions(quality_window, quality_app, tmp_path, monkeypatch):
     path = tmp_path / "很长但必须完整显示的收到文件名称.txt"
     path.write_text("preview", encoding="utf-8")
     row = {
@@ -84,10 +84,16 @@ def test_file_table_keeps_complete_values_and_real_actions(quality_window, quali
     quality_window._populate_files(quality_window.files_table, [row], actions=True)
     assert quality_window.files_table.textElideMode() == Qt.TextElideMode.ElideNone
     assert quality_window.files_table.item(0, 0).text() == path.name
-    assert quality_window.files_table.item(0, 2).text() == str(path)
+    displayed_path = quality_window.files_table.item(0, 2).text()
+    assert displayed_path == quality_window._compact_table_path(str(path))
+    assert len(displayed_path) <= int(len(str(path)) * 0.30) + 2
+    assert len(displayed_path) <= 22
+    assert quality_window.files_table.item(0, 2).data(Qt.ItemDataRole.UserRole) == str(path)
+    assert quality_window.files_table.item(0, 2).toolTip() == str(path)
     assert quality_window.files_table.item(0, 3).text() == "2026-07-13 12:34:56"
     assert "..." not in quality_window.files_table.item(0, 0).text()
-    assert "……" not in quality_window.files_table.item(0, 2).text()
+    assert displayed_path.count("…") == 1
+    assert quality_window.files_table.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
 
     action_widget = quality_window.files_table.cellWidget(0, 4)
     buttons = {button.text(): button for button in action_widget.findChildren(QPushButton)}
@@ -168,10 +174,35 @@ def test_theme_icon_and_typography_tokens_are_formal(quality_window):
 def test_high_dpi_window_uses_bounded_geometry_and_scroll_fallbacks(quality_window):
     available = quality_window.screen().availableGeometry()
     assert quality_window.height() <= max(available.height(), quality_window.minimumHeight())
-    assert not isinstance(quality_window.pages["inbox"], QScrollArea)
+    assert isinstance(quality_window.pages["inbox"], QScrollArea)
     assert isinstance(quality_window.right_panel, QScrollArea)
-    assert quality_window.files_table.minimumHeight() == 110
-    assert quality_window.logs_table.minimumHeight() == 85
+    assert quality_window.files_table.minimumHeight() == 220
+    assert quality_window.logs_table.minimumHeight() == 220
     assert quality_window.logs_table.isVisible()
-    logs_bottom = quality_window.logs_table.mapTo(quality_window, QPoint(0, 0)).y() + quality_window.logs_table.height()
-    assert logs_bottom <= quality_window.height()
+    assert quality_window.pages["inbox"].verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOn
+    page_bar = quality_window.pages["inbox"].verticalScrollBar()
+    assert page_bar.maximum() > 0
+
+    class WheelDown:
+        accepted = False
+
+        @staticmethod
+        def type():
+            return QEvent.Type.Wheel
+
+        @staticmethod
+        def pixelDelta():
+            return QPoint()
+
+        @staticmethod
+        def angleDelta():
+            return QPoint(0, -120)
+
+        def accept(self):
+            self.accepted = True
+
+    page_bar.setValue(0)
+    wheel = WheelDown()
+    assert quality_window.eventFilter(quality_window.files_table.viewport(), wheel)
+    assert wheel.accepted
+    assert page_bar.value() > 0
