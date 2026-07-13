@@ -17,21 +17,43 @@ SUCCESS = "#18A957"
 SUCCESS_SOFT = "#ECFAF1"
 WARNING = "#E59A24"
 DANGER = "#D84A56"
+FONT_FAMILY = "Microsoft YaHei UI"
+
+# Qt 样式表不支持 CSS line-height；行高由控件高度与布局间距落实。
+TYPOGRAPHY = {
+    "app_title": {"size": 18, "weight": 700, "line_height": 26},
+    "page_title": {"size": 18, "weight": 700, "line_height": 27},
+    "section_title": {"size": 15, "weight": 700, "line_height": 23},
+    "card_title": {"size": 13, "weight": 700, "line_height": 21},
+    "body": {"size": 12, "weight": 400, "line_height": 20},
+    "secondary_body": {"size": 11, "weight": 400, "line_height": 18},
+    "caption": {"size": 10, "weight": 400, "line_height": 16},
+    "button": {"size": 12, "weight": 400, "line_height": 20},
+    "table_header": {"size": 11, "weight": 700, "line_height": 18},
+    "table_cell": {"size": 11, "weight": 400, "line_height": 18},
+    "status": {"size": 10, "weight": 700, "line_height": 16},
+}
+_INTERFACE_FONT_IDS: list[int] = []
 
 
 def load_interface_font() -> QFont:
     """选择 Windows 原生清晰字体，避免重复加载造成字体回退不稳定。"""
-    candidates = (
-        (Path("C:/Windows/Fonts/msyh.ttc"), "Microsoft YaHei UI"),
-        (Path("C:/Windows/Fonts/NotoSansSC-VF.ttf"), "Noto Sans SC"),
+    if not _INTERFACE_FONT_IDS:
+        for path in (
+            Path("C:/Windows/Fonts/msyh.ttc"),
+            Path("C:/Windows/Fonts/msyhbd.ttc"),
+        ):
+            if path.exists():
+                font_id = QFontDatabase.addApplicationFont(str(path))
+                if font_id >= 0:
+                    _INTERFACE_FONT_IDS.append(font_id)
+    installed = set(QFontDatabase.families())
+    family = FONT_FAMILY if FONT_FAMILY in installed else "Segoe UI"
+    font = QFont(family, 10, QFont.Weight.Normal)
+    font.setStyleStrategy(
+        QFont.StyleStrategy.PreferAntialias | QFont.StyleStrategy.PreferQuality
     )
-    for path, family in candidates:
-        if path.exists() and QFontDatabase.addApplicationFont(str(path)) >= 0:
-            font = QFont(family, 10)
-            font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
-            return font
-    font = QFont("Microsoft YaHei UI", 10)
-    font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+    font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
     return font
 
 
@@ -39,7 +61,9 @@ def build_stylesheet(theme: str = "light") -> str:
     """生成指定的全局主题样式。"""
     base = f"""
     * {{
-        font-family: "Noto Sans SC", "Microsoft YaHei UI", "Segoe UI";
+        font-family: "Microsoft YaHei UI";
+        font-size: 12px;
+        font-weight: 400;
         color: {TEXT};
         outline: none;
     }}
@@ -77,11 +101,11 @@ def build_stylesheet(theme: str = "light") -> str:
         font-weight: 700;
     }}
     QLabel#sectionTitle {{
-        font-size: 16px;
+        font-size: 15px;
         font-weight: 700;
     }}
     QLabel#pageTitle {{
-        font-size: 17px;
+        font-size: 18px;
         font-weight: 700;
     }}
     QLabel#minorTitle {{
@@ -96,7 +120,7 @@ def build_stylesheet(theme: str = "light") -> str:
         color: #555A68;
         font-size: 12px;
     }}
-    QLabel#sendFileValue {{ font-size: 12px; font-weight: 600; }}
+    QLabel#sendFileValue {{ font-size: 12px; font-weight: 700; }}
     QLabel#successText {{ color: {SUCCESS}; font-weight: 700; }}
     QLabel#errorText {{ color: {DANGER}; }}
     QLabel#purpleText {{ color: {PURPLE}; font-weight: 700; }}
@@ -164,6 +188,18 @@ def build_stylesheet(theme: str = "light") -> str:
         border: 1px solid {BORDER};
         border-radius: 10px;
     }}
+    QFrame#healthItem {{
+        background: #FBFBFE;
+        border: 1px solid #ECEEF4;
+        border-radius: 8px;
+    }}
+    QLabel#healthName {{ font-size: 11px; font-weight: 700; color: #343744; }}
+    QLabel#healthState {{ font-size: 10px; font-weight: 700; color: {TEXT_MUTED}; }}
+    QLabel#healthState[healthState="normal"] {{ color: {SUCCESS}; }}
+    QLabel#healthState[healthState="partial"] {{ color: #A76500; }}
+    QLabel#healthState[healthState="fault"] {{ color: {DANGER}; }}
+    QLabel#healthDetail {{ font-size: 10px; color: #565C6B; }}
+    QLabel#healthChecked {{ font-size: 9px; color: {TEXT_MUTED}; }}
     QFrame#statPurple {{
         background: #F5F2FF;
         border: 1px solid #EEE9FF;
@@ -196,6 +232,7 @@ def build_stylesheet(theme: str = "light") -> str:
         background: #FAF9FF;
     }}
     QPushButton:pressed {{ background: {PURPLE_SOFT}; }}
+    QPushButton:focus {{ border: 1px solid {PURPLE}; }}
     QPushButton:disabled {{
         color: #AFB2BC;
         background: #F4F5F7;
@@ -227,9 +264,13 @@ def build_stylesheet(theme: str = "light") -> str:
         font-weight: 700;
         border: none;
         background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 {PURPLE}, stop:1 #7247F6);
+                    stop:0 {PURPLE}, stop:1 #2E86DE);
     }}
-    QPushButton#primaryButton:hover {{ background: {PURPLE_DARK}; }}
+    QPushButton#primaryButton:hover {{
+        background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {PURPLE_DARK}, stop:1 #2478C8);
+    }}
+    QPushButton#primaryButton:pressed {{ background: #4930D9; }}
     QPushButton#outlinePurple {{
         color: {PURPLE};
         font-weight: 700;
@@ -244,7 +285,7 @@ def build_stylesheet(theme: str = "light") -> str:
         background: #FFFFFF;
         padding: 12px 16px;
         font-size: 12px;
-        font-weight: 600;
+        font-weight: 700;
     }}
     QPushButton#accountChoice:hover {{
         color: {PURPLE};
@@ -259,10 +300,23 @@ def build_stylesheet(theme: str = "light") -> str:
     QPushButton#textButton {{
         color: {PURPLE};
         font-weight: 700;
-        border: none;
-        background: transparent;
-        padding: 4px;
+        border: 1px solid #E2DEFA;
+        border-radius: 6px;
+        background: #F9F8FF;
+        padding: 5px 9px;
     }}
+    QPushButton#textButton:hover {{ border-color: #B8ADF5; background: {PURPLE_SOFT}; }}
+    QPushButton#compactButton {{
+        min-height: 26px;
+        color: #4A3CB3;
+        background: #F5F3FF;
+        border: 1px solid #DDD7FA;
+        border-radius: 5px;
+        padding: 3px 8px;
+        font-size: 10px;
+        font-weight: 700;
+    }}
+    QPushButton#compactButton:hover {{ background: #EDE9FF; border-color: #A99AF2; }}
     QPushButton#titleButton {{
         border: none;
         border-radius: 4px;
@@ -302,7 +356,7 @@ def build_stylesheet(theme: str = "light") -> str:
         background: transparent;
         padding: 15px 18px 12px 18px;
         font-size: 12px;
-        font-weight: 600;
+        font-weight: 700;
     }}
     QPushButton#tabButton:hover {{ color: {PURPLE}; background: transparent; }}
     QPushButton#tabButton:checked {{
@@ -322,6 +376,12 @@ def build_stylesheet(theme: str = "light") -> str:
     QTextEdit {{ padding: 8px; }}
     QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{
         border: 1px solid #8E7AF4;
+    }}
+    QLineEdit#inboxSearch {{
+        min-height: 36px;
+        padding-left: 8px;
+        border-radius: 7px;
+        background: #FBFBFE;
     }}
     QComboBox::drop-down {{ border: none; width: 26px; }}
     QComboBox QAbstractItemView {{
@@ -354,6 +414,7 @@ def build_stylesheet(theme: str = "light") -> str:
         selection-color: {TEXT};
     }}
     QTableWidget::item {{ padding: 5px 6px; border-bottom: 1px solid #F0F1F4; }}
+    QTableWidget::item:hover {{ background: #F7F5FF; }}
     QHeaderView::section {{
         color: #777C8B;
         background: #F4F5F8;
@@ -361,12 +422,15 @@ def build_stylesheet(theme: str = "light") -> str:
         border-bottom: 1px solid {BORDER};
         padding: 6px;
         font-size: 11px;
-        font-weight: 600;
+        font-weight: 700;
         text-align: left;
     }}
     QScrollBar:vertical {{ width: 7px; background: transparent; margin: 1px; }}
     QScrollBar::handle:vertical {{ background: #D7D9E1; border-radius: 3px; min-height: 28px; }}
     QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+    QScrollBar:horizontal {{ height: 9px; background: #F5F6F9; margin: 1px; }}
+    QScrollBar::handle:horizontal {{ background: #C9CCD6; border-radius: 4px; min-width: 32px; }}
+    QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
     QScrollArea {{ border: none; background: #FFFFFF; }}
     QProgressBar {{
         border: none;
@@ -397,14 +461,14 @@ def build_stylesheet(theme: str = "light") -> str:
     QWidget#sidebar, QWidget#titleBar, QWidget#tabBar {{ border-color: #343746; }}
     QLabel#fieldLabel, QLabel#muted, QLabel#hint {{ color: #AEB4C5; }}
     QLabel#statusName, QLabel#statusValue, QLabel#tipText, QLabel#statNumber,
-    QLabel#statCaption {{ color: #C7CBD8; }}
+    QLabel#statCaption, QLabel#healthName, QLabel#healthDetail {{ color: #C7CBD8; }}
     QFrame#card, QLineEdit, QComboBox, QSpinBox, QTextEdit, QTableWidget,
     QHeaderView::section, QComboBox QAbstractItemView {{
         background: #222532;
         border-color: #3A3E50;
     }}
     QFrame#heroCard, QFrame#statPurple, QFrame#statGreen,
-    QFrame#statBlue, QFrame#statRed {{
+    QFrame#statBlue, QFrame#statRed, QFrame#healthItem {{
         background: #242736;
         border-color: #3A3E50;
     }}
@@ -415,7 +479,8 @@ def build_stylesheet(theme: str = "light") -> str:
     QPushButton {{ background: #292C3A; border-color: #42465A; }}
     QPushButton:hover, QPushButton#titleButton:hover {{ background: #35394B; }}
     QPushButton#outlinePurple {{ background: #242736; }}
-    QPushButton#textButton, QPushButton#tabButton, QPushButton#navButton {{ background: transparent; }}
+    QPushButton#textButton, QPushButton#compactButton {{ background: #292C3A; border-color: #4A4E63; }}
+    QPushButton#tabButton, QPushButton#navButton {{ background: transparent; }}
     QPushButton#navButton, QPushButton#tabButton {{ color: #C7CBD8; }}
     QScrollBar::handle:vertical {{ background: #555A6C; }}
     """

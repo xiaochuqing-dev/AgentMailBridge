@@ -35,6 +35,15 @@ Use `runtime_paths.py`. Frozen program files are read-only under the install dir
 - Do not add duplicate routes for an existing account or application capability.
 - Every new backend capability must be assigned to account, receive, send, files/data, settings, advanced, automatic, or CLI-only ownership before adding UI.
 
+## UI quality invariants
+
+- Do not use Emoji or Unicode symbols as formal application icons; use the shared linear icon system.
+- Clickable actions must use real button controls, not ordinary QLabel text styled as links.
+- `no_changes` is a successful neutral check result and must never increment failure/error statistics.
+- `partial` must remain a warning with successful work preserved; it must not be reported as an overall failure.
+- File tables must not hide core filename, path, time or action information with generated ellipses.
+- New UI must pass Windows screenshot QA at 100%, 125% and 150% DPI, including the supported dark theme.
+
 ## Development commands
 
 ```powershell

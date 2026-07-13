@@ -80,7 +80,7 @@ def test_user_provided_provider_assets_are_packaged_and_readable():
 def test_settings_is_primary_and_advanced_has_no_duplicate_account_or_mcp(v1_window):
     settings_text = _all_text(v1_window.pages["settings"])
     advanced_text = _all_text(v1_window.pages["advanced"])
-    assert "高级设置 →" in settings_text
+    assert "高级设置" in settings_text
     assert "QQ SMTP 授权码" not in advanced_text
     assert "Gmail IMAP 应用专用密码" not in advanced_text
     assert "Agent 接口配置" not in advanced_text

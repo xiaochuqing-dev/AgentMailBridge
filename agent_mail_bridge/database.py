@@ -509,9 +509,12 @@ def query_received_files_by_date(
     with _get_conn(db_path) as conn:
         rows = conn.execute(
             """
-            SELECT * FROM received_files
-            WHERE saved_date = ?
-            ORDER BY id ASC
+            SELECT files.*, messages.subject AS subject
+            FROM received_files AS files
+            LEFT JOIN received_messages AS messages
+                ON messages.message_id = files.message_id
+            WHERE files.saved_date = ?
+            ORDER BY files.id ASC
             """,
             (saved_date,),
         ).fetchall()

@@ -9,14 +9,16 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QObject, QPoint, QRunnable, QSettings, Qt, QThreadPool, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, QPoint, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QCloseEvent, QColor, QFont, QIcon, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
+    QButtonGroup,
     QComboBox,
     QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -28,6 +30,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QProgressBar,
+    QRadioButton,
     QScrollArea,
     QSystemTrayIcon,
     QMenu,
@@ -73,6 +76,7 @@ from agent_mail_bridge.ui.theme import (
 from agent_mail_bridge.ui.widgets import (
     AccountCard,
     DataTable,
+    HealthStatusRow,
     MessageBar,
     NavButton,
     StatCard,
@@ -234,11 +238,13 @@ class TitleBar(QWidget):
     def set_theme(self, theme: str) -> None:
         """用清晰图标显示下一次可切换的主题。"""
         if theme == "dark":
-            self.theme_button.setText("☀")
+            self.theme_button.setIcon(QIcon(line_icon_pixmap("sun", 18, "#D8DBE8")))
             self.theme_button.setToolTip("切换为浅色模式")
         else:
-            self.theme_button.setText("☾")
+            self.theme_button.setIcon(QIcon(line_icon_pixmap("moon", 18, "#555B69")))
             self.theme_button.setToolTip("切换为深色模式")
+        self.theme_button.setText("")
+        self.theme_button.setIconSize(QSize(18, 18))
 
     def _toggle_maximized(self) -> None:
         if self.window_ref.isMaximized():
@@ -584,7 +590,8 @@ class BridgeWindow(QMainWindow):
         rule_label.setObjectName("fieldLabel")
         self.self_mail_check = QCheckBox("仅收取本人 Gmail 且重要的邮件")
         self.self_mail_check.setChecked(self.service.cfg.auto_receive_only_self_mail)
-        help_label = QLabel("ⓘ")
+        help_label = QLabel()
+        help_label.setPixmap(line_icon_pixmap("info", 16, PURPLE))
         help_label.setToolTip("只接收可信 Gmail 自发自收邮件，避免结果邮件形成循环")
         help_label.setStyleSheet(f"color: {TEXT_MUTED};")
         rule_row.addWidget(rule_label)
@@ -643,7 +650,7 @@ class BridgeWindow(QMainWindow):
         self.files_table.cellClicked.connect(self._file_action_clicked)
         self._configure_file_table(self.files_table)
         layout.addWidget(self.files_table)
-        file_note = QLabel("ⓘ  文件接收后会自动按规则保存至此目录；危险附件只保存并标记，不会自动执行。")
+        file_note = QLabel("文件接收后会自动按规则保存至此目录；危险附件只保存并标记，不会自动执行。")
         file_note.setObjectName("hint")
         layout.addWidget(file_note)
         layout.addWidget(horizontal_line())
@@ -657,7 +664,7 @@ class BridgeWindow(QMainWindow):
         self.home_refresh_button.clicked.connect(
             lambda: self.request_refresh(self.home_refresh_button)
         )
-        more_logs = self._button("查看更多日志  →", lambda: self.select_page("logs"), text_only=True)
+        more_logs = self._button("查看更多日志", lambda: self.select_page("logs"), text_only=True)
         log_header.addWidget(log_title)
         log_header.addStretch(1)
         log_header.addWidget(self.home_refresh_label)
@@ -676,6 +683,11 @@ class BridgeWindow(QMainWindow):
         page, layout = self._standard_page(
             "收件",
             "日常收件工作台；邮箱地址、OAuth 和 IMAP 凭据请通过左侧 Gmail 账号卡片管理。",
+            header_action_label="刷新",
+        )
+        self.inbox_refresh_button = page.header_action_button
+        self.inbox_refresh_button.clicked.connect(
+            lambda: self.request_refresh(self.inbox_refresh_button)
         )
         status_card = QFrame()
         status_card.setObjectName("heroCard")
@@ -720,30 +732,36 @@ class BridgeWindow(QMainWindow):
         tools.addWidget(self.interval_combo)
         tools.addStretch(1)
         self.inbox_test_button = self._button("测试当前连接", self.test_connection)
-        receive = self._button("立即收取", self.receive, primary=True)
-        self.health_check_button = self._button("一键检查", self.run_all_connection_diagnostics, outline=True)
+        receive = self._button("立即收取", self.receive, primary=True, icon_kind="mail")
         self.receive_button = receive
-        self.inbox_refresh_button = self._button("刷新")
-        self.logs_refresh_button = self.inbox_refresh_button
-        self.inbox_refresh_button.clicked.connect(
-            lambda: self.request_refresh(self.inbox_refresh_button)
-        )
-        self.task_buttons.extend((self.inbox_test_button, receive, self.health_check_button))
+        self.task_buttons.extend((self.inbox_test_button, receive))
         self.manual_receive_buttons.append(receive)
         tools.addWidget(self.inbox_test_button)
         tools.addWidget(receive)
-        tools.addWidget(self.health_check_button)
-        tools.addWidget(self.inbox_refresh_button)
         layout.addLayout(tools)
 
-        self.self_mail_check = QCheckBox("仅收取本人 Gmail 且重要的邮件")
+        self.self_mail_check = QCheckBox(page)
         self.self_mail_check.setChecked(self.service.cfg.auto_receive_only_self_mail)
-        self.self_mail_check.setToolTip("避免结果邮件形成循环；修改后点击保存收件偏好")
+        self.self_mail_check.hide()
+        preference_card = QFrame()
+        preference_card.setObjectName("card")
         preference_row = QHBoxLayout()
-        preference_row.addWidget(self.self_mail_check)
+        preference_card.setLayout(preference_row)
+        preference_row.setContentsMargins(14, 10, 14, 10)
+        preference_text = QVBoxLayout()
+        preference_title = QLabel("当前收件偏好")
+        preference_title.setObjectName("fieldLabel")
+        self.preference_summary_label = QLabel()
+        self.preference_summary_label.setObjectName("minorTitle")
+        preference_text.addWidget(preference_title)
+        preference_text.addWidget(self.preference_summary_label)
+        preference_row.addLayout(preference_text)
         preference_row.addStretch(1)
-        preference_row.addWidget(self._button("保存收件偏好", self.save_receive_preferences, text_only=True))
-        layout.addLayout(preference_row)
+        preference_row.addWidget(
+            self._button("编辑偏好", self.open_receive_preferences_editor, outline=True)
+        )
+        layout.addWidget(preference_card)
+        self._update_receive_preference_summary()
 
         self.message_bar = MessageBar()
         layout.addWidget(self.message_bar)
@@ -751,19 +769,25 @@ class BridgeWindow(QMainWindow):
         file_title = QLabel("今日收到文件")
         file_title.setObjectName("sectionTitle")
         self.inbox_search = QLineEdit()
-        self.inbox_search.setPlaceholderText("搜索文件名或保存路径")
-        self.inbox_search.setMaximumWidth(260)
+        self.inbox_search.setObjectName("inboxSearch")
+        self.inbox_search.setPlaceholderText("搜索收到的文件")
+        self.inbox_search.setClearButtonEnabled(True)
+        self.inbox_search.addAction(
+            QIcon(line_icon_pixmap("search", 17, TEXT_MUTED)),
+            QLineEdit.ActionPosition.LeadingPosition,
+        )
+        self.inbox_search.setMinimumWidth(330)
+        self.inbox_search.setMaximumWidth(460)
         self.inbox_search.textChanged.connect(self._filter_inbox)
-        open_button = self._button("打开今日接收文件夹", self.open_today_folder)
+        open_button = self._button("打开今日接收文件夹", self.open_today_folder, icon_kind="file")
         file_header.addWidget(file_title)
         file_header.addStretch(1)
         file_header.addWidget(self.inbox_search)
         file_header.addWidget(open_button)
         layout.addLayout(file_header)
-        self.files_table = DataTable(["文件名", "大小", "保存路径", "收取时间", "状态 / 操作"])
+        self.files_table = DataTable(["文件名", "大小", "保存路径", "收取时间", "操作"])
         self.files_table.setMinimumHeight(250)
         self.files_table.cellDoubleClicked.connect(self._preview_table_file)
-        self.files_table.cellClicked.connect(self._file_action_clicked)
         self._configure_file_table(self.files_table)
         self.inbox_table = self.files_table
         layout.addWidget(self.files_table, 3)
@@ -775,15 +799,10 @@ class BridgeWindow(QMainWindow):
         self.home_refresh_label.setObjectName("hint")
         self.home_refresh_label.setMinimumWidth(130)
         self.home_refresh_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.logs_refresh_button = self._button("刷新", text_only=True)
-        self.logs_refresh_button.clicked.connect(
-            lambda: self.request_refresh(self.logs_refresh_button)
-        )
-        manage_logs = self._button("管理日志", lambda: self.select_page("logs"), text_only=True)
+        manage_logs = self._button("管理日志", lambda: self.select_page("logs"), outline=True)
         log_header.addWidget(log_title)
         log_header.addStretch(1)
         log_header.addWidget(self.home_refresh_label)
-        log_header.addWidget(self.logs_refresh_button)
         log_header.addWidget(manage_logs)
         layout.addLayout(log_header)
         self.logs_table = DataTable(["时间", "级别", "消息"])
@@ -956,7 +975,7 @@ class BridgeWindow(QMainWindow):
         overview_layout.addWidget(overview_title)
         overview_layout.addWidget(self.data_overview_label, 1)
         overview_layout.addWidget(
-            self._button("数据维护与备份 →", lambda: self.select_page("maintenance"), outline=True)
+            self._button("数据维护与备份", lambda: self.select_page("maintenance"), outline=True)
         )
         layout.addWidget(overview)
         return page
@@ -1019,7 +1038,7 @@ class BridgeWindow(QMainWindow):
         advanced_text.addWidget(advanced_title)
         advanced_text.addWidget(advanced_hint)
         advanced_layout.addLayout(advanced_text, 1)
-        advanced_layout.addWidget(self._button("高级设置 →", lambda: self.select_page("advanced"), outline=True))
+        advanced_layout.addWidget(self._button("高级设置", lambda: self.select_page("advanced"), outline=True))
         layout.addWidget(advanced_card)
         layout.addStretch(1)
         return page
@@ -1079,7 +1098,7 @@ class BridgeWindow(QMainWindow):
         for row, (name, path) in enumerate(path_specs):
             name_label = QLabel(name)
             name_label.setObjectName("fieldLabel")
-            status = QLabel("✓ 可用" if path.exists() else "○ 尚未创建")
+            status = QLabel("可用" if path.exists() else "尚未创建")
             status.setObjectName("successText" if path.exists() else "hint")
             button = self._button("打开目录", lambda checked=False, target=path: self.open_managed_directory(target))
             self.path_status_labels[name] = status
@@ -1503,7 +1522,7 @@ class BridgeWindow(QMainWindow):
         panel.setObjectName("rightPanel")
         panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         _fill_background(panel, "#FCFCFE")
-        panel.setFixedWidth(330)
+        panel.setFixedWidth(350)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(20, 24, 20, 18)
         layout.setSpacing(12)
@@ -1535,7 +1554,7 @@ class BridgeWindow(QMainWindow):
         stats = QGridLayout()
         stats.setSpacing(9)
         self.stat_cards = {
-            "received": StatCard("statPurple", line_icon_pixmap("mail", 28, PURPLE), "收取附件", PURPLE),
+            "received": StatCard("statPurple", line_icon_pixmap("mail", 28, PURPLE), "收取邮件", PURPLE),
             "saved": StatCard("statGreen", line_icon_pixmap("calendar", 28, SUCCESS), "保存文件", SUCCESS),
             "sent": StatCard("statBlue", line_icon_pixmap("send", 28, "#2394C8"), "发送邮件", "#2394C8"),
             "errors": StatCard("statRed", line_icon_pixmap("warning", 28, WARNING), "失败 / 错误", DANGER),
@@ -1551,32 +1570,50 @@ class BridgeWindow(QMainWindow):
         health_layout.setContentsMargins(12, 11, 12, 11)
         health_title = QLabel("连接健康")
         health_title.setObjectName("minorTitle")
-        self.health_summary_label = QLabel("尚未运行一键检查")
+        self.health_summary_label = QLabel("5 项尚未检查")
         self.health_summary_label.setObjectName("hint")
         self.health_summary_label.setWordWrap(True)
-        health_actions = QHBoxLayout()
-        health_actions.addWidget(self._button("一键检查", self.run_all_connection_diagnostics, outline=True))
-        self.health_fix_button = self._button("去处理", self.go_to_health_issue, text_only=True)
-        self.health_fix_button.hide()
-        health_actions.addWidget(self.health_fix_button)
-        health_actions.addStretch(1)
         health_layout.addWidget(health_title)
         health_layout.addWidget(self.health_summary_label)
-        health_layout.addLayout(health_actions)
+        self.health_rows: dict[str, HealthStatusRow] = {}
+        health_specs = (
+            ("Gmail 收件", "mail", "gmail"),
+            ("QQ SMTP", "send", "qq"),
+            ("Agent / MCP", "terminal", "agent"),
+            ("凭据 / OAuth", "key", "credentials"),
+            ("SQLite / 数据目录", "database", "files_data"),
+        )
+        for name, icon_kind, target in health_specs:
+            row = HealthStatusRow(icon_kind, name, target)
+            row.fix_requested.connect(self.go_to_health_target)
+            self.health_rows[name] = row
+            health_layout.addWidget(row)
+        self.health_check_button = self._button(
+            "一键检查全部",
+            self.run_all_connection_diagnostics,
+            primary=True,
+            icon_kind="shield",
+        )
+        self.task_buttons.append(self.health_check_button)
+        health_layout.addWidget(self.health_check_button)
         layout.addWidget(health_card)
 
         tips_title = QLabel("快捷提示")
         tips_title.setObjectName("sectionTitle")
         layout.addWidget(tips_title)
-        layout.addWidget(TipRow(provider_icon("gmail"), "Gmail 只按当前收件规则接收并保存邮件附件。", PURPLE))
-        layout.addWidget(TipRow(provider_icon("qq"), "QQ 发件始终发送到绑定的固定 Gmail。", "#329BC5"))
-        layout.addWidget(TipRow(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogInfoView), "低频技术选项位于“设置 > 高级设置”。", WARNING))
-        help_button = self._button("查看帮助文档  →", self._show_help, text_only=True)
+        layout.addWidget(TipRow(provider_icon("gmail"), "收件范围可通过“编辑偏好”调整。", PURPLE))
+        layout.addWidget(TipRow(provider_icon("qq"), "QQ 发件固定发送到绑定的 Gmail。", "#329BC5"))
+        help_button = self._button("查看帮助文档", self._show_help, text_only=True)
         layout.addWidget(help_button, 0, Qt.AlignmentFlag.AlignLeft)
-        layout.addStretch(1)
         return panel
 
-    def _standard_page(self, title: str, description: str) -> tuple[QWidget, QVBoxLayout]:
+    def _standard_page(
+        self,
+        title: str,
+        description: str,
+        *,
+        header_action_label: str | None = None,
+    ) -> tuple[QWidget, QVBoxLayout]:
         page = QWidget()
         page.setObjectName("pageSurface")
         page.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
@@ -1584,11 +1621,21 @@ class BridgeWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(24, 20, 22, 20)
         layout.setSpacing(12)
+        heading_row = QHBoxLayout()
         heading = QLabel(title)
         heading.setObjectName("pageTitle")
+        heading_row.addWidget(heading)
+        heading_row.addStretch(1)
+        if header_action_label:
+            page.header_action_button = self._button(
+                header_action_label,
+                outline=True,
+                icon_kind="refresh",
+            )
+            heading_row.addWidget(page.header_action_button)
         hint = QLabel(description)
         hint.setObjectName("hint")
-        layout.addWidget(heading)
+        layout.addLayout(heading_row)
         layout.addWidget(hint)
         layout.addWidget(horizontal_line())
         return page, layout
@@ -1663,6 +1710,7 @@ class BridgeWindow(QMainWindow):
         primary: bool = False,
         outline: bool = False,
         text_only: bool = False,
+        icon_kind: str | None = None,
     ) -> QPushButton:
         button = QPushButton(label)
         if primary:
@@ -1672,17 +1720,26 @@ class BridgeWindow(QMainWindow):
         elif text_only:
             button.setObjectName("textButton")
         button.setCursor(Qt.CursorShape.PointingHandCursor)
+        if icon_kind:
+            button.setIcon(QIcon(line_icon_pixmap(icon_kind, 15, PURPLE)))
+            button.setIconSize(QSize(15, 15))
         if callback is not None:
             button.clicked.connect(callback)
         return button
 
     def _configure_file_table(self, table: DataTable) -> None:
         header = table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setMinimumSectionSize(80)
+        header.setStretchLastSection(False)
+        for column in range(5):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
+        table.setColumnWidth(0, 210)
+        table.setColumnWidth(1, 88)
+        table.setColumnWidth(2, 430)
+        table.setColumnWidth(3, 150)
+        table.setColumnWidth(4, 180)
+        table.setTextElideMode(Qt.TextElideMode.ElideNone)
+        table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
     def _configure_log_table(self, table: DataTable, *, full: bool = False) -> None:
         header = table.horizontalHeader()
@@ -1765,7 +1822,69 @@ class BridgeWindow(QMainWindow):
             self.show_message(f"保存收件偏好失败：{exc}", "error")
             return
         self.service.cfg.auto_receive_only_self_mail = self.self_mail_check.isChecked()
+        self._update_receive_preference_summary()
         self.show_message("收件偏好已保存", "success")
+
+    def _update_receive_preference_summary(self) -> None:
+        if not hasattr(self, "preference_summary_label"):
+            return
+        summary = (
+            "仅本人邮件"
+            if self.self_mail_check.isChecked()
+            else "当前收件范围内的全部邮件"
+        )
+        self.preference_summary_label.setText(f"当前：{summary}")
+
+    def open_receive_preferences_editor(self) -> None:
+        """用小型对话框编辑 API 与 IMAP 共用的收件范围。"""
+        dialog = QDialog(self)
+        dialog.setObjectName("receivePreferencesDialog")
+        dialog.setWindowTitle("编辑收件偏好")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(480)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(10)
+
+        title = QLabel("选择要保存的邮件范围")
+        title.setObjectName("sectionTitle")
+        layout.addWidget(title)
+        only_self = QRadioButton("仅本人邮件（推荐）")
+        only_self.setToolTip("只保存当前 Gmail 发给当前 Gmail 的可信邮件")
+        all_scanned = QRadioButton("当前收件范围内的全部邮件")
+        all_scanned.setToolTip("仍受查询范围、单次限制和去重规则约束")
+        group = QButtonGroup(dialog)
+        group.addButton(only_self)
+        group.addButton(all_scanned)
+        only_self.setChecked(self.self_mail_check.isChecked())
+        all_scanned.setChecked(not self.self_mail_check.isChecked())
+        layout.addWidget(only_self)
+        layout.addWidget(all_scanned)
+        note = QLabel("手动立即收取与自动收取、Gmail API 与 Gmail IMAP 均使用此设置。")
+        note.setObjectName("hint")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        only_self_enabled = only_self.isChecked()
+        if self.self_mail_check.isChecked() and not only_self_enabled:
+            QMessageBox.information(
+                self,
+                "收件范围已扩大",
+                "关闭“仅本人邮件”后，AgentMailBridge 会保存当前收件后端扫描到的其他邮件，请确认这符合你的使用需求。",
+            )
+        self.self_mail_check.setChecked(only_self_enabled)
+        self.save_receive_preferences()
 
     def receive(self) -> None:
         if self.auto_switch.isChecked():
@@ -2084,6 +2203,7 @@ class BridgeWindow(QMainWindow):
             {
                 "name": "Gmail 收件",
                 "ok": receive_result.ok,
+                "state": "normal" if receive_result.ok else "fault",
                 "message": receive_result.message or receive_result.error_code,
                 "target": "gmail",
             }
@@ -2093,13 +2213,20 @@ class BridgeWindow(QMainWindow):
             if self.service.cfg.qq_email and self.service.cfg.qq_auth_code
             else ServiceResult(OperationStatus.FAILED, error_code="qq_not_configured", message="QQ SMTP 未配置")
         )
-        checks.append({"name": "QQ SMTP", "ok": qq_result.ok, "message": qq_result.message, "target": "qq"})
+        checks.append({
+            "name": "QQ SMTP",
+            "ok": qq_result.ok,
+            "state": "normal" if qq_result.ok else "partial" if qq_result.error_code == "qq_not_configured" else "fault",
+            "message": qq_result.message,
+            "target": "qq",
+        })
         command, _ = mcp_launch()
         mcp_ok = not get_runtime_paths().frozen or Path(command).is_file()
         checks.append({
             "name": "Agent / MCP",
             "ok": mcp_ok and bool(self.service.cfg.owner_gmail) and bool(self.service.cfg.effective_allowed_send_roots),
-            "message": "stdio 组件与安全边界正常" if mcp_ok else "内部 MCP 组件缺失",
+            "state": "normal" if mcp_ok and self.service.cfg.owner_gmail and self.service.cfg.effective_allowed_send_roots else "partial" if mcp_ok else "fault",
+            "message": "stdio 组件与安全边界正常" if mcp_ok and self.service.cfg.owner_gmail and self.service.cfg.effective_allowed_send_roots else "请检查固定收件人、允许目录或内部组件",
             "target": "agent",
         })
         status = self.service.get_config_and_connection_status().details
@@ -2111,6 +2238,7 @@ class BridgeWindow(QMainWindow):
         checks.append({
             "name": "凭据 / OAuth",
             "ok": bool(active_auth_ok and status.get("qq_smtp") == "configured"),
+            "state": "normal" if active_auth_ok and status.get("qq_smtp") == "configured" else "partial",
             "message": "当前凭据状态完整" if active_auth_ok else "当前收件认证未就绪",
             "target": "gmail" if not active_auth_ok else "qq",
         })
@@ -2119,13 +2247,15 @@ class BridgeWindow(QMainWindow):
         checks.append({
             "name": "SQLite / 数据目录",
             "ok": database_ok and self.service.cfg.data_root_path.exists(),
+            "state": "normal" if database_ok and self.service.cfg.data_root_path.exists() else "fault",
             "message": "数据库与数据目录正常" if database_ok else maintenance.message or "数据库检查失败",
             "target": "files_data",
         })
         failed = [item for item in checks if not item["ok"]]
         if failed:
+            status_value = OperationStatus.FAILED if len(failed) == len(checks) else OperationStatus.PARTIAL
             return ServiceResult(
-                OperationStatus.FAILED,
+                status_value,
                 error_code="health_check_failed",
                 message=f"{len(checks) - len(failed)}/{len(checks)} 项正常",
                 details={"checks": checks, "target": failed[0]["target"]},
@@ -2138,22 +2268,37 @@ class BridgeWindow(QMainWindow):
 
     def _show_health_check_result(self, result: ServiceResult) -> None:
         checks = result.details.get("checks", [])
-        summary = " · ".join(f"{'✓' if item.get('ok') else '✕'} {item.get('name')}" for item in checks)
-        self.health_summary_label.setText(summary or result.message)
+        checked_at = datetime.now().strftime("%H:%M:%S")
+        passed = sum(1 for item in checks if item.get("ok"))
+        self.health_summary_label.setText(
+            f"最近检查 {checked_at} · {passed}/{len(checks)} 项正常"
+            if checks else result.message
+        )
         self.health_summary_label.setToolTip("\n".join(
             f"{item.get('name')}：{item.get('message')}" for item in checks
         ))
+        for item in checks:
+            row = self.health_rows.get(str(item.get("name")))
+            if row is not None:
+                row.target = str(item.get("target") or row.target)
+                row.set_status(
+                    str(item.get("state") or ("normal" if item.get("ok") else "fault")),
+                    str(item.get("message") or "未提供检查说明"),
+                    checked_at,
+                )
         self.health_fix_target = str(result.details.get("target") or "")
-        self.health_fix_button.setVisible(bool(self.health_fix_target))
         self._show_service_result(result)
 
     def go_to_health_issue(self) -> None:
-        if self.health_fix_target == "gmail":
+        self.go_to_health_target(self.health_fix_target)
+
+    def go_to_health_target(self, target: str) -> None:
+        if target in {"gmail", "credentials"}:
             self.open_account(AccountTypeDialog.GMAIL)
-        elif self.health_fix_target == "qq":
+        elif target == "qq":
             self.open_account(AccountTypeDialog.QQ)
-        elif self.health_fix_target in {"agent", "files_data"}:
-            self.select_page(self.health_fix_target)
+        elif target in {"agent", "files_data"}:
+            self.select_page(target)
 
     def run_mcp_self_check(self) -> None:
         command, _ = mcp_launch()
@@ -2306,6 +2451,8 @@ class BridgeWindow(QMainWindow):
             self.gmail_card.set_configured(bool(cfg.gmail_address))
             self.qq_card.set_configured(bool(cfg.qq_email))
             self.receive_account_label.setText(cfg.gmail_address or "尚未配置 Gmail 收件账号")
+            self.self_mail_check.setChecked(cfg.auto_receive_only_self_mail)
+            self._update_receive_preference_summary()
             self.recipient_edit.setText(cfg.owner_gmail or cfg.gmail_address)
             self._set_combo_data(self.network_combo, cfg.gmail_network_mode)
         finally:
@@ -2365,8 +2512,23 @@ class BridgeWindow(QMainWindow):
 
         today = datetime.now().strftime("%Y-%m-%d")
         sent_today = sum(1 for row in self.history_rows.get("sent", []) if str(row.get("sent_at", "")).startswith(today) and row.get("status") in {"sent", "success"})
-        error_today = sum(1 for row in self.log_rows if str(row.get("created_at", "")).startswith(today) and str(row.get("level", "")).upper() in {"ERROR", "FAILED"})
-        self.stat_cards["received"].set_count(len(self.file_rows))
+        error_today = sum(
+            1
+            for row in self.log_rows
+            if str(row.get("created_at", "")).startswith(today)
+            and (
+                str(row.get("level", "")).upper() in {"ERROR", "FAILED"}
+                or (
+                    str(row.get("level", "")).upper() == "WARNING"
+                    and str(row.get("event_type", "")).lower() == "receive"
+                    and "失败" in str(row.get("message", ""))
+                )
+            )
+        )
+        received_message_ids = {
+            str(row.get("message_id")) for row in self.file_rows if row.get("message_id")
+        }
+        self.stat_cards["received"].set_count(len(received_message_ids))
         self.stat_cards["saved"].set_count(sum(1 for row in self.file_rows if row.get("status") in {"saved", "ok", "normal"}))
         self.stat_cards["sent"].set_count(sent_today)
         self.stat_cards["errors"].set_count(error_today)
@@ -2375,20 +2537,49 @@ class BridgeWindow(QMainWindow):
         table.setRowCount(0)
         for row_index, row in enumerate(rows):
             table.insertRow(row_index)
-            path = str(row.get("saved_path") or row.get("body_file_path") or "")
+            path = str(row.get("path_display") or row.get("saved_path") or row.get("body_file_path") or "")
             values = [
                 str(row.get("saved_filename") or Path(path).name or "未命名文件"),
-                format_size(row.get("size_bytes")),
+                format_size(row.get("size_now") if row.get("size_now") is not None else row.get("size_bytes")),
                 path,
-                self._short_time(row.get("created_at") or row.get("received_at")),
-                "复制路径" if actions else str(row.get("status") or "saved"),
+                self._short_time(row.get("created_at") or row.get("received_at"), include_date=True),
+                "" if actions else str(row.get("status") or "saved"),
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setData(Qt.ItemDataRole.UserRole, path)
-                if column == 4 and actions:
-                    item.setForeground(QColor(PURPLE))
+                if column in {0, 2, 3}:
+                    item.setToolTip(value)
                 table.setItem(row_index, column, item)
+            if actions:
+                action_widget = QWidget()
+                action_widget.setObjectName("tableActions")
+                action_layout = QHBoxLayout(action_widget)
+                action_layout.setContentsMargins(4, 2, 4, 2)
+                action_layout.setSpacing(5)
+                open_button = self._button(
+                    "打开",
+                    lambda checked=False, value=path: self._open_received_file(value),
+                    icon_kind="open",
+                )
+                open_button.setObjectName("compactButton")
+                copy_button = self._button("复制路径", icon_kind="copy")
+                copy_button.setObjectName("compactButton")
+                copy_button.clicked.connect(
+                    lambda checked=False, button=copy_button, value=path: self._copy_received_path(button, value)
+                )
+                action_layout.addWidget(open_button)
+                action_layout.addWidget(copy_button)
+                table.setCellWidget(row_index, 4, action_widget)
+        if rows:
+            table.resizeColumnToContents(0)
+            table.resizeColumnToContents(1)
+            table.resizeColumnToContents(2)
+            table.resizeColumnToContents(3)
+            table.setColumnWidth(0, max(180, table.columnWidth(0)))
+            table.setColumnWidth(2, max(360, table.columnWidth(2)))
+            table.setColumnWidth(3, max(145, table.columnWidth(3)))
+            table.setColumnWidth(4, 180)
 
     def _populate_logs(self, table: DataTable, rows: list[dict]) -> None:
         table.setRowCount(0)
@@ -2539,6 +2730,7 @@ class BridgeWindow(QMainWindow):
                 row for row in self.file_rows
                 if keyword in str(row.get("saved_filename", "")).lower()
                 or keyword in str(row.get("saved_path", "")).lower()
+                or keyword in str(row.get("subject", "")).lower()
             ]
         self._populate_files(self.inbox_table, rows, actions=True)
 
@@ -2779,21 +2971,41 @@ class BridgeWindow(QMainWindow):
 
     def _show_receive_result(self, result: ServiceResult) -> None:
         if isinstance(result, ReceiveResult):
-            summary = (
-                f"收件完成：扫描 {result.scanned}，保存 {result.saved}，"
-                f"重复 {result.duplicates}，失败 {result.failed}"
-            )
             if result.status in {OperationStatus.FAILED, OperationStatus.AUTH_REQUIRED}:
                 reason = result.message or (result.errors[0] if result.errors else result.error_code)
-                message = f"收件失败：{reason or '原因未知'}；{summary}"
+                message = f"收件失败：{reason or '原因未知'}"
             elif result.status == OperationStatus.PARTIAL:
                 reason = result.message or (result.errors[0] if result.errors else "部分邮件处理失败")
-                message = f"{summary}；{reason}"
+                message = (
+                    f"收件部分完成：已保存 {result.saved} 封邮件，"
+                    f"但 {result.failed} 项处理失败；{reason}"
+                )
+            elif result.status == OperationStatus.NO_CHANGES or (
+                result.status == OperationStatus.SUCCESS
+                and result.saved == 0
+                and result.failed == 0
+            ):
+                message = "检查完成，暂时没有新邮件"
             else:
-                message = summary
+                file_count = len(result.saved_files) or result.saved + result.attachments
+                message = f"收取完成：新增 {result.saved} 封邮件，保存 {file_count} 个文件"
         else:
             message = result.message or result.status.value
-        kind = "warning" if result.status == OperationStatus.PARTIAL else "success" if result.ok else "error"
+        kind = (
+            "warning"
+            if result.status == OperationStatus.PARTIAL
+            else "normal"
+            if result.status == OperationStatus.NO_CHANGES
+            or (
+                isinstance(result, ReceiveResult)
+                and result.status == OperationStatus.SUCCESS
+                and result.saved == 0
+                and result.failed == 0
+            )
+            else "success"
+            if result.ok
+            else "error"
+        )
         self.show_message(message, kind)
         if not result.ok:
             self.last_error_details = self._redact_error_details(message)
@@ -2841,6 +3053,8 @@ class BridgeWindow(QMainWindow):
             self.error_details_button.setEnabled(True)
         if result.status in {OperationStatus.PARTIAL, OperationStatus.DUPLICATE, OperationStatus.CANCELLED}:
             kind = "warning"
+        elif result.status == OperationStatus.NO_CHANGES:
+            kind = "normal"
         else:
             kind = "success" if result.ok else "error"
         self.show_message(message, kind)
@@ -3041,13 +3255,42 @@ class BridgeWindow(QMainWindow):
             self._preview_path(str(item.data(Qt.ItemDataRole.UserRole) or ""))
 
     def _file_action_clicked(self, row: int, column: int) -> None:
-        if column != 4:
+        """兼容旧调用；文件操作现由单元格内真实按钮完成。"""
+        del row, column
+
+    def _open_received_file(self, raw_path: str) -> None:
+        path = Path(raw_path)
+        try:
+            assert_within_allowed_roots(path, [self.service.cfg.data_root_path])
+        except SecurityError:
+            self.show_message("已阻止打开 DATA_ROOT 之外的文件", "error")
             return
-        item = self.files_table.item(row, 0)
-        if item:
-            path = str(item.data(Qt.ItemDataRole.UserRole) or "")
-            QApplication.clipboard().setText(path)
-            self.show_message("文件路径已复制；双击该行可安全预览", "success")
+        if not path.exists() or not path.is_file():
+            self.show_message("文件不存在或已移动，无法打开", "error")
+            return
+        try:
+            os.startfile(str(path))
+        except OSError as exc:
+            self.show_message(f"打开文件失败：{exc}", "error")
+            return
+        self.show_message("已使用 Windows 默认程序打开文件", "success")
+
+    def _copy_received_path(self, button: QPushButton, path: str) -> None:
+        if not path:
+            self.show_message("文件路径不可用", "error")
+            return
+        QApplication.clipboard().setText(path)
+        original = button.text()
+        button.setText("已复制")
+        button.setEnabled(False)
+        self.show_message("完整文件路径已复制", "success")
+
+        def restore() -> None:
+            if not self.closed:
+                button.setText(original)
+                button.setEnabled(True)
+
+        QTimer.singleShot(1200, restore)
 
     def _preview_path(self, raw_path: str) -> None:
         if not raw_path:

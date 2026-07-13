@@ -247,6 +247,8 @@ class ApplicationService:
                 status = OperationStatus.PARTIAL
             elif failures or not raw.get("ok", True):
                 status = OperationStatus.FAILED
+            elif saved == 0:
+                status = OperationStatus.NO_CHANGES
             else:
                 status = OperationStatus.SUCCESS
             return ReceiveResult(
@@ -267,6 +269,7 @@ class ApplicationService:
                 ),
                 message=(
                     "收件完成" if status == OperationStatus.SUCCESS
+                    else "检查完成，暂时没有新邮件" if status == OperationStatus.NO_CHANGES
                     else errors[0] if errors else "收件存在错误"
                 ),
             )

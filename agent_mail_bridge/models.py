@@ -11,6 +11,7 @@ class OperationStatus(StrEnum):
     """核心操作统一状态。"""
 
     SUCCESS = "success"
+    NO_CHANGES = "no_changes"
     PARTIAL = "partial"
     FAILED = "failed"
     AUTH_REQUIRED = "auth_required"
@@ -30,7 +31,11 @@ class ServiceResult:
 
     @property
     def ok(self) -> bool:
-        return self.status in {OperationStatus.SUCCESS, OperationStatus.PARTIAL}
+        return self.status in {
+            OperationStatus.SUCCESS,
+            OperationStatus.NO_CHANGES,
+            OperationStatus.PARTIAL,
+        }
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

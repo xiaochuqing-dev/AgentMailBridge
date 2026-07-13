@@ -24,6 +24,7 @@ from agent_mail_bridge.ui.theme import (
     SUCCESS,
     TEXT,
     TEXT_MUTED,
+    WARNING,
 )
 
 
@@ -133,6 +134,50 @@ def line_icon_pixmap(kind: str, size: int = 20, color: str = PURPLE) -> QPixmap:
         painter.drawEllipse(rect)
         painter.drawLine(QPointF(size / 2, size * 0.44), QPointF(size / 2, size * 0.72))
         painter.drawPoint(QPointF(size / 2, size * 0.3))
+    elif kind == "search":
+        painter.drawEllipse(QRectF(size * 0.16, size * 0.14, size * 0.5, size * 0.5))
+        painter.drawLine(QPointF(size * 0.6, size * 0.6), QPointF(size * 0.86, size * 0.86))
+    elif kind == "refresh":
+        painter.drawArc(QRectF(size * 0.16, size * 0.16, size * 0.68, size * 0.68), 35 * 16, 280 * 16)
+        painter.drawLine(QPointF(size * 0.72, size * 0.13), QPointF(size * 0.85, size * 0.18))
+        painter.drawLine(QPointF(size * 0.85, size * 0.18), QPointF(size * 0.8, size * 0.32))
+    elif kind == "file":
+        path = QPainterPath(QPointF(size * 0.27, size * 0.1))
+        path.lineTo(size * 0.62, size * 0.1)
+        path.lineTo(size * 0.78, size * 0.27)
+        path.lineTo(size * 0.78, size * 0.88)
+        path.lineTo(size * 0.27, size * 0.88)
+        path.closeSubpath()
+        painter.drawPath(path)
+        painter.drawLine(QPointF(size * 0.61, size * 0.1), QPointF(size * 0.61, size * 0.29))
+        painter.drawLine(QPointF(size * 0.61, size * 0.29), QPointF(size * 0.78, size * 0.29))
+    elif kind == "open":
+        painter.drawRoundedRect(QRectF(size * 0.12, size * 0.24, size * 0.64, size * 0.62), size * 0.05, size * 0.05)
+        painter.drawLine(QPointF(size * 0.46, size * 0.54), QPointF(size * 0.88, size * 0.12))
+        painter.drawLine(QPointF(size * 0.62, size * 0.12), QPointF(size * 0.88, size * 0.12))
+        painter.drawLine(QPointF(size * 0.88, size * 0.12), QPointF(size * 0.88, size * 0.38))
+    elif kind == "copy":
+        painter.drawRoundedRect(QRectF(size * 0.28, size * 0.26, size * 0.58, size * 0.6), size * 0.06, size * 0.06)
+        painter.drawRoundedRect(QRectF(size * 0.12, size * 0.1, size * 0.58, size * 0.6), size * 0.06, size * 0.06)
+    elif kind == "moon":
+        path = QPainterPath(QPointF(size * 0.68, size * 0.12))
+        path.cubicTo(size * 0.34, size * 0.18, size * 0.24, size * 0.63, size * 0.54, size * 0.82)
+        path.cubicTo(size * 0.71, size * 0.93, size * 0.86, size * 0.84, size * 0.9, size * 0.76)
+        path.cubicTo(size * 0.55, size * 0.78, size * 0.42, size * 0.35, size * 0.68, size * 0.12)
+        painter.drawPath(path)
+    elif kind == "sun":
+        painter.drawEllipse(QRectF(size * 0.34, size * 0.34, size * 0.32, size * 0.32))
+        for x1, y1, x2, y2 in ((0.5, 0.08, 0.5, 0.23), (0.5, 0.77, 0.5, 0.92), (0.08, 0.5, 0.23, 0.5), (0.77, 0.5, 0.92, 0.5), (0.2, 0.2, 0.3, 0.3), (0.7, 0.7, 0.8, 0.8), (0.8, 0.2, 0.7, 0.3), (0.3, 0.7, 0.2, 0.8)):
+            painter.drawLine(QPointF(size * x1, size * y1), QPointF(size * x2, size * y2))
+    elif kind == "key":
+        painter.drawEllipse(QRectF(size * 0.1, size * 0.18, size * 0.42, size * 0.42))
+        painter.drawLine(QPointF(size * 0.46, size * 0.52), QPointF(size * 0.88, size * 0.86))
+        painter.drawLine(QPointF(size * 0.69, size * 0.7), QPointF(size * 0.77, size * 0.61))
+    elif kind == "terminal":
+        painter.drawRoundedRect(rect, size * 0.08, size * 0.08)
+        painter.drawLine(QPointF(size * 0.28, size * 0.38), QPointF(size * 0.42, size * 0.5))
+        painter.drawLine(QPointF(size * 0.42, size * 0.5), QPointF(size * 0.28, size * 0.62))
+        painter.drawLine(QPointF(size * 0.5, size * 0.66), QPointF(size * 0.7, size * 0.66))
     painter.end()
     return pixmap
 
@@ -275,6 +320,76 @@ class StatusRow(QWidget):
         self.value_label.style().polish(self.value_label)
 
 
+class HealthStatusRow(QFrame):
+    """可扫描、可跳转的单项连接健康状态。"""
+
+    fix_requested = Signal(str)
+
+    def __init__(self, icon_kind: str, title: str, target: str):
+        super().__init__()
+        self.setObjectName("healthItem")
+        self.icon_kind = icon_kind
+        self.target = target
+        self.setMinimumHeight(54)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(9, 7, 8, 7)
+        layout.setSpacing(9)
+
+        self.icon_label = QLabel()
+        self.icon_label.setFixedSize(22, 22)
+        self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.icon_label, 0, Qt.AlignmentFlag.AlignTop)
+
+        content = QVBoxLayout()
+        content.setSpacing(1)
+        title_row = QHBoxLayout()
+        title_row.setSpacing(6)
+        self.title_label = QLabel(title)
+        self.title_label.setObjectName("healthName")
+        self.state_label = QLabel("未检查")
+        self.state_label.setObjectName("healthState")
+        title_row.addWidget(self.title_label)
+        title_row.addStretch(1)
+        title_row.addWidget(self.state_label)
+        content.addLayout(title_row)
+        self.detail_label = QLabel("尚未运行检查")
+        self.detail_label.setObjectName("healthDetail")
+        content.addWidget(self.detail_label)
+        self.checked_label = QLabel("最近检查：—")
+        self.checked_label.setObjectName("healthChecked")
+        self.checked_label.hide()
+        layout.addLayout(content, 1)
+
+        self.fix_button = QPushButton("去处理")
+        self.fix_button.setObjectName("compactButton")
+        self.fix_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.fix_button.clicked.connect(lambda: self.fix_requested.emit(self.target))
+        self.fix_button.hide()
+        layout.addWidget(self.fix_button, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.set_status("unchecked", "尚未运行检查")
+
+    def set_status(self, state: str, detail: str, checked_at: str = "—") -> None:
+        normalized = state if state in {"normal", "partial", "fault", "unchecked"} else "unchecked"
+        labels = {
+            "normal": ("正常", SUCCESS),
+            "partial": ("部分异常", WARNING),
+            "fault": ("故障", DANGER),
+            "unchecked": ("未检查", TEXT_MUTED),
+        }
+        text, color = labels[normalized]
+        self.state_label.setText(text)
+        self.state_label.setProperty("healthState", normalized)
+        self.state_label.style().unpolish(self.state_label)
+        self.state_label.style().polish(self.state_label)
+        detail_text = detail or "未提供检查说明"
+        recent_text = checked_at or "—"
+        self.detail_label.setText(f"{detail_text} · 最近检查 {recent_text}")
+        self.detail_label.setToolTip(detail or "")
+        self.checked_label.setText(f"最近检查：{recent_text}")
+        self.icon_label.setPixmap(line_icon_pixmap(self.icon_kind, 18, color))
+        self.fix_button.setVisible(normalized in {"partial", "fault"})
+
+
 class StatCard(QFrame):
     """今日统计卡片。"""
 
@@ -295,7 +410,7 @@ class StatCard(QFrame):
             icon_label.setStyleSheet(f"color: {color}; font-size: 21px;")
         self.number = QLabel("0")
         self.number.setObjectName("statNumber")
-        self.number.setStyleSheet("font-size: 24px; font-weight: 500;")
+        self.number.setStyleSheet("font-size: 24px; font-weight: 400;")
         number_row.addWidget(icon_label)
         number_row.addSpacing(6)
         number_row.addWidget(self.number)
@@ -390,7 +505,7 @@ class MessageBar(QFrame):
         self.setStyleSheet(
             f"QFrame {{ background: {background}; border: 1px solid {BORDER}; border-radius: 5px; }}"
         )
-        self.label.setStyleSheet(f"color: {foreground}; font-size: 10px; font-weight: 600;")
+        self.label.setStyleSheet(f"color: {foreground}; font-size: 10px; font-weight: 700;")
         self.label.setText(text)
         self.label.setToolTip(text)
 

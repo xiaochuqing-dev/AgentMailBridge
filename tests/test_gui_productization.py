@@ -10,7 +10,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtGui import QImage
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QPushButton
 
 from agent_mail_bridge.application_service import ApplicationService
 from agent_mail_bridge.models import OperationStatus, ReceiveResult, ServiceResult
@@ -81,7 +81,12 @@ def test_file_action_text_matches_real_click_behavior(product_window):
         [{"saved_filename": "result.md", "saved_path": "C:/safe/result.md"}],
         actions=True,
     )
-    assert product_window.files_table.item(0, 4).text() == "复制路径"
+    action_widget = product_window.files_table.cellWidget(0, 4)
+    assert action_widget is not None
+    assert {button.text() for button in action_widget.findChildren(QPushButton)} == {
+        "打开",
+        "复制路径",
+    }
 
 
 def test_brand_asset_contract_has_stable_expected_paths():

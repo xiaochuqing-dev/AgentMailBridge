@@ -223,9 +223,9 @@ def _receive_via_imap(
                 _process_one_unified(conn, uid, cfg, mark_seen, result)
             except Exception as exc:  # noqa: BLE001
                 err = f"处理邮件 uid={uid.decode(errors='replace')} 失败：{exc}"
-                logger.exception("处理邮件失败")
-                logger.error(err)
-                log_event(cfg.db_path, "ERROR", "receive", err)
+                logger.warning("处理邮件失败", exc_info=True)
+                logger.warning(err)
+                log_event(cfg.db_path, "WARNING", "receive", err)
                 result["errors"].append(err)
                 result["failed"] += 1
 

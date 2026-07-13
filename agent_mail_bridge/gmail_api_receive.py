@@ -149,9 +149,9 @@ def receive_gmail_api_messages(
             )
         except Exception as exc:  # noqa: BLE001
             err = f"处理 Gmail API 邮件 id={gmail_message_id} 失败：{exc}"
-            logger.exception("处理 Gmail API 邮件失败")
-            logger.error(err)
-            log_event(cfg.db_path, "ERROR", "receive", err)
+            logger.warning("处理 Gmail API 邮件失败", exc_info=True)
+            logger.warning(err)
+            log_event(cfg.db_path, "WARNING", "receive", err)
             result["errors"].append(err)
             result["failed"] += 1
 
