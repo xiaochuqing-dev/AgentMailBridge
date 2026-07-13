@@ -44,6 +44,16 @@ Use `runtime_paths.py`. Frozen program files are read-only under the install dir
 - File tables must not hide core filename, path, time or action information with generated ellipses.
 - New UI must pass Windows screenshot QA at 100%, 125% and 150% DPI, including the supported dark theme.
 
+## History and managed-file invariants
+
+- `received_messages` is business history; `received_files` is the authoritative source for real received files.
+- File management must never derive file sizes from business-history rows.
+- Main tables must not display meaningless truncated absolute paths; keep complete paths in DTOs, details and explicit copy/open actions.
+- Receive rules must execute in the shared Gmail API/IMAP business-processing layer, and new rules must preserve legacy configuration semantics.
+- History and file management have separate responsibilities: history explains business actions, while Files & Data manages stored objects and maintenance.
+- User-facing statuses must be productized and localized; raw statuses remain available only in structured details where useful.
+- Unknown file size and a real zero-byte file are distinct states and must never share the same display value.
+
 ## Development commands
 
 ```powershell

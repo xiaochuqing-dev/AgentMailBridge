@@ -11,19 +11,18 @@ from agent_mail_bridge.database import store_received_message_atomically
 from agent_mail_bridge.mail_common import (
     NormalizedMail,
     fallback_dedup_key,
-    is_trusted_self_mail,
     normalize_message_id,
 )
+from agent_mail_bridge.receive_rules import match_receive_rule
 from agent_mail_bridge.security import assert_within_root
 from agent_mail_bridge.utils import sanitize_filename, sha256_of_bytes, split_ext
 
 
 def process_normalized_mail(cfg: AppConfig, mail: NormalizedMail) -> dict[str, Any]:
     """处理两个后端共同的业务规则并返回结构化单封结果。"""
-    if cfg.auto_receive_only_self_mail and not is_trusted_self_mail(
-        cfg.gmail_address, mail.from_raw, mail.to_raw, mail.cc_raw
-    ):
-        return {"status": "skipped", "reason": "untrusted_source", "saved_files": []}
+    matched, reason = match_receive_rule(cfg, mail)
+    if not matched:
+        return {"status": "skipped", "reason": reason, "saved_files": []}
 
     message_id = normalize_message_id(mail.message_id)
     if not message_id:

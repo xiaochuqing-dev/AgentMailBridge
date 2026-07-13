@@ -565,6 +565,25 @@ def query_all_received_files(db_path: Path | str) -> list[dict[str, Any]]:
         return [dict(r) for r in rows]
 
 
+def query_all_received_files_with_messages(
+    db_path: Path | str,
+) -> list[dict[str, Any]]:
+    """文件管理使用的真实收件文件查询，并关联业务主题和后端。"""
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT files.*, messages.subject AS subject,
+                   messages.source AS message_source,
+                   messages.backend AS message_backend
+            FROM received_files AS files
+            LEFT JOIN received_messages AS messages
+                ON messages.message_id = files.message_id
+            ORDER BY files.id DESC
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
 # ============================================================
 # sent_files
 # ============================================================

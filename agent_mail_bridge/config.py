@@ -15,6 +15,14 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from agent_mail_bridge.receive_rules import (
+    ALL_SCANNED,
+    SELF_ONLY,
+    VALID_MODES,
+    normalize_sender_rules,
+    normalize_subject_keywords,
+)
+
 from agent_mail_bridge.runtime_paths import get_runtime_paths
 
 try:
@@ -171,6 +179,10 @@ class AppConfig:
 
     # --- 收件规则 ---
     auto_receive_only_self_mail: bool = True
+    receive_rule_mode: str = ""
+    receive_rule_senders: tuple[str, ...] = field(default_factory=tuple)
+    receive_rule_subject_keywords: tuple[str, ...] = field(default_factory=tuple)
+    receive_rule_require_attachment: bool = False
     max_fetch_limit: int = 30
     receive_unseen_only: bool = False
     receive_mark_seen: bool = False
@@ -181,6 +193,22 @@ class AppConfig:
 
     # --- 日志 ---
     log_level: str = "INFO"
+
+    def __post_init__(self) -> None:
+        """旧布尔配置无损映射到新模式，并归一化非敏感规则。"""
+        if not self.receive_rule_mode:
+            self.receive_rule_mode = (
+                SELF_ONLY if self.auto_receive_only_self_mail else ALL_SCANNED
+            )
+        if self.receive_rule_mode not in VALID_MODES:
+            raise ConfigError(
+                f"RECEIVE_RULE_MODE 取值非法：{self.receive_rule_mode!r}"
+            )
+        self.auto_receive_only_self_mail = self.receive_rule_mode == SELF_ONLY
+        self.receive_rule_senders = normalize_sender_rules(self.receive_rule_senders)
+        self.receive_rule_subject_keywords = normalize_subject_keywords(
+            self.receive_rule_subject_keywords
+        )
 
     @property
     def data_root_path(self) -> Path:
@@ -264,6 +292,10 @@ class AppConfig:
             "data_root": str(self.data_root_path),
             "allowed_send_roots": [str(item) for item in self.effective_allowed_send_roots],
             "auto_receive_only_self_mail": self.auto_receive_only_self_mail,
+            "receive_rule_mode": self.receive_rule_mode,
+            "receive_rule_senders": list(self.receive_rule_senders),
+            "receive_rule_subject_keywords": list(self.receive_rule_subject_keywords),
+            "receive_rule_require_attachment": self.receive_rule_require_attachment,
             "max_fetch_limit": self.max_fetch_limit,
             "receive_unseen_only": self.receive_unseen_only,
             "receive_mark_seen": self.receive_mark_seen,
@@ -338,6 +370,11 @@ def load_config(env_path: Path | str | None = None) -> AppConfig:
         if runtime.frozen else "secrets/token.json"
     )
 
+    legacy_only_self = _as_bool(os.getenv("AUTO_RECEIVE_ONLY_SELF_MAIL"), True)
+    receive_rule_mode = os.getenv("RECEIVE_RULE_MODE", "").strip().lower()
+    if not receive_rule_mode:
+        receive_rule_mode = SELF_ONLY if legacy_only_self else ALL_SCANNED
+
     cfg = AppConfig(
         gmail_address=os.getenv("GMAIL_ADDRESS", "").strip(),
         gmail_app_password=secure_secrets.get(
@@ -401,8 +438,16 @@ def load_config(env_path: Path | str | None = None) -> AppConfig:
         owner_gmail=os.getenv("OWNER_GMAIL", "").strip(),
         data_root=data_root,
         allowed_send_roots=allowed_send_roots,
-        auto_receive_only_self_mail=_as_bool(
-            os.getenv("AUTO_RECEIVE_ONLY_SELF_MAIL"), True
+        auto_receive_only_self_mail=legacy_only_self,
+        receive_rule_mode=receive_rule_mode,
+        receive_rule_senders=normalize_sender_rules(
+            os.getenv("RECEIVE_RULE_SENDERS", "")
+        ),
+        receive_rule_subject_keywords=normalize_subject_keywords(
+            os.getenv("RECEIVE_RULE_SUBJECT_KEYWORDS", "")
+        ),
+        receive_rule_require_attachment=_as_bool(
+            os.getenv("RECEIVE_RULE_REQUIRE_ATTACHMENT"), False
         ),
         max_fetch_limit=_as_int(os.getenv("MAX_FETCH_LIMIT"), 30),
         receive_unseen_only=_as_bool(os.getenv("RECEIVE_UNSEEN_ONLY"), False),

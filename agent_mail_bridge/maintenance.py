@@ -232,6 +232,7 @@ def data_statistics(cfg: AppConfig) -> dict[str, Any]:
         }
     finally:
         connection.close()
+    backups = list_database_backups(cfg)
     return {
         "database_size_bytes": cfg.db_path.stat().st_size if cfg.db_path.exists() else 0,
         "integrity_check": integrity,
@@ -240,7 +241,10 @@ def data_statistics(cfg: AppConfig) -> dict[str, Any]:
         "send": folder_state(cfg.send_dir),
         "sent": folder_state(cfg.sent_dir),
         "logs": folder_state(cfg.logs_dir),
-        "backups": list_database_backups(cfg),
+        "backups": backups,
+        "backups_size_bytes": sum(
+            int(item.get("size_bytes") or 0) for item in backups
+        ),
     }
 
 

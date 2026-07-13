@@ -24,6 +24,8 @@ def isolate_local_secrets(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     sensitive_names = (
         "GMAIL_ADDRESS", "GMAIL_APP_PASSWORD", "QQ_EMAIL", "QQ_AUTH_CODE",
         "OWNER_GMAIL", "GMAIL_API_SCOPES", "ALLOWED_SEND_ROOTS",
+        "RECEIVE_RULE_MODE", "RECEIVE_RULE_SENDERS",
+        "RECEIVE_RULE_SUBJECT_KEYWORDS", "RECEIVE_RULE_REQUIRE_ATTACHMENT",
     )
     for name in sensitive_names:
         monkeypatch.delenv(name, raising=False)

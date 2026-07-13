@@ -188,6 +188,16 @@ def build_stylesheet(theme: str = "light") -> str:
         border: 1px solid {BORDER};
         border-radius: 10px;
     }}
+    QFrame#overviewMetric {{
+        background: #F8F9FC;
+        border: 1px solid #ECEEF4;
+        border-radius: 7px;
+    }}
+    QLabel#overviewValue {{
+        color: #343744;
+        font-size: 13px;
+        font-weight: 700;
+    }}
     QFrame#healthItem {{
         background: #FBFBFE;
         border: 1px solid #ECEEF4;
@@ -469,14 +479,23 @@ def build_stylesheet(theme: str = "light") -> str:
         background: #222532;
         border-color: #3A3E50;
     }}
-    QFrame#heroCard, QFrame#statPurple, QFrame#statGreen,
+    QFrame#heroCard, QFrame#overviewMetric, QFrame#statPurple, QFrame#statGreen,
     QFrame#statBlue, QFrame#statRed, QFrame#healthItem {{
         background: #242736;
         border-color: #3A3E50;
     }}
+    QLineEdit#inboxSearch {{ background: #222532; border-color: #3A3E50; }}
+    QLabel#overviewValue {{ color: #E8EAF2; }}
     QFrame#navCard {{ background: #222532; border-color: #3A3E50; }}
     QFrame#separator {{ background: #343746; }}
-    QTableWidget {{ alternate-background-color: #1D202C; gridline-color: #343746; }}
+    QTableWidget {{
+        alternate-background-color: #1D202C;
+        gridline-color: #343746;
+        selection-background-color: #30354B;
+        selection-color: #E8EAF2;
+    }}
+    QTableWidget::item {{ border-bottom-color: #343746; }}
+    QTableWidget::item:selected {{ background: #30354B; color: #E8EAF2; }}
     QHeaderView::section {{ color: #BFC4D3; }}
     QPushButton {{ background: #292C3A; border-color: #42465A; }}
     QPushButton:hover, QPushButton#titleButton:hover {{ background: #35394B; }}

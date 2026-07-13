@@ -10,7 +10,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEvent, QPoint, Qt
-from PySide6.QtWidgets import QApplication, QPushButton, QScrollArea
+from PySide6.QtWidgets import QApplication, QHeaderView, QPushButton, QScrollArea
 
 from agent_mail_bridge.application_service import ApplicationService
 from agent_mail_bridge.models import OperationStatus, ReceiveResult, ServiceResult
@@ -70,7 +70,7 @@ def test_inbox_has_one_refresh_in_title_and_no_recent_log_refresh(quality_window
     assert not quality_window.inbox_refresh_button.icon().isNull()
 
 
-def test_file_table_compacts_path_but_keeps_complete_value_and_real_actions(quality_window, quality_app, tmp_path, monkeypatch):
+def test_file_table_removes_path_column_but_keeps_complete_value_and_real_actions(quality_window, quality_app, tmp_path, monkeypatch):
     path = tmp_path / "很长但必须完整显示的收到文件名称.txt"
     path.write_text("preview", encoding="utf-8")
     row = {
@@ -82,20 +82,23 @@ def test_file_table_compacts_path_but_keeps_complete_value_and_real_actions(qual
         "subject": "专项整改邮件",
     }
     quality_window._populate_files(quality_window.files_table, [row], actions=True)
+    assert [
+        quality_window.files_table.horizontalHeaderItem(index).text()
+        for index in range(quality_window.files_table.columnCount())
+    ] == ["文件名", "大小", "收取时间", "操作"]
     assert quality_window.files_table.textElideMode() == Qt.TextElideMode.ElideNone
     assert quality_window.files_table.item(0, 0).text() == path.name
-    displayed_path = quality_window.files_table.item(0, 2).text()
-    assert displayed_path == quality_window._compact_table_path(str(path))
-    assert len(displayed_path) <= int(len(str(path)) * 0.30) + 2
-    assert len(displayed_path) <= 22
-    assert quality_window.files_table.item(0, 2).data(Qt.ItemDataRole.UserRole) == str(path)
-    assert quality_window.files_table.item(0, 2).toolTip() == str(path)
-    assert quality_window.files_table.item(0, 3).text() == "2026-07-13 12:34:56"
+    assert quality_window.files_table.item(0, 0).data(Qt.ItemDataRole.UserRole) == str(path)
+    assert quality_window.files_table.item(0, 2).text() == "12:34:56"
     assert "..." not in quality_window.files_table.item(0, 0).text()
-    assert displayed_path.count("…") == 1
+    assert str(path) not in [
+        quality_window.files_table.horizontalHeaderItem(index).text()
+        for index in range(quality_window.files_table.columnCount())
+    ]
+    assert quality_window.files_table.horizontalHeader().sectionResizeMode(0) == QHeaderView.ResizeMode.Stretch
     assert quality_window.files_table.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
 
-    action_widget = quality_window.files_table.cellWidget(0, 4)
+    action_widget = quality_window.files_table.cellWidget(0, 3)
     buttons = {button.text(): button for button in action_widget.findChildren(QPushButton)}
     assert set(buttons) == {"打开", "复制路径"}
     buttons["复制路径"].click()

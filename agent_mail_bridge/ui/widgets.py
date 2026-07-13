@@ -50,7 +50,9 @@ def horizontal_line() -> QFrame:
 def format_size(size_bytes: int | str | None) -> str:
     """把字节数转为紧凑显示。"""
     try:
-        value = max(0, int(size_bytes or 0))
+        if size_bytes is None or str(size_bytes).strip() == "":
+            return "—"
+        value = max(0, int(size_bytes))
     except (TypeError, ValueError):
         return "—"
     if value < 1024:
@@ -217,10 +219,10 @@ class AccountCard(QFrame):
         super().__init__()
         self.setObjectName("card")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedHeight(108)
+        self.setFixedHeight(122)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(14, 13, 12, 12)
-        layout.setSpacing(12)
+        layout.setSpacing(10)
 
         icon = QLabel(symbol if isinstance(symbol, str) else "")
         icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -237,22 +239,28 @@ class AccountCard(QFrame):
 
         text_area = QVBoxLayout()
         text_area.setSpacing(2)
-        title_row = QHBoxLayout()
-        title_label = QLabel(title)
-        title_label.setObjectName("minorTitle")
+        self.title_label = QLabel(title)
+        self.title_label.setObjectName("minorTitle")
+        self.title_label.setWordWrap(False)
         self.status_tag = QLabel("未配置")
         self.status_tag.setObjectName("tag")
         self.status_tag.setProperty("configured", False)
-        title_row.addWidget(title_label)
-        title_row.addStretch()
-        title_row.addWidget(self.status_tag)
         self.email_label = QLabel(email or "未配置")
         self.email_label.setObjectName("muted")
-        detail = QLabel(description)
-        detail.setObjectName("hint")
-        text_area.addLayout(title_row)
+        self.email_label.setWordWrap(True)
+        self.email_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.detail_label = QLabel(description)
+        self.detail_label.setObjectName("hint")
+        bottom_row = QHBoxLayout()
+        bottom_row.setSpacing(5)
+        bottom_row.addWidget(self.detail_label)
+        bottom_row.addStretch(1)
+        bottom_row.addWidget(self.status_tag)
+        text_area.addWidget(self.title_label)
         text_area.addWidget(self.email_label)
-        text_area.addWidget(detail)
+        text_area.addLayout(bottom_row)
         layout.addLayout(text_area, 1)
 
     def set_configured(self, configured: bool) -> None:

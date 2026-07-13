@@ -53,6 +53,7 @@ from agent_mail_bridge.maintenance import (
     verify_database_backup,
 )
 from agent_mail_bridge.models import OperationStatus, ReceiveResult, SendResult, ServiceResult
+from agent_mail_bridge.managed_files import get_managed_files as query_managed_files
 from agent_mail_bridge.security import (
     SecurityError,
     assert_within_allowed_roots,
@@ -596,6 +597,29 @@ class ApplicationService:
                     self.cfg.effective_allowed_send_roots,
                 ),
             },
+        )
+
+    def get_managed_files(self, limit: int = 500) -> ServiceResult:
+        """返回统一受管文件 DTO，不从 received_messages 推导文件大小。"""
+        self.initialize()
+        if limit <= 0:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="invalid_limit",
+                message="文件记录数量必须大于 0",
+            )
+        try:
+            rows = query_managed_files(self.cfg, limit)
+        except Exception as exc:  # noqa: BLE001
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="managed_files_failed",
+                message=f"读取受管文件失败：{exc}",
+            )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            message=f"共 {len(rows)} 个受管文件",
+            details={"files": rows},
         )
 
     def get_recent_logs(self, limit: int = 50) -> ServiceResult:

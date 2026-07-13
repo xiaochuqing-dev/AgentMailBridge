@@ -81,7 +81,7 @@ def test_file_action_text_matches_real_click_behavior(product_window):
         [{"saved_filename": "result.md", "saved_path": "C:/safe/result.md"}],
         actions=True,
     )
-    action_widget = product_window.files_table.cellWidget(0, 4)
+    action_widget = product_window.files_table.cellWidget(0, 3)
     assert action_widget is not None
     assert {button.text() for button in action_widget.findChildren(QPushButton)} == {
         "打开",
