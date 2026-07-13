@@ -2,11 +2,11 @@
 
 ## 1. 执行摘要
 
-AgentMailBridge v1.0.0 已完成信息架构收口、参考图视觉精修、真实功能连通、测试、构建、本机安装、快捷方式和 GitHub master 推送，最终结论为 PASS。
+AgentMailBridge v1.0.0 已完成信息架构收口、参考图视觉精修、真实功能连通、测试、构建、本机安装、快捷方式和 GitHub master 推送。2026-07-13 又按正式版总任务完成一次独立复验，最终结论为 PASS。
 
 ## 2. 开始前真实状态
 
-开始时本地位于产品化分支，工作区无未提交改动；本地已有 3 个待推送提交，远端 master 为 e4d1c6d。版本为 0.9.0，桌面快捷方式指向仓库 dist。基线 269 项 pytest 全部通过。
+原始收口开始时版本为 0.9.0，基线 269 项 pytest 全部通过。本次独立复验开始时本地 master 与 origin/master 均为 23a5248，工作区干净，版本已为 1.0.0；重新执行基线后 285 项 pytest 全部通过。桌面快捷方式已指向正式安装目录，但已安装 EXE 早于本次复验，因此继续执行了 clean build 和覆盖安装。
 
 ## 3. 最终信息架构
 
@@ -83,11 +83,11 @@ AgentMailBridge v1.0.0 已完成信息架构收口、参考图视觉精修、真
 
 ## 18. 自动化测试
 
-最终完整 pytest：285 passed in 139.43s。另有 packaged GUI self-test、MCP initialize/ping/tools/list/path_not_allowed/EOF smoke 和 Windows 版本资源测试通过。
+本次基线 pytest：285 passed in 125.10s；clean build 内完整 pytest：285 passed in 129.52s。packaged GUI self-test、MCP initialize/ping/tools/list/path_not_allowed/EOF smoke 和 Windows 版本资源测试均通过。
 
 ## 19. 敏感信息扫描
 
-待提交文件名、Git diff、本机绝对路径、常见 token 模式、tracked runtime 路径、dist 和 release 均已扫描。secret_scan：864 个产物文件通过；Defender 自定义扫描无新增检测。报告不含 secret、token、邮件正文或附件内容。
+待提交文件名、Git diff、staged diff、108 个 tracked 文件、本机绝对路径、常见 token/私钥模式、tracked runtime 路径、dist 和 release 均已扫描。发现并移除了旧报告中的两条本机绝对路径；未发现 secret、OAuth token、私钥、用户数据库、邮件或附件被跟踪。secret_scan：864 个产物文件通过；Windows Defender 自定义扫描新增检测为 0。
 
 ## 20. v1.0.0 版本统一
 
@@ -95,15 +95,15 @@ version.py、GUI、About、CLI、MCP serverInfo、PyInstaller GUI/MCP ProductVer
 
 ## 21. Windows clean build
 
-正式脚本完成 clean build、双 EXE、packaged self-test、MCP smoke、portable ZIP、Inno Setup 安装器、哈希和秘密扫描。签名检查：GUI EXE、MCP EXE、安装器均为 NotSigned。
+2026-07-13 正式脚本重新完成 clean build、双 EXE、packaged self-test、MCP smoke、portable ZIP、Inno Setup 6.7.3 安装器、哈希和秘密扫描。签名检查：GUI EXE、MCP EXE、安装器均为 NotSigned。
 
 ## 22. 本机安装升级
 
-安装器静默覆盖安装返回 0。安装前 5 个现有用户文件在安装后缺失 0、内容变化 0；安装目录双 EXE 与 dist 哈希一致，用户配置、OAuth、凭据和数据未被安装器清理。
+安装器再次静默覆盖安装完成；安装目录 GUI 与 MCP EXE 均和本轮 dist 哈希一致，ProductVersion 均为 1.0.0。安装器仅覆盖 `%LOCALAPPDATA%\Programs\AgentMailBridge`，现有 `%LOCALAPPDATA%\AgentMailBridge` 配置、OAuth 与数据目录保持存在，安装器未执行用户数据清理。
 
 ## 23. 桌面快捷方式验证
 
-桌面快捷方式指向 `%LOCALAPPDATA%\Programs\AgentMailBridge\AgentMailBridge.exe`，Working Directory 为安装目录。实际启动版本 1.0.0；关闭窗口后进入托盘；再次双击恢复原 PID，进程数为 1，单实例通过。
+桌面快捷方式指向 `%LOCALAPPDATA%\Programs\AgentMailBridge\AgentMailBridge.exe`，Working Directory 为安装目录。2026-07-13 从该快捷方式实际启动，第二次双击仍为同一 PID；关闭窗口后进程留在托盘，再次双击恢复同一 PID，进程数为 1。单实例、托盘和正式安装入口复验通过。
 
 ## 24. Git 提交与 push
 
@@ -127,6 +127,6 @@ PASS。v1.0.0 功能、信息架构、参考图视觉、测试、构建、安装
 
 安装器：`release/AgentMailBridge-1.0.0-Setup.exe`
 
-安装器 SHA-256：`00f6fbc47a3f43a82ed03024525e5a1ea840cc2d4a06ccbb72b4aa6333d2fae9`
+安装器 SHA-256：`c104e859237458d59707b52e0702727bac8f07f94866ce311d5268e2f902fb69`
 
-Portable SHA-256：`2be2437128b4b0beac8537095c07f6c5c7e8f0baaf85aab12a4fe01b1e050b3d`
+Portable SHA-256：`b4489d26957c24e74e981ada70c9db823813bf6c5d919d4bd1dfb8cc362592c4`
