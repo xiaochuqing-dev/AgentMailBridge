@@ -10,7 +10,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QPushButton
+from PySide6.QtWidgets import QApplication, QPushButton, QScrollArea
 
 from agent_mail_bridge.application_service import ApplicationService
 from agent_mail_bridge.models import OperationStatus, ReceiveResult, ServiceResult
@@ -163,3 +163,11 @@ def test_theme_icon_and_typography_tokens_are_formal(quality_window):
         "secondary_body", "caption", "button", "table_header", "table_cell", "status",
     }
     assert all(token["weight"] in {400, 700} for token in TYPOGRAPHY.values())
+
+
+def test_high_dpi_window_uses_bounded_geometry_and_scroll_fallbacks(quality_window):
+    available = quality_window.screen().availableGeometry()
+    assert quality_window.height() <= max(available.height(), quality_window.minimumHeight())
+    assert isinstance(quality_window.pages["inbox"], QScrollArea)
+    assert isinstance(quality_window.right_panel, QScrollArea)
+    assert quality_window.pages["inbox"].horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff

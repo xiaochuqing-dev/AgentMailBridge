@@ -70,12 +70,12 @@ def build_stylesheet(theme: str = "light") -> str:
     QMainWindow, QWidget#windowRoot {{
         background: #FFFFFF;
     }}
-    QWidget#titleBar, QWidget#sidebar, QWidget#rightPanel,
+    QWidget#titleBar, QWidget#sidebar, QWidget#rightPanelContent,
     QWidget#centralPanel, QWidget#pageSurface, QWidget#bodySurface,
-    QWidget#tabBar {{
+    QWidget#tabBar, QScrollArea#rightPanel, QScrollArea#pageScroll {{
         background: #FFFFFF;
     }}
-    QWidget#rightPanel {{
+    QScrollArea#rightPanel, QWidget#rightPanelContent {{
         background: #FCFCFE;
         border-left: 1px solid {BORDER};
     }}
@@ -455,9 +455,9 @@ def build_stylesheet(theme: str = "light") -> str:
     return base + f"""
     * {{ color: #E8EAF2; }}
     QMainWindow, QWidget#windowRoot, QWidget#titleBar, QWidget#sidebar,
-    QWidget#centralPanel, QWidget#rightPanel, QWidget#pageSurface,
+    QWidget#centralPanel, QWidget#rightPanelContent, QWidget#pageSurface,
     QWidget#bodySurface, QWidget#tabBar, QScrollArea {{ background: #171923; }}
-    QWidget#rightPanel {{ background: #1C1E2A; border-left-color: #343746; }}
+    QScrollArea#rightPanel, QWidget#rightPanelContent {{ background: #1C1E2A; border-left-color: #343746; }}
     QWidget#sidebar, QWidget#titleBar, QWidget#tabBar {{ border-color: #343746; }}
     QLabel#fieldLabel, QLabel#muted, QLabel#hint {{ color: #AEB4C5; }}
     QLabel#statusName, QLabel#statusValue, QLabel#tipText, QLabel#statNumber,

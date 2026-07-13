@@ -322,8 +322,8 @@ class BridgeWindow(QMainWindow):
         self.setWindowTitle("Agent 邮箱桥接工具")
         self.setWindowIcon(brand_icon())
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
-        self.resize(1280, 920)
-        self.setMinimumSize(1160, 780)
+        self.resize(1240, 680)
+        self.setMinimumSize(1160, 640)
         self._build()
         self.apply_theme(self.theme_mode)
         self._build_tray()
@@ -332,6 +332,7 @@ class BridgeWindow(QMainWindow):
         saved_geometry = self.settings.value("window/geometry")
         if saved_geometry:
             self.restoreGeometry(saved_geometry)
+        self._fit_to_available_screen()
         # 高频收件工作台始终作为启动首页，避免旧版本页面状态恢复到已删除路由。
         self.select_page("inbox")
         QTimer.singleShot(0, self.refresh)
@@ -375,6 +376,20 @@ class BridgeWindow(QMainWindow):
         self.size_grip = QSizeGrip(root)
         self.size_grip.setFixedSize(16, 16)
         self.size_grip.raise_()
+
+    def _fit_to_available_screen(self) -> None:
+        """限制恢复后的旧窗口几何，确保 150% DPI 下不超出可用桌面。"""
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        target_width = min(self.width(), available.width())
+        target_height = min(self.height(), available.height())
+        self.resize(max(self.minimumWidth(), target_width), max(self.minimumHeight(), target_height))
+        frame = self.frameGeometry()
+        x = min(max(frame.x(), available.left()), available.right() - frame.width() + 1)
+        y = min(max(frame.y(), available.top()), available.bottom() - frame.height() + 1)
+        self.move(x, y)
 
     def _build_sidebar(self) -> QWidget:
         panel = QWidget()
@@ -812,7 +827,13 @@ class BridgeWindow(QMainWindow):
         self.logs_refresh_label = self.home_refresh_label
         self.dashboard_refresh_label = self.home_refresh_label
         layout.addWidget(self.logs_table, 1)
-        return page
+        page.setMinimumHeight(850)
+        scroll = QScrollArea()
+        scroll.setObjectName("pageScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(page)
+        return scroll
 
     def _build_send_page(self) -> QWidget:
         page, layout = self._standard_page("发邮件", "用户可手动选择任意位置的普通文件；MCP 和 CLI 仍受目录限制。")
@@ -1518,11 +1539,16 @@ class BridgeWindow(QMainWindow):
         return page
 
     def _build_right_panel(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setObjectName("rightPanel")
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setFixedWidth(350)
         panel = QWidget()
-        panel.setObjectName("rightPanel")
+        panel.setObjectName("rightPanelContent")
         panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         _fill_background(panel, "#FCFCFE")
-        panel.setFixedWidth(350)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(20, 24, 20, 18)
         layout.setSpacing(12)
@@ -1605,7 +1631,8 @@ class BridgeWindow(QMainWindow):
         layout.addWidget(TipRow(provider_icon("qq"), "QQ 发件固定发送到绑定的 Gmail。", "#329BC5"))
         help_button = self._button("查看帮助文档", self._show_help, text_only=True)
         layout.addWidget(help_button, 0, Qt.AlignmentFlag.AlignLeft)
-        return panel
+        scroll.setWidget(panel)
+        return scroll
 
     def _standard_page(
         self,
