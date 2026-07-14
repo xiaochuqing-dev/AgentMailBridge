@@ -16,16 +16,22 @@ from __future__ import annotations
 
 import base64
 import re
+from datetime import timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
 from agent_mail_bridge.config import AppConfig
 from agent_mail_bridge.database import (
+    clear_receive_retry,
+    count_receive_retries,
     insert_received_file,
     insert_received_message,
     log_event,
     message_id_exists,
+    query_due_receive_retries,
+    receive_retry_is_due,
+    record_receive_failure,
 )
 from agent_mail_bridge.logging_setup import get_logger
 from agent_mail_bridge.mail_common import (
@@ -88,7 +94,11 @@ def receive_gmail_api_messages(
     require_receive_config(cfg)
 
     if limit is None:
-        limit = cfg.gmail_api_max_results
+        page_size = cfg.gmail_api_max_results
+        scan_cap = cfg.receive_scan_cap
+    else:
+        page_size = limit
+        scan_cap = limit
 
     result: dict[str, Any] = {
         "ok": True,
@@ -101,13 +111,15 @@ def receive_gmail_api_messages(
         "failed": 0,
         "saved_files": [],
         "errors": [],
+        "global_error": False,
+        "retry_deferred": 0,
     }
 
     gmail_addr = cfg.gmail_address.lower().strip()
 
     log_event(
         cfg.db_path, "INFO", "receive",
-        f"开始通过 Gmail API 收取邮件（limit={limit}, query={cfg.gmail_api_query}）",
+        f"开始通过 Gmail API 收取邮件（page_size={page_size}, lookback={cfg.receive_lookback_minutes}m）",
     )
 
     # ---- 获取 service ----
@@ -119,34 +131,62 @@ def receive_gmail_api_messages(
             logger.error(msg)
             log_event(cfg.db_path, "ERROR", "receive", msg)
             result["ok"] = False
+            result["global_error"] = True
             result["errors"].append(msg)
             return result
 
     # ---- list 邮件 id ----
     try:
-        list_resp = service.users().messages().list(
-            userId="me",
-            q=cfg.gmail_api_query,
-            maxResults=limit,
-        ).execute()
+        messages: list[dict[str, Any]] = []
+        page_token: str | None = None
+        query = _query_with_lookback(cfg)
+        while len(messages) < scan_cap:
+            request: dict[str, Any] = {
+                "userId": "me",
+                "q": query,
+                "maxResults": min(page_size, scan_cap - len(messages)),
+            }
+            if page_token:
+                request["pageToken"] = page_token
+            list_resp = service.users().messages().list(**request).execute()
+            messages.extend(list_resp.get("messages", []) or [])
+            page_token = list_resp.get("nextPageToken")
+            if not page_token:
+                break
     except Exception as exc:  # noqa: BLE001
         msg = _describe_api_error(exc)
         logger.error(msg)
         log_event(cfg.db_path, "ERROR", "receive", msg)
         result["ok"] = False
+        result["global_error"] = True
         result["errors"].append(msg)
         return result
 
-    messages = list_resp.get("messages", []) or []
+    messages = messages[:scan_cap]
+    known_ids = {str(item.get("id", "")) for item in messages}
+    for retry in query_due_receive_retries(
+        cfg.db_path, "gmail_api", limit=min(100, scan_cap)
+    ):
+        resource_id = str(retry.get("resource_id") or "")
+        if resource_id and resource_id not in known_ids:
+            messages.append({"id": resource_id, "retry": True})
+            known_ids.add(resource_id)
     result["fetched"] = len(messages)
 
     for item in messages:
         gmail_message_id = item.get("id", "")
         gmail_thread_id = item.get("threadId", "")
+        if not receive_retry_is_due(
+            cfg.db_path, "gmail_api", gmail_message_id
+        ):
+            result["skipped"] += 1
+            result["retry_deferred"] += 1
+            continue
         try:
             _process_one_unified(
                 service, cfg, gmail_message_id, gmail_thread_id, result,
             )
+            clear_receive_retry(cfg.db_path, "gmail_api", gmail_message_id)
         except Exception as exc:  # noqa: BLE001
             err = f"处理 Gmail API 邮件 id={gmail_message_id} 失败：{exc}"
             logger.warning("处理 Gmail API 邮件失败", exc_info=True)
@@ -154,16 +194,34 @@ def receive_gmail_api_messages(
             log_event(cfg.db_path, "WARNING", "receive", err)
             result["errors"].append(err)
             result["failed"] += 1
+            record_receive_failure(
+                cfg.db_path,
+                backend="gmail_api",
+                resource_id=gmail_message_id,
+                message_id=gmail_message_id,
+                error=str(exc),
+            )
+
+    retry_counts = count_receive_retries(cfg.db_path)
+    result["pending_retries"] = retry_counts["pending"]
+    result["needs_attention"] = retry_counts["needs_attention"]
 
     log_event(
         cfg.db_path,
-        "SUCCESS",
+        "WARNING" if result["failed"] else "SUCCESS",
         "receive",
         f"Gmail API 收取完成：扫描 {result['fetched']} 封，"
         f"新存 {result['saved']} 封，跳过 {result['skipped']} 封，"
         f"附件 {result['attachments']} 个",
     )
     return result
+
+
+def _query_with_lookback(cfg: AppConfig) -> str:
+    """每轮重叠回看并依靠 Message-ID/唯一约束去重，优先防漏。"""
+    cutoff = now_local() - timedelta(minutes=max(1, cfg.receive_lookback_minutes))
+    base = cfg.gmail_api_query.strip()
+    return f"{base} after:{int(cutoff.timestamp())}".strip()
 
 
 # ============================================================
@@ -336,7 +394,7 @@ def _process_one_unified(
         backend="gmail_api",
         message_id=_find_header(headers, ("Message-ID",)),
         backend_message_id=gmail_message_id,
-        thread_id=gmail_thread_id,
+        thread_id=str(msg.get("threadId") or gmail_thread_id),
         uid="",
         from_raw=_find_header(headers, ("From",)),
         to_raw=_find_header(headers, ("To",)),

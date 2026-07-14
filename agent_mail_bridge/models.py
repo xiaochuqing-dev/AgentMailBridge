@@ -58,6 +58,8 @@ class ReceiveResult(ServiceResult):
     attachments: int = 0
     saved_files: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    pending_retries: int = 0
+    needs_attention: int = 0
 
 
 @dataclass
@@ -72,3 +74,9 @@ class SendResult(ServiceResult):
     subject: str = ""
     to_email: str = ""
     sent_at: str = ""
+    filename: str = ""
+    size_bytes: int = 0
+    source_sha256: str = ""
+    staged_sha256: str = ""
+    attachment_pre_smtp_sha256: str = ""
+    sent_archive_sha256: str = ""

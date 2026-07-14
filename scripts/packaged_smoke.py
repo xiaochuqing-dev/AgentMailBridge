@@ -51,12 +51,17 @@ def main() -> int:
                     "name": "submit_result",
                     "arguments": {
                         "file_path": str(outside),
+                        "title": "中文 title / English",
                         "request_id": "packaged-smoke-001",
                     },
                 },
             },
+            {"jsonrpc": "2.0", "id": 5, "method": "unknown/method", "params": {}},
         ]
-        payload = "\n".join(json.dumps(item, ensure_ascii=False) for item in requests) + "\n"
+        encoded = [json.dumps(item, ensure_ascii=False) for item in requests]
+        encoded[0] = "\ufeff" + encoded[0]
+        encoded.insert(2, "{malformed")
+        payload = "\n".join(encoded) + "\n"
         completed = subprocess.run(
             [str(executable)],
             input=payload,
@@ -71,7 +76,7 @@ def main() -> int:
             raise SystemExit(f"MCP 返回码异常：{completed.returncode}；stderr={completed.stderr[-500:]}")
         responses = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
         by_id = {item.get("id"): item for item in responses}
-        if set(by_id) != {1, 2, 3, 4}:
+        if set(by_id) != {None, 1, 2, 3, 4, 5}:
             raise SystemExit("MCP stdout 含缺失或额外协议输出")
         if by_id[1]["result"]["serverInfo"]["version"] != __version__:
             raise SystemExit("MCP 版本不一致")
@@ -81,6 +86,10 @@ def main() -> int:
         result = by_id[4]["result"]["structuredContent"]
         if result["status"] != "path_not_allowed":
             raise SystemExit(f"MCP 路径边界异常：{result['status']}")
+        if by_id[None].get("error", {}).get("code") != -32700:
+            raise SystemExit("MCP malformed JSON 未返回 parse error")
+        if by_id[5].get("error", {}).get("code") != -32601:
+            raise SystemExit("MCP 未知 method 未返回 method not found")
         if "Traceback" in completed.stderr:
             raise SystemExit("MCP stderr 出现异常回溯")
     print("packaged MCP smoke PASS")

@@ -103,7 +103,10 @@ from agent_mail_bridge.ui.widgets import (
 )
 from agent_mail_bridge.utils import sha256_of_file
 
-AUTO_RECEIVE_DEFAULT_MINUTES = 3  # 自动收件默认间隔，单位：分钟
+AUTO_RECEIVE_DEFAULT_SECONDS = 60
+AUTO_RECEIVE_MIN_SECONDS = 30
+AUTO_RECEIVE_DEFAULT_MINUTES = 1  # 兼容旧调用方；新调度统一按秒计算。
+AUTO_RECEIVE_BACKOFF_SECONDS = (30, 60, 120, 300, 900)
 PREVIEW_MAX_BYTES = 128 * 1024  # 文本预览上限，单位：字节
 SAFE_TEXT_SUFFIXES = {".txt", ".md", ".csv", ".json", ".log", ".py", ".toml", ".ini"}
 SAFE_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}
@@ -260,20 +263,23 @@ class TitleBar(QWidget):
         self.set_theme(self.window_ref.theme_mode)
         layout.addWidget(self.theme_button)
 
-        minimize = QPushButton("—")
-        maximize = QPushButton("□")
-        close = QPushButton("×")
-        for button in (minimize, maximize):
+        self.minimize_button = QPushButton()
+        self.maximize_button = QPushButton()
+        self.close_button = QPushButton()
+        for button in (self.minimize_button, self.maximize_button):
             button.setObjectName("titleButton")
             button.setFixedSize(42, 38)
-        close.setObjectName("closeButton")
-        close.setFixedSize(42, 38)
-        minimize.clicked.connect(window.minimize_to_tray)
-        maximize.clicked.connect(self._toggle_maximized)
-        close.clicked.connect(window.close)
-        layout.addWidget(minimize)
-        layout.addWidget(maximize)
-        layout.addWidget(close)
+        self.close_button.setObjectName("closeButton")
+        self.close_button.setFixedSize(42, 38)
+        self.minimize_button.clicked.connect(window.minimize_to_tray)
+        self.maximize_button.clicked.connect(self._toggle_maximized)
+        self.close_button.clicked.connect(window.close)
+        self.minimize_button.setToolTip("最小化到托盘")
+        self.close_button.setToolTip("关闭到托盘")
+        layout.addWidget(self.minimize_button)
+        layout.addWidget(self.maximize_button)
+        layout.addWidget(self.close_button)
+        self.sync_window_state()
 
     def set_theme(self, theme: str) -> None:
         """用清晰图标显示下一次可切换的主题。"""
@@ -285,12 +291,33 @@ class TitleBar(QWidget):
             self.theme_button.setToolTip("切换为深色模式")
         self.theme_button.setText("")
         self.theme_button.setIconSize(QSize(18, 18))
+        if not hasattr(self, "minimize_button"):
+            return
+        color = "#D8DBE8" if theme == "dark" else "#555B69"
+        self.minimize_button.setIcon(QIcon(line_icon_pixmap("minimize", 16, color)))
+        self.close_button.setIcon(QIcon(line_icon_pixmap("close", 16, color)))
+        self.minimize_button.setIconSize(QSize(16, 16))
+        self.close_button.setIconSize(QSize(16, 16))
+        self.sync_window_state(color=color)
+
+    def sync_window_state(self, *, color: str | None = None) -> None:
+        """窗口状态变化时同步最大化/还原图标与提示。"""
+        if not hasattr(self, "maximize_button"):
+            return
+        if color is None:
+            color = "#D8DBE8" if self.window_ref.theme_mode == "dark" else "#555B69"
+        maximized = self.window_ref.isMaximized()
+        kind = "restore" if maximized else "maximize"
+        self.maximize_button.setIcon(QIcon(line_icon_pixmap(kind, 16, color)))
+        self.maximize_button.setIconSize(QSize(16, 16))
+        self.maximize_button.setToolTip("还原" if maximized else "最大化")
 
     def _toggle_maximized(self) -> None:
         if self.window_ref.isMaximized():
             self.window_ref.showNormal()
         else:
             self.window_ref.showMaximized()
+        self.sync_window_state()
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -330,6 +357,7 @@ class BridgeWindow(QMainWindow):
         self.pending_quit = False
         self.instance_guard = None
         self._notification_times: dict[str, float] = {}
+        self._hidden_window_was_maximized = False
         self.task_buttons: list[QPushButton] = []
         self.manual_receive_buttons: list[QPushButton] = []
         self._active_task_button: QPushButton | None = None
@@ -358,20 +386,28 @@ class BridgeWindow(QMainWindow):
         self.auto_timer = QTimer(self)
         self.auto_timer.setSingleShot(True)
         self.auto_timer.timeout.connect(self._automatic_receive)
+        self.auto_watchdog = QTimer(self)
+        self.auto_watchdog.setInterval(15_000)
+        self.auto_watchdog.timeout.connect(self._watchdog_auto_receive)
+        self.auto_watchdog.start()
         self.auto_failures = 0
+        self._loading_auto_receive = False
         self.setWindowTitle("Agent 邮箱桥接工具")
         self.setWindowIcon(brand_icon())
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
-        self.resize(1240, 960)
-        self.setMinimumSize(1160, 660)
+        self.resize(1400, 960)
+        self.setMinimumSize(1320, 660)
         self._build()
         self.apply_theme(self.theme_mode)
         self._build_tray()
         self._load_auto_receive_preferences()
         self._wire_config_change_tracking()
-        saved_geometry = self.settings.value("window/geometry")
+        saved_geometry = self.settings.value("window/normal_geometry")
         if saved_geometry:
-            self.restoreGeometry(saved_geometry)
+            try:
+                self.setGeometry(saved_geometry)
+            except TypeError:
+                pass
         self._fit_to_available_screen()
         # 高频收件工作台始终作为启动首页，避免旧版本页面状态恢复到已删除路由。
         self.select_page("inbox")
@@ -442,10 +478,17 @@ class BridgeWindow(QMainWindow):
         if screen is None:
             return
         available = screen.availableGeometry()
-        target_width = min(self.width(), available.width())
+        self.setMinimumSize(
+            min(1320, available.width()),
+            min(660, available.height()),
+        )
+        target_width = min(max(self.width(), self.minimumWidth()), available.width())
         preferred_height = min(1020, available.height())
-        target_height = min(max(self.height(), preferred_height), available.height())
-        self.resize(max(self.minimumWidth(), target_width), max(self.minimumHeight(), target_height))
+        target_height = min(
+            max(self.height(), preferred_height, self.minimumHeight()),
+            available.height(),
+        )
+        self.resize(target_width, target_height)
         frame = self.frameGeometry()
         x = min(max(frame.x(), available.left()), available.right() - frame.width() + 1)
         y = min(max(frame.y(), available.top()), available.bottom() - frame.height() + 1)
@@ -507,7 +550,7 @@ class BridgeWindow(QMainWindow):
         panel.setObjectName("centralPanel")
         panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         _fill_background(panel, "#FFFFFF")
-        panel.setMinimumWidth(620)
+        panel.setMinimumWidth(720)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -648,8 +691,11 @@ class BridgeWindow(QMainWindow):
         interval_label = QLabel("检查间隔")
         interval_label.setObjectName("fieldLabel")
         self.interval_combo = QComboBox()
-        for minutes in (1, 3, 5, 10, 30):
-            self.interval_combo.addItem(f"每 {minutes} 分钟", minutes)
+        for label, seconds in (
+            ("每 30 秒", 30), ("每 1 分钟", 60), ("每 3 分钟", 180),
+            ("每 5 分钟", 300), ("每 10 分钟", 600),
+        ):
+            self.interval_combo.addItem(label, seconds)
         self.interval_combo.currentIndexChanged.connect(self._reschedule_auto_receive)
         self.interval_combo.setFixedWidth(170)
         option_row.addWidget(auto_label)
@@ -766,32 +812,6 @@ class BridgeWindow(QMainWindow):
         self.inbox_refresh_button.clicked.connect(
             lambda: self.request_refresh(self.inbox_refresh_button)
         )
-        status_card = QFrame()
-        status_card.setObjectName("heroCard")
-        status_layout = QHBoxLayout(status_card)
-        status_layout.setContentsMargins(16, 12, 16, 12)
-        status_layout.setSpacing(10)
-        account_icon = QLabel()
-        account_icon.setFixedSize(46, 46)
-        account_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        account_icon.setPixmap(provider_icon("gmail").pixmap(40, 40))
-        status_layout.addWidget(account_icon)
-        status_text = QVBoxLayout()
-        self.receive_account_label = QLabel(self.service.cfg.gmail_address or "尚未配置 Gmail 收件账号")
-        self.receive_account_label.setObjectName("minorTitle")
-        self.dashboard_health_detail = QLabel("正在读取当前连接状态…")
-        self.dashboard_health_detail.setObjectName("hint")
-        status_text.addWidget(self.receive_account_label)
-        status_text.addWidget(self.dashboard_health_detail)
-        status_layout.addLayout(status_text, 1)
-        manage = self._button(
-            "管理 Gmail 账号",
-            lambda: self.open_account(AccountTypeDialog.GMAIL),
-            outline=True,
-        )
-        status_layout.addWidget(manage)
-        layout.addWidget(status_card)
-
         tools = QHBoxLayout()
         tools.setSpacing(9)
         tools.addWidget(QLabel("自动收取"))
@@ -801,9 +821,12 @@ class BridgeWindow(QMainWindow):
         tools.addSpacing(5)
         tools.addWidget(QLabel("检查间隔"))
         self.interval_combo = QComboBox()
-        for minutes in (1, 3, 5, 10, 30):
-            self.interval_combo.addItem(f"每 {minutes} 分钟", minutes)
-        self.interval_combo.setFixedWidth(160)
+        for label, seconds in (
+            ("每 30 秒", 30), ("每 1 分钟", 60), ("每 3 分钟", 180),
+            ("每 5 分钟", 300), ("每 10 分钟", 600),
+        ):
+            self.interval_combo.addItem(label, seconds)
+        self.interval_combo.setFixedWidth(145)
         self.interval_combo.currentIndexChanged.connect(self._reschedule_auto_receive)
         tools.addWidget(self.interval_combo)
         tools.addStretch(1)
@@ -815,6 +838,28 @@ class BridgeWindow(QMainWindow):
         tools.addWidget(self.inbox_test_button)
         tools.addWidget(receive)
         layout.addLayout(tools)
+
+        auto_state_card = QFrame()
+        auto_state_card.setObjectName("card")
+        auto_state_layout = QGridLayout(auto_state_card)
+        auto_state_layout.setContentsMargins(16, 10, 16, 10)
+        auto_state_layout.setHorizontalSpacing(14)
+        auto_state_layout.setVerticalSpacing(5)
+        self.auto_state_values: dict[str, QLabel] = {}
+        for index, (key, title) in enumerate((
+            ("state", "自动收取"), ("last_check", "上次检查"),
+            ("last_success", "上次成功"), ("next_check", "下次检查"),
+            ("last_result", "最近结果"), ("retries", "待重试邮件"),
+        )):
+            caption = QLabel(title)
+            caption.setObjectName("hint")
+            value = QLabel("—")
+            value.setObjectName("fieldLabel")
+            self.auto_state_values[key] = value
+            row, column = divmod(index, 3)
+            auto_state_layout.addWidget(caption, row * 2, column)
+            auto_state_layout.addWidget(value, row * 2 + 1, column)
+        layout.addWidget(auto_state_card)
 
         self.self_mail_check = QCheckBox(page)
         self.self_mail_check.setChecked(self.service.cfg.auto_receive_only_self_mail)
@@ -853,8 +898,8 @@ class BridgeWindow(QMainWindow):
             QIcon(line_icon_pixmap("search", 17, TEXT_MUTED)),
             QLineEdit.ActionPosition.LeadingPosition,
         )
-        self.inbox_search.setMinimumWidth(330)
-        self.inbox_search.setMaximumWidth(460)
+        self.inbox_search.setMinimumWidth(260)
+        self.inbox_search.setMaximumWidth(420)
         self.inbox_search.textChanged.connect(self._filter_inbox)
         open_button = self._button("打开今日接收文件夹", self.open_today_folder, icon_kind="file")
         file_header.addWidget(file_title)
@@ -864,11 +909,11 @@ class BridgeWindow(QMainWindow):
         layout.addLayout(file_header)
         self.files_table = DataTable(["文件名", "大小", "收取时间", "操作"])
         self.files_table.setMinimumHeight(220)
-        self.files_table.setMaximumHeight(320)
+        self.files_table.setMaximumHeight(300)
         self.files_table.cellDoubleClicked.connect(self._preview_table_file)
         self._configure_file_table(self.files_table)
         self.inbox_table = self.files_table
-        layout.addWidget(self.files_table, 1)
+        layout.addWidget(self.files_table, 2)
 
         log_header = QHBoxLayout()
         log_title = QLabel("最近日志")
@@ -884,13 +929,12 @@ class BridgeWindow(QMainWindow):
         log_header.addWidget(manage_logs)
         layout.addLayout(log_header)
         self.logs_table = DataTable(["时间", "级别", "消息"])
-        self.logs_table.setMinimumHeight(220)
-        self.logs_table.setMaximumHeight(320)
+        self.logs_table.setMinimumHeight(180)
+        self.logs_table.setMaximumHeight(220)
         self._configure_log_table(self.logs_table)
         self.logs_refresh_label = self.home_refresh_label
         self.dashboard_refresh_label = self.home_refresh_label
         layout.addWidget(self.logs_table, 1)
-        page.setMinimumHeight(900)
         scroll = QScrollArea()
         scroll.setObjectName("pageScroll")
         scroll.setWidgetResizable(True)
@@ -1984,7 +2028,7 @@ class BridgeWindow(QMainWindow):
         if errors:
             self.show_message(errors[0], "error")
             return False
-        minutes = self._auto_minutes()
+        seconds = self._auto_seconds()
         try:
             save_env_values(
                 {
@@ -1994,7 +2038,8 @@ class BridgeWindow(QMainWindow):
                     "RECEIVE_RULE_REQUIRE_ATTACHMENT": str(target_attachment).lower(),
                     "AUTO_RECEIVE_ONLY_SELF_MAIL": str(target_mode == SELF_ONLY).lower(),
                     "GUI_AUTO_RECEIVE": str(self.auto_switch.isChecked()).lower(),
-                    "GUI_AUTO_RECEIVE_INTERVAL_MINUTES": str(minutes),
+                    "GUI_AUTO_RECEIVE_INTERVAL_SECONDS": str(seconds),
+                    "GUI_AUTO_RECEIVE_INTERVAL_MINUTES": str(max(1, seconds // 60)),
                 }
             )
         except OSError as exc:
@@ -2126,9 +2171,6 @@ class BridgeWindow(QMainWindow):
         dialog.exec()
 
     def receive(self) -> None:
-        if self.auto_switch.isChecked():
-            self.show_message("自动收取已开启，手动收取已禁用", "normal")
-            return
         sender = self.sender()
         button = sender if isinstance(sender, QPushButton) else None
         self._run_task(
@@ -2337,7 +2379,7 @@ class BridgeWindow(QMainWindow):
         if backend == "imap" and not (password.strip() or self.service.cfg.gmail_app_password):
             self.show_message("IMAP 模式需要 Gmail 应用专用密码", "error")
             return
-        minutes = int(self.interval_combo.currentData() or AUTO_RECEIVE_DEFAULT_MINUTES)
+        seconds = self._auto_seconds()
         previous_password = self.service.cfg.gmail_app_password
         if password.strip():
             credential_result = self.service.set_credential(GMAIL_IMAP_SECRET, password)
@@ -2353,7 +2395,8 @@ class BridgeWindow(QMainWindow):
                     "GMAIL_RECEIVE_BACKEND": backend,
                     "AUTO_RECEIVE_ONLY_SELF_MAIL": str(self.self_mail_check.isChecked()).lower(),
                     "GUI_AUTO_RECEIVE": str(self.auto_switch.isChecked()).lower(),
-                    "GUI_AUTO_RECEIVE_INTERVAL_MINUTES": str(minutes),
+                    "GUI_AUTO_RECEIVE_INTERVAL_SECONDS": str(seconds),
+                    "GUI_AUTO_RECEIVE_INTERVAL_MINUTES": str(max(1, seconds // 60)),
                 }
             )
         except OSError as exc:
@@ -2624,6 +2667,7 @@ class BridgeWindow(QMainWindow):
             if not managed_result.ok:
                 raise RuntimeError(managed_result.message)
             maintenance = self.service.get_maintenance_status()
+            auto_receive = self.service.get_auto_receive_state().details
         except Exception as exc:  # noqa: BLE001
             return ServiceResult(
                 OperationStatus.FAILED,
@@ -2640,6 +2684,7 @@ class BridgeWindow(QMainWindow):
                 "mcp": mcp,
                 "managed_files": managed_result.details.get("files", []),
                 "maintenance": maintenance.to_dict(),
+                "auto_receive": auto_receive,
             },
         )
 
@@ -2655,6 +2700,7 @@ class BridgeWindow(QMainWindow):
         self.history_rows = result.details.get("history", {"received": [], "sent": []})
         self.mcp_rows = result.details.get("mcp", [])
         self.managed_file_rows = result.details.get("managed_files", [])
+        self._update_auto_receive_status(result.details.get("auto_receive", {}))
         self._apply_config_to_controls(status)
         self._populate_files(self.files_table, self.file_rows, actions=True)
         self._populate_logs(self.logs_table, self.log_rows[:30])
@@ -2705,7 +2751,8 @@ class BridgeWindow(QMainWindow):
             self.qq_card.email_label.setText(cfg.qq_email or "未配置")
             self.gmail_card.set_configured(bool(cfg.gmail_address))
             self.qq_card.set_configured(bool(cfg.qq_email))
-            self.receive_account_label.setText(cfg.gmail_address or "尚未配置 Gmail 收件账号")
+            if hasattr(self, "receive_account_label"):
+                self.receive_account_label.setText(cfg.gmail_address or "尚未配置 Gmail 收件账号")
             self.self_mail_check.setChecked(cfg.auto_receive_only_self_mail)
             self._update_receive_preference_summary()
             self.recipient_edit.setText(cfg.owner_gmail or cfg.gmail_address)
@@ -2750,7 +2797,18 @@ class BridgeWindow(QMainWindow):
             oauth_text = "未配置" if "MISSING" in oauth_key else "需重新授权" if "EXPIRED" in oauth_key else "状态待检查"
         qq_text_short = "已配置" if qq == "configured" else "未配置"
         self.service_rows["service"].set_value("● 运行中", success=True)
-        self.service_rows["auto"].set_value("已开启" if self.auto_switch.isChecked() else "未开启", success=self.auto_switch.isChecked())
+        auto_state = getattr(self, "_auto_state", {})
+        auto_failures = int(auto_state.get("consecutive_global_failures") or 0)
+        auto_text = (
+            "连接退避" if self.auto_switch.isChecked() and auto_failures
+            else "正常运行" if self.auto_switch.isChecked()
+            else "未开启"
+        )
+        self.service_rows["auto"].set_value(
+            auto_text,
+            success=self.auto_switch.isChecked() and not auto_failures,
+            danger=bool(auto_failures),
+        )
         qq_text = self.service.cfg.qq_email or "未配置"
         self.service_rows["qq"].set_value(qq_text, success=qq == "configured")
         receive_time = self._latest_event_time(("receive", "收件"))
@@ -2762,8 +2820,9 @@ class BridgeWindow(QMainWindow):
         health_detail = (
             f"收件：{backend_text} · Gmail 授权：{oauth_text} · QQ 发件：{qq_text_short}"
         )
-        self.dashboard_health_detail.setText(health_detail)
-        self.dashboard_health_detail.setToolTip(health_detail)
+        if hasattr(self, "dashboard_health_detail"):
+            self.dashboard_health_detail.setText(health_detail)
+            self.dashboard_health_detail.setToolTip(health_detail)
 
         today = datetime.now().strftime("%Y-%m-%d")
         sent_today = sum(1 for row in self.history_rows.get("sent", []) if str(row.get("sent_at", "")).startswith(today) and row.get("status") in {"sent", "success"})
@@ -3336,6 +3395,7 @@ class BridgeWindow(QMainWindow):
             self.error_var.set("已有任务正在运行，请勿重复点击")
             return
         self.task_active = True
+        self._sync_manual_receive_actions()
         self._task_refresh_on_finish = refresh_on_finish
         self.status_var.set(title)
         self._active_task_button = button
@@ -3590,70 +3650,200 @@ class BridgeWindow(QMainWindow):
         self.show_message(f"已切换为{theme_name}", "success")
 
     def _sync_manual_receive_actions(self) -> None:
-        """自动收取期间禁止所有入口重复手动收取。"""
-        enabled = not self.auto_switch.isChecked()
-        hint = "自动收取已开启，关闭后可手动收取" if not enabled else ""
+        """自动任务执行中禁止重复启动；开启自动收取不禁用立即收取。"""
+        enabled = not self.task_active
+        hint = "当前已有检查任务正在运行" if not enabled else ""
         for button in self.manual_receive_buttons:
             button.setEnabled(enabled)
             button.setToolTip(hint)
 
     def _load_auto_receive_preferences(self) -> None:
-        minutes_text = os.getenv("GUI_AUTO_RECEIVE_INTERVAL_MINUTES", str(AUTO_RECEIVE_DEFAULT_MINUTES))
+        persisted = self.service.get_auto_receive_state().details
+        seconds_text = os.getenv("GUI_AUTO_RECEIVE_INTERVAL_SECONDS", "").strip()
         try:
-            minutes = max(1, int(minutes_text))
+            if seconds_text:
+                seconds = max(AUTO_RECEIVE_MIN_SECONDS, int(seconds_text))
+            else:
+                legacy_minutes = int(os.getenv("GUI_AUTO_RECEIVE_INTERVAL_MINUTES", "1"))
+                seconds = max(AUTO_RECEIVE_MIN_SECONDS, legacy_minutes * 60)
         except ValueError:
-            minutes = AUTO_RECEIVE_DEFAULT_MINUTES
-        self._set_combo_data(self.interval_combo, minutes)
-        enabled = os.getenv("GUI_AUTO_RECEIVE", "false").strip().lower() in {"1", "true", "yes", "on"}
+            seconds = AUTO_RECEIVE_DEFAULT_SECONDS
+        enabled = os.getenv("GUI_AUTO_RECEIVE", "false").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        if persisted.get("updated_at"):
+            seconds = max(
+                AUTO_RECEIVE_MIN_SECONDS,
+                int(persisted.get("interval_seconds") or seconds),
+            )
+            enabled = bool(persisted.get("enabled"))
+        self.auto_failures = int(persisted.get("consecutive_global_failures") or 0)
+        self._loading_auto_receive = True
+        self._set_combo_data(self.interval_combo, seconds)
         self.auto_switch.setChecked(enabled)
+        self._loading_auto_receive = False
         self._sync_manual_receive_actions()
-        self._reschedule_auto_receive()
+        self.service.save_auto_receive_state(
+            enabled=enabled,
+            interval_seconds=seconds,
+        )
+        if enabled:
+            self._schedule_auto_receive(3)
+        self._update_auto_receive_status(
+            self.service.get_auto_receive_state().details
+        )
 
     def _toggle_auto_receive(self, enabled: bool) -> None:
+        if self._loading_auto_receive:
+            return
         self._sync_manual_receive_actions()
+        self.service.save_auto_receive_state(
+            enabled=enabled,
+            interval_seconds=self._auto_seconds(),
+            consecutive_global_failures=0 if enabled else self.auto_failures,
+            next_check_at=None if not enabled else None,
+        )
         if enabled:
             self.auto_failures = 0
-            self._schedule_auto_receive()
-            self.show_message(f"自动收件已开启，每 {self._auto_minutes()} 分钟检查一次", "success")
+            self._schedule_auto_receive(3)
+            self.show_message(
+                f"自动收件已开启，每 {self._auto_seconds()} 秒检查一次，约 3 秒后首次检查",
+                "success",
+            )
         else:
             self.auto_timer.stop()
             self.show_message("自动收件已关闭", "normal")
         if hasattr(self, "service_rows"):
             self.service_rows["auto"].set_value("已开启" if enabled else "未开启", success=enabled)
+        self._update_auto_receive_status(
+            self.service.get_auto_receive_state().details
+        )
 
     def _reschedule_auto_receive(self) -> None:
+        if self._loading_auto_receive:
+            return
+        self.service.save_auto_receive_state(interval_seconds=self._auto_seconds())
         if hasattr(self, "auto_switch") and self.auto_switch.isChecked():
             self._schedule_auto_receive()
 
     def _automatic_receive(self) -> None:
-        if self.task_active:
-            self._schedule_auto_receive(1)
-            return
-        self._run_task("自动收件正在运行", self.service.receive, self._finish_auto_receive)
-
-    def _auto_minutes(self) -> int:
-        return int(self.interval_combo.currentData() or AUTO_RECEIVE_DEFAULT_MINUTES)
-
-    def _schedule_auto_receive(self, minutes: int | None = None) -> None:
         if not self.auto_switch.isChecked():
             return
-        delay = minutes if minutes is not None else self._auto_minutes()
-        self.auto_timer.start(max(1, delay) * 60 * 1000)
+        if self.task_active:
+            self._schedule_auto_receive(5)
+            return
+        now_text = datetime.now().isoformat(sep=" ", timespec="seconds")
+        self.service.save_auto_receive_state(
+            last_check_at=now_text,
+            last_result="checking",
+        )
+        self._update_auto_receive_status(
+            self.service.get_auto_receive_state().details
+        )
+        self._run_task("自动收件正在运行", self.service.receive, self._finish_auto_receive)
+
+    def _watchdog_auto_receive(self) -> None:
+        """睡眠、长暂停或事件循环阻塞恢复后尽快补偿检查。"""
+        if not self.auto_switch.isChecked() or self.task_active:
+            return
+        state = self.service.get_auto_receive_state().details
+        next_check = state.get("next_check_at")
+        if not next_check:
+            self._schedule_auto_receive(1)
+            return
+        try:
+            overdue = datetime.now() - datetime.fromisoformat(str(next_check))
+        except ValueError:
+            overdue = timedelta(seconds=1)
+        if overdue.total_seconds() >= 0:
+            self.auto_timer.start(1)
+
+    def _auto_seconds(self) -> int:
+        return max(
+            AUTO_RECEIVE_MIN_SECONDS,
+            int(self.interval_combo.currentData() or AUTO_RECEIVE_DEFAULT_SECONDS),
+        )
+
+    def _schedule_auto_receive(self, seconds: int | None = None) -> None:
+        if not self.auto_switch.isChecked():
+            return
+        delay = max(1, seconds if seconds is not None else self._auto_seconds())
+        self.auto_timer.start(delay * 1000)
+        next_check = (datetime.now() + timedelta(seconds=delay)).isoformat(
+            sep=" ", timespec="seconds"
+        )
+        self.service.save_auto_receive_state(
+            enabled=True,
+            interval_seconds=self._auto_seconds(),
+            next_check_at=next_check,
+        )
+        self._update_auto_receive_status(
+            self.service.get_auto_receive_state().details
+        )
 
     def _finish_auto_receive(self, result: ServiceResult) -> None:
         self._show_receive_result(result)
         if not self.auto_switch.isChecked():
             return
-        if result.needs_auth:
-            self.service_rows["auto"].set_value("需重新授权", danger=True)
-            return
-        if not result.ok:
+        now_text = datetime.now().isoformat(sep=" ", timespec="seconds")
+        if result.status in {OperationStatus.FAILED, OperationStatus.AUTH_REQUIRED}:
             self.auto_failures += 1
-            delay = min(self._auto_minutes() * (2 ** min(self.auto_failures, 3)), 60)
+            delay = AUTO_RECEIVE_BACKOFF_SECONDS[
+                min(self.auto_failures - 1, len(AUTO_RECEIVE_BACKOFF_SECONDS) - 1)
+            ]
+            self.service.save_auto_receive_state(
+                last_check_at=now_text,
+                last_result=result.status.value,
+                last_error=result.message or result.error_code,
+                consecutive_global_failures=self.auto_failures,
+            )
             self._schedule_auto_receive(delay)
             return
         self.auto_failures = 0
+        result_text = {
+            OperationStatus.NO_CHANGES: "暂无新邮件",
+            OperationStatus.PARTIAL: "部分完成，失败项已隔离重试",
+            OperationStatus.SUCCESS: "收件成功",
+        }.get(result.status, result.message or result.status.value)
+        self.service.save_auto_receive_state(
+            last_check_at=now_text,
+            last_success_at=now_text,
+            last_result=result_text,
+            last_error=None,
+            consecutive_global_failures=0,
+            checkpoint=now_text,
+        )
         self._schedule_auto_receive()
+
+    def _update_auto_receive_status(self, state: dict) -> None:
+        if not hasattr(self, "auto_state_values"):
+            return
+        self._auto_state = dict(state)
+        enabled = bool(state.get("enabled", self.auto_switch.isChecked()))
+        failures = int(state.get("consecutive_global_failures") or 0)
+        if not enabled:
+            state_text = "未开启"
+        elif self.task_active:
+            state_text = "正在检查"
+        elif failures:
+            state_text = "连接退避"
+        else:
+            state_text = "正常运行"
+        last_result = str(state.get("last_result") or "尚未检查")
+        if failures and state.get("last_error"):
+            last_result = f"连接失败：{state.get('last_error')}"
+        pending = int(state.get("pending") or state.get("pending_retries") or 0)
+        attention = int(state.get("needs_attention") or 0)
+        retries = str(pending)
+        if attention:
+            retries += f"，需处理 {attention}"
+        self.auto_state_values["state"].setText(state_text)
+        self.auto_state_values["last_check"].setText(self._short_time(state.get("last_check_at")))
+        self.auto_state_values["last_success"].setText(self._short_time(state.get("last_success_at")))
+        self.auto_state_values["next_check"].setText(self._short_time(state.get("next_check_at")))
+        self.auto_state_values["last_result"].setText(last_result)
+        self.auto_state_values["last_result"].setToolTip(last_result)
+        self.auto_state_values["retries"].setText(retries)
 
     def open_today_folder(self) -> None:
         today_folder = self.service.cfg.received_dir / datetime.now().strftime("%Y-%m-%d")
@@ -3836,17 +4026,22 @@ class BridgeWindow(QMainWindow):
         if self.tray_icon is None:
             self.showMinimized()
             return
+        self._hidden_window_was_maximized = self.isMaximized()
         self.hide()
         self.notify("Agent 邮箱桥接工具仍在运行", "可从系统托盘打开窗口或正常退出", "tray-hidden", 3600)
 
     def show_from_tray(self) -> None:
-        self.showNormal()
+        if self._hidden_window_was_maximized:
+            self.showMaximized()
+        else:
+            self.showNormal()
         self.raise_()
         self.activateWindow()
 
     def request_quit(self) -> None:
         self.accepting_tasks = False
         self.auto_timer.stop()
+        self.auto_watchdog.stop()
         if self.task_active:
             self.pending_quit = True
             self.show_message("正在等待当前任务安全结束", "working")
@@ -3856,7 +4051,7 @@ class BridgeWindow(QMainWindow):
     def _finalize_quit(self) -> None:
         self.quitting = True
         self.thread_pool.waitForDone(1000)
-        self.settings.setValue("window/geometry", self.saveGeometry())
+        self.settings.setValue("window/normal_geometry", self.normalGeometry())
         self.settings.setValue("window/last_page", self._current_page_name())
         self.settings.setValue("runtime/clean_exit", True)
         self.settings.sync()
@@ -3933,7 +4128,8 @@ class BridgeWindow(QMainWindow):
             return
         self.closed = True
         self.auto_timer.stop()
-        self.settings.setValue("window/geometry", self.saveGeometry())
+        self.auto_watchdog.stop()
+        self.settings.setValue("window/normal_geometry", self.normalGeometry())
         self.settings.setValue("window/last_page", self._current_page_name())
         if self.quitting or self.tray_icon is None:
             self.settings.setValue("runtime/clean_exit", True)
@@ -3946,3 +4142,8 @@ class BridgeWindow(QMainWindow):
         if hasattr(self, "vertical_resize_handle"):
             self.vertical_resize_handle.setGeometry(0, self.height() - 6, self.width() - 16, 6)
         super().resizeEvent(event)
+
+    def changeEvent(self, event) -> None:
+        if event.type() == QEvent.Type.WindowStateChange and hasattr(self, "title_bar"):
+            self.title_bar.sync_window_state()
+        super().changeEvent(event)

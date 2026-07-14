@@ -10,7 +10,11 @@ import subprocess
 import sys
 
 from agent_mail_bridge.application_service import ApplicationService
-from agent_mail_bridge.database import insert_mcp_call, update_mcp_call
+from agent_mail_bridge.database import (
+    insert_mcp_call,
+    query_recent_events,
+    update_mcp_call,
+)
 from agent_mail_bridge.models import OperationStatus
 from agent_mail_bridge.mcp_server import McpServer, SubmissionRateLimit
 
@@ -41,6 +45,7 @@ def test_submit_result_reuses_send_idempotency(tmp_cfg, monkeypatch):
     assert second.status == OperationStatus.DUPLICATE
     assert len(smtp_calls) == 1
     assert [item["status"] for item in calls[:2]] == ["duplicate", "sent"]
+    assert query_recent_events(tmp_cfg.db_path, 1)[0]["level"] == "SUCCESS"
 
 
 def test_submit_result_rejects_outside_path(tmp_cfg, tmp_path, monkeypatch):

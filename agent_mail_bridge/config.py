@@ -186,6 +186,8 @@ class AppConfig:
     max_fetch_limit: int = 30
     receive_unseen_only: bool = False
     receive_mark_seen: bool = False
+    receive_lookback_minutes: int = 30
+    receive_scan_cap: int = 500
 
     # --- 大小限制 (MB) ---
     max_attachment_mb: int = 25
@@ -299,6 +301,8 @@ class AppConfig:
             "max_fetch_limit": self.max_fetch_limit,
             "receive_unseen_only": self.receive_unseen_only,
             "receive_mark_seen": self.receive_mark_seen,
+            "receive_lookback_minutes": self.receive_lookback_minutes,
+            "receive_scan_cap": self.receive_scan_cap,
             "max_attachment_mb": self.max_attachment_mb,
             "max_send_file_mb": self.max_send_file_mb,
             "log_level": self.log_level,
@@ -452,6 +456,12 @@ def load_config(env_path: Path | str | None = None) -> AppConfig:
         max_fetch_limit=_as_int(os.getenv("MAX_FETCH_LIMIT"), 30),
         receive_unseen_only=_as_bool(os.getenv("RECEIVE_UNSEEN_ONLY"), False),
         receive_mark_seen=_as_bool(os.getenv("RECEIVE_MARK_SEEN"), False),
+        receive_lookback_minutes=_as_positive_int(
+            os.getenv("RECEIVE_LOOKBACK_MINUTES"), "RECEIVE_LOOKBACK_MINUTES", 30
+        ),
+        receive_scan_cap=_as_positive_int(
+            os.getenv("RECEIVE_SCAN_CAP"), "RECEIVE_SCAN_CAP", 500
+        ),
         max_attachment_mb=_as_int(os.getenv("MAX_ATTACHMENT_MB"), 25),
         max_send_file_mb=_as_int(os.getenv("MAX_SEND_FILE_MB"), 25),
         log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),

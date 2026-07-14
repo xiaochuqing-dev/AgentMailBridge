@@ -325,6 +325,7 @@ def test_manual_and_automatic_receive_call_the_same_service_operation(
         "_run_task",
         lambda _title, operation, _callback, **_kwargs: automatic.append(operation),
     )
+    specialty_window.auto_switch.setChecked(True)
     specialty_window._automatic_receive()
     assert automatic and automatic[0] == specialty_window.service.receive
 

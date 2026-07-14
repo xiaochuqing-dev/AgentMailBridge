@@ -28,6 +28,8 @@ from agent_mail_bridge.credentials import (
     QQ_SMTP_SECRET,
 )
 from agent_mail_bridge.database import (
+    count_receive_retries,
+    get_auto_receive_state,
     init_db,
     insert_mcp_call,
     log_event,
@@ -37,6 +39,8 @@ from agent_mail_bridge.database import (
     query_recent_sent_files,
     query_sent_files_by_date,
     update_mcp_call,
+    update_mcp_staging,
+    save_auto_receive_state,
 )
 from agent_mail_bridge.file_index import list_received_files_for_date, scan_file_status
 from agent_mail_bridge.gmail_api_auth import get_oauth_state
@@ -60,8 +64,16 @@ from agent_mail_bridge.security import (
     check_size_ok,
     is_dangerous,
 )
-from agent_mail_bridge.storage import ensure_data_dirs
+from agent_mail_bridge.storage import atomic_copy_file, ensure_data_dirs
 from agent_mail_bridge.utils import fmt_date, sanitize_filename, sha256_of_file
+
+
+class _McpStagingHandled(Exception):
+    """携带已产品化的 staging 拒绝结果，避免落入内部错误。"""
+
+    def __init__(self, result: SendResult):
+        super().__init__(result.message)
+        self.result = result
 
 
 class ApplicationService:
@@ -244,10 +256,11 @@ class ApplicationService:
             failures = int(raw.get("failed", len(raw.get("errors", []))))
             saved = int(raw.get("saved", 0))
             errors = list(raw.get("errors", []))
-            if failures and saved:
-                status = OperationStatus.PARTIAL
-            elif failures or not raw.get("ok", True):
+            retry_counts = count_receive_retries(self.cfg.db_path)
+            if raw.get("global_error") or not raw.get("ok", True):
                 status = OperationStatus.FAILED
+            elif failures:
+                status = OperationStatus.PARTIAL
             elif saved == 0:
                 status = OperationStatus.NO_CHANGES
             else:
@@ -264,6 +277,8 @@ class ApplicationService:
                 attachments=int(raw.get("attachments", 0)),
                 saved_files=list(raw.get("saved_files", [])),
                 errors=errors,
+                pending_retries=int(raw.get("pending_retries", retry_counts["pending"])),
+                needs_attention=int(raw.get("needs_attention", retry_counts["needs_attention"])),
                 error_code=(
                     "partial_receive" if status == OperationStatus.PARTIAL
                     else _classify_receive_error(errors[0]) if errors else None
@@ -277,12 +292,32 @@ class ApplicationService:
         finally:
             self._receive_lock.release()
 
+    def get_auto_receive_state(self) -> ServiceResult:
+        """供 GUI 展示真实持久化调度与坏邮件隔离状态。"""
+        self.initialize()
+        state = get_auto_receive_state(self.cfg.db_path)
+        state["enabled"] = bool(state.get("enabled"))
+        state.update(count_receive_retries(self.cfg.db_path))
+        return ServiceResult(OperationStatus.SUCCESS, details=state)
+
+    def save_auto_receive_state(self, **changes: Any) -> ServiceResult:
+        """由 GUI 调度器原子更新可恢复状态。"""
+        self.initialize()
+        state = save_auto_receive_state(self.cfg.db_path, **changes)
+        state["enabled"] = bool(state.get("enabled"))
+        state.update(count_receive_retries(self.cfg.db_path))
+        return ServiceResult(OperationStatus.SUCCESS, details=state)
+
     def send_file(
         self,
         file_path: str | Path,
         *,
         subject: str | None = None,
         request_id: str | None = None,
+        attachment_name: str | None = None,
+        source_origin: str = "controlled",
+        source_sha256: str | None = None,
+        staged_sha256: str | None = None,
     ) -> SendResult:
         """发送白名单目录内文件，request_id 用于安全重试。"""
         self.initialize()
@@ -290,6 +325,10 @@ class ApplicationService:
         raw = send_file_with_request(
             file_path, request_id=stable_request_id,
             subject=subject, cfg=self.cfg,
+            attachment_name=attachment_name,
+            source_origin=source_origin,
+            source_sha256=source_sha256,
+            staged_sha256=staged_sha256,
         )
         status_map = {
             "success": OperationStatus.SUCCESS,
@@ -308,6 +347,12 @@ class ApplicationService:
             subject=raw.get("subject", subject or ""),
             to_email=raw.get("to", self.cfg.owner_gmail),
             sent_at=raw.get("sent_at", ""),
+            filename=raw.get("filename", attachment_name or Path(file_path).name),
+            size_bytes=int(raw.get("size_bytes") or 0),
+            source_sha256=raw.get("source_sha256", ""),
+            staged_sha256=raw.get("staged_sha256", ""),
+            attachment_pre_smtp_sha256=raw.get("attachment_pre_smtp_sha256", ""),
+            sent_archive_sha256=raw.get("sent_archive_sha256", ""),
             error_code=raw.get("error_code"),
             message=raw.get("error", "发送完成"),
             details={"previous_status": raw.get("previous_status")},
@@ -412,10 +457,119 @@ class ApplicationService:
             title=title,
         )
         try:
+            source = assert_within_allowed_roots(
+                Path(file_path), self.cfg.effective_allowed_send_roots
+            )
+            if not source.exists() or not source.is_file():
+                raise FileNotFoundError("待提交文件不存在")
+            if is_dangerous(source.name):
+                result = SendResult(
+                    OperationStatus.FAILED,
+                    request_id=stable_request_id,
+                    send_status="not_sent",
+                    error_code="file_type_not_allowed",
+                    message="危险扩展名文件禁止发送",
+                )
+                raise _McpStagingHandled(result)
+            source_size = source.stat().st_size
+            if not check_size_ok(source_size, self.cfg.max_send_file_bytes):
+                result = SendResult(
+                    OperationStatus.FAILED,
+                    request_id=stable_request_id,
+                    send_status="not_sent",
+                    error_code="file_too_large",
+                    message="文件超过发送大小限制",
+                )
+                raise _McpStagingHandled(result)
+            source_sha = sha256_of_file(source)
+            request_folder = uuid.uuid5(uuid.NAMESPACE_URL, stable_request_id).hex
+            staged_name = sanitize_filename(source.stem) + source.suffix.lower()
+            staged = self.cfg.send_dir / "staging" / "mcp" / request_folder / staged_name
+            if staged.exists():
+                staged_size = staged.stat().st_size
+                staged_sha = sha256_of_file(staged)
+                if staged_size != source_size or staged_sha != source_sha:
+                    raise OSError("同一 request_id 的受控 staging 内容不一致")
+            else:
+                atomic_copy_file(source, staged)
+                staged_size = staged.stat().st_size
+                staged_sha = sha256_of_file(staged)
+            if staged_size != source_size or staged_sha != source_sha:
+                raise OSError("受控 staging 与源文件字节校验不一致")
+            update_mcp_staging(
+                self.cfg.db_path,
+                call_id,
+                staging_status="staged",
+                staged_path=str(staged),
+                source_size_bytes=source_size,
+                staged_size_bytes=staged_size,
+                source_sha256=source_sha,
+                staged_sha256=staged_sha,
+            )
             result = self.send_file(
-                file_path,
+                staged,
                 subject=title,
                 request_id=stable_request_id,
+                attachment_name=source.name,
+                source_origin="mcp_staged",
+                source_sha256=source_sha,
+                staged_sha256=staged_sha,
+            )
+            result.source_path = str(source)
+            update_mcp_staging(
+                self.cfg.db_path,
+                call_id,
+                staging_status=("verified" if result.send_status in {"sent", "duplicate"} else "send_failed"),
+                attachment_sha256=result.attachment_pre_smtp_sha256 or None,
+                sent_archive_sha256=result.sent_archive_sha256 or None,
+                failure_reason=None if result.send_status in {"sent", "duplicate"} else result.message,
+            )
+        except _McpStagingHandled as exc:
+            result = exc.result
+            update_mcp_staging(
+                self.cfg.db_path,
+                call_id,
+                staging_status="rejected",
+                failure_reason=result.message,
+            )
+        except SecurityError as exc:
+            result = SendResult(
+                OperationStatus.FAILED,
+                request_id=stable_request_id,
+                send_status="not_sent",
+                source_path=path_text,
+                error_code="path_not_allowed",
+                message=str(exc),
+            )
+            update_mcp_staging(
+                self.cfg.db_path, call_id,
+                staging_status="rejected", failure_reason=str(exc),
+            )
+        except FileNotFoundError as exc:
+            result = SendResult(
+                OperationStatus.FAILED,
+                request_id=stable_request_id,
+                send_status="not_sent",
+                source_path=path_text,
+                error_code="file_not_found",
+                message=str(exc),
+            )
+            update_mcp_staging(
+                self.cfg.db_path, call_id,
+                staging_status="failed", failure_reason=str(exc),
+            )
+        except OSError as exc:
+            result = SendResult(
+                OperationStatus.FAILED,
+                request_id=stable_request_id,
+                send_status="not_sent",
+                source_path=path_text,
+                error_code="staging_failed",
+                message=f"创建受控 staging 失败：{exc}",
+            )
+            update_mcp_staging(
+                self.cfg.db_path, call_id,
+                staging_status="failed", failure_reason=str(exc),
             )
         except Exception as exc:  # noqa: BLE001
             result = SendResult(
@@ -437,7 +591,7 @@ class ApplicationService:
         )
         log_event(
             self.cfg.db_path,
-            "SUCCESS" if result.ok else "ERROR",
+            "SUCCESS" if result.ok or result.status == OperationStatus.DUPLICATE else "ERROR",
             "mcp",
             f"MCP 提交完成：request_id={stable_request_id}，状态={audit_status}",
         )
@@ -449,7 +603,7 @@ class ApplicationService:
         self.initialize()
         rows = _sanitize_history_paths(
             query_recent_mcp_calls(self.cfg.db_path, max(1, limit)),
-            ("file_path",),
+            ("file_path", "staged_path"),
             self.cfg.effective_allowed_send_roots,
         )
         return ServiceResult(

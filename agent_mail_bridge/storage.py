@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import shutil
+import os
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -166,6 +168,23 @@ def copy_file(src: Path | str, dst: Path | str) -> Path:
     # 注：这里不做强校验，因为调用方已控制路径；越权校验在 security 层
     shutil.copy2(src, dst)
     return dst
+
+
+def atomic_copy_file(src: Path | str, dst: Path | str) -> Path:
+    """在目标目录内复制到临时文件后原子替换，避免暴露半成品。"""
+    source = Path(src)
+    target = Path(dst)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        shutil.copy2(source, temporary)
+        os.replace(temporary, target)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return target
 
 
 # ============================================================

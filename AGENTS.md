@@ -20,6 +20,23 @@ Do not expand the project into SaaS, multi-tenant infrastructure, a general emai
 
 Use `runtime_paths.py`. Frozen program files are read-only under the install directory. Installed configuration, OAuth and data are current-user writable paths under `%LOCALAPPDATA%\AgentMailBridge`. Source mode continues to support the repository `.env`. Do not depend on the current working directory or hard-code a user name or drive.
 
+## MCP reliability invariants
+
+- MCP stdout may contain protocol data only; diagnostics belong on stderr or in file logs.
+- MCP stdin, stdout and stderr must be explicitly UTF-8, and Chinese paths, filenames, titles, spaces, BOM input, flush and EOF must be tested.
+- Agents must not perform ad-hoc Copy-Item staging. AgentMailBridge validates allowed roots and performs atomic controlled staging.
+- Source, staged, pre-SMTP attachment and sent archive size/SHA-256 facts must remain auditable and must block sending on a pre-SMTP mismatch.
+- Real packaged MCP and loopback E2E evidence cannot be replaced by mocks; unexecuted external steps must be reported as unverified.
+
+## Automatic receive invariants
+
+- Automatic receive must start promptly, continue in the tray, recover after long pauses and never depend on the manual button.
+- Gmail API/IMAP must use overlapping lookback plus Message-ID/database dedupe; prefer a repeated scan over a missed message.
+- A single message or attachment failure must not block later mail. Persist finite retry state and keep global connection backoff separate.
+- `no_changes` is healthy, never increments failures and never triggers backoff. `partial` preserves successful work and continues normal scheduling.
+- True scheduler state, last check/success/result, next check and retry counts must remain observable after refresh and restart.
+- Maximize/restore must use the shared linear icon system, support title-bar double click and preserve a normal geometry constrained to the current Windows work area.
+
 ## Frontend information architecture
 
 - The top-level work area contains only Receive and Send.

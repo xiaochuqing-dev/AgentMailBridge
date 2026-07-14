@@ -311,6 +311,8 @@ def send_file_with_request(
     cfg: AppConfig,
     attachment_name: str | None = None,
     source_origin: str = "controlled",
+    source_sha256: str | None = None,
+    staged_sha256: str | None = None,
 ) -> dict[str, Any]:
     """按 request_id 幂等发送，并准确区分 SMTP 与归档状态。"""
     try:
@@ -333,6 +335,12 @@ def send_file_with_request(
         return _send_error_result(request_id, "configuration_error", str(exc))
 
     sha = sha256_of_file(source_path)
+    source_sha = source_sha256 or sha
+    staged_sha = staged_sha256 or sha
+    if sha != staged_sha:
+        return _send_error_result(
+            request_id, "staged_hash_mismatch", "受控 staging 文件 Hash 已变化，已阻止发送"
+        )
     confirmed_name = attachment_name or source_path.name
     actual_subject = subject or f"Agent执行结果 - {confirmed_name}"
     attempt_state, previous = create_or_retry_send_attempt(
@@ -346,6 +354,8 @@ def send_file_with_request(
         original_filename=confirmed_name,
         size_bytes=size_bytes,
         source_origin=source_origin,
+        source_sha256=source_sha,
+        staged_sha256=staged_sha,
     )
     if attempt_state == "duplicate":
         return {
@@ -356,12 +366,27 @@ def send_file_with_request(
             "error_code": "duplicate_request",
             "error": "相同发送请求已执行或正在执行，未重复发信",
             "previous_status": previous.get("status"),
+            "source_path": previous.get("source_path", ""),
+            "send_copy_path": previous.get("send_copy_path", ""),
+            "sent_copy_path": previous.get("sent_copy_path", ""),
+            "subject": previous.get("subject", actual_subject),
+            "to": previous.get("to_email", cfg.owner_gmail),
+            "sent_at": previous.get("sent_at", ""),
+            "filename": previous.get("original_filename") or confirmed_name,
+            "size_bytes": int(previous.get("size_bytes") or size_bytes),
+            "source_sha256": previous.get("source_sha256") or previous.get("sha256") or source_sha,
+            "staged_sha256": previous.get("staged_sha256") or previous.get("sha256") or staged_sha,
+            "attachment_pre_smtp_sha256": previous.get("attachment_sha256") or "",
+            "sent_archive_sha256": previous.get("sent_archive_sha256") or "",
         }
 
     now = now_local()
     try:
         send_copy_path = build_send_copy_path(cfg, source_path, now)
         copy_file(source_path, send_copy_path)
+        attachment_sha = sha256_of_file(send_copy_path)
+        if send_copy_path.stat().st_size != size_bytes or attachment_sha != staged_sha:
+            raise OSError("send 副本与受控 staging 文件校验不一致")
     except Exception as exc:  # noqa: BLE001
         error = f"创建 send 副本失败：{exc}"
         update_send_attempt(
@@ -382,6 +407,7 @@ def send_file_with_request(
         update_send_attempt(
             cfg.db_path, request_id, status="failed",
             send_copy_path=str(send_copy_path), error_message=error,
+            attachment_sha256=attachment_sha,
         )
         return _send_error_result(request_id, f"smtp_{exc.stage}_failed", error)
 
@@ -389,15 +415,20 @@ def send_file_with_request(
     update_send_attempt(
         cfg.db_path, request_id, status="sent",
         send_copy_path=str(send_copy_path), sent_at=sent_at,
+        attachment_sha256=attachment_sha,
     )
     try:
         sent_copy_path = build_sent_copy_path(cfg, source_path, now)
         copy_file(send_copy_path, sent_copy_path)
+        archive_sha = sha256_of_file(sent_copy_path)
+        if sent_copy_path.stat().st_size != size_bytes or archive_sha != attachment_sha:
+            raise OSError("sent 归档与 SMTP 附件来源校验不一致")
     except Exception as exc:  # noqa: BLE001
         error = f"SMTP 已发送，但本地 sent 归档失败：{exc}"
         update_send_attempt(
             cfg.db_path, request_id, status="sent_archive_failed",
             sent_at=sent_at, error_message=error,
+            attachment_sha256=attachment_sha,
         )
         return {
             "ok": True,
@@ -412,11 +443,19 @@ def send_file_with_request(
             "subject": actual_subject,
             "to": cfg.owner_gmail,
             "sent_at": sent_at,
+            "filename": confirmed_name,
+            "size_bytes": size_bytes,
+            "source_sha256": source_sha,
+            "staged_sha256": staged_sha,
+            "attachment_pre_smtp_sha256": attachment_sha,
+            "sent_archive_sha256": "",
         }
 
     update_send_attempt(
         cfg.db_path, request_id, status="sent",
         sent_copy_path=str(sent_copy_path), sent_at=sent_at,
+        attachment_sha256=attachment_sha,
+        sent_archive_sha256=archive_sha,
     )
     return {
         "ok": True,
@@ -429,6 +468,12 @@ def send_file_with_request(
         "subject": actual_subject,
         "to": cfg.owner_gmail,
         "sent_at": sent_at,
+        "filename": confirmed_name,
+        "size_bytes": size_bytes,
+        "source_sha256": source_sha,
+        "staged_sha256": staged_sha,
+        "attachment_pre_smtp_sha256": attachment_sha,
+        "sent_archive_sha256": archive_sha,
     }
 
 
@@ -443,6 +488,7 @@ def _send_error_result(request_id: str, error_code: str, message: str) -> dict[s
             "file_type_not_allowed",
             "file_too_large",
             "file_copy_failed",
+            "staged_hash_mismatch",
         }
         else "failed"
     )

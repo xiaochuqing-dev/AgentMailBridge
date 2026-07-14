@@ -18,6 +18,7 @@ import email
 import imaplib
 import mimetypes
 import re
+from datetime import timedelta
 from email.message import Message
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -25,10 +26,15 @@ from typing import Any
 
 from agent_mail_bridge.config import AppConfig
 from agent_mail_bridge.database import (
+    clear_receive_retry,
+    count_receive_retries,
     insert_received_file,
     insert_received_message,
     log_event,
     message_id_exists,
+    query_due_receive_retries,
+    receive_retry_is_due,
+    record_receive_failure,
 )
 from agent_mail_bridge.logging_setup import get_logger
 from agent_mail_bridge.mail_common import (
@@ -148,8 +154,9 @@ def _receive_via_imap(
     from agent_mail_bridge.config import require_receive_config
     require_receive_config(cfg)
 
-    if limit is None:
-        limit = cfg.max_fetch_limit
+    scan_cap = limit if limit is not None else max(
+        cfg.max_fetch_limit, cfg.receive_scan_cap
+    )
     if unseen_only is None:
         unseen_only = cfg.receive_unseen_only
     if mark_seen is None:
@@ -166,6 +173,8 @@ def _receive_via_imap(
         "failed": 0,
         "saved_files": [],
         "errors": [],
+        "global_error": False,
+        "retry_deferred": 0,
     }
 
     gmail_addr = cfg.gmail_address.lower().strip()
@@ -196,6 +205,7 @@ def _receive_via_imap(
         logger.error(msg)
         log_event(cfg.db_path, "ERROR", "receive", msg)
         result["ok"] = False
+        result["global_error"] = True
         result["errors"].append(msg)
         return result
 
@@ -203,35 +213,65 @@ def _receive_via_imap(
         conn.select("INBOX")
 
         # 搜索条件
-        search_criteria = "UNSEEN" if unseen_only else "ALL"
-        typ, data = conn.search(None, search_criteria)
+        cutoff = now_local() - timedelta(minutes=max(1, cfg.receive_lookback_minutes))
+        criteria: list[str] = []
+        if unseen_only:
+            criteria.append("UNSEEN")
+        criteria.extend(("SINCE", _imap_date(cutoff)))
+        typ, data = conn.uid("search", None, *criteria)
         if typ != "OK":
             msg = f"IMAP 搜索失败：{typ}"
             logger.error(msg)
             log_event(cfg.db_path, "ERROR", "receive", msg)
             result["ok"] = False
+            result["global_error"] = True
             result["errors"].append(msg)
             return result
 
         uids = [u for u in data[0].split() if u]
         # 限制扫描数量；从最新的开始（UID 通常递增，倒序取最近 limit 封）
-        uids = uids[-limit:] if limit and limit > 0 else uids
+        uids = uids[-scan_cap:] if scan_cap and scan_cap > 0 else uids
+        known_uids = {uid.decode(errors="replace") for uid in uids}
+        for retry in query_due_receive_retries(
+            cfg.db_path, "imap", limit=min(100, scan_cap)
+        ):
+            resource_id = str(retry.get("resource_id") or "")
+            if resource_id and resource_id not in known_uids:
+                uids.append(resource_id.encode("ascii", errors="ignore"))
+                known_uids.add(resource_id)
         result["fetched"] = len(uids)
 
         for uid in uids:
+            resource_id = uid.decode(errors="replace")
+            if not receive_retry_is_due(cfg.db_path, "imap", resource_id):
+                result["skipped"] += 1
+                result["retry_deferred"] += 1
+                continue
             try:
                 _process_one_unified(conn, uid, cfg, mark_seen, result)
+                clear_receive_retry(cfg.db_path, "imap", resource_id)
             except Exception as exc:  # noqa: BLE001
-                err = f"处理邮件 uid={uid.decode(errors='replace')} 失败：{exc}"
+                err = f"处理邮件 uid={resource_id} 失败：{exc}"
                 logger.warning("处理邮件失败", exc_info=True)
                 logger.warning(err)
                 log_event(cfg.db_path, "WARNING", "receive", err)
                 result["errors"].append(err)
                 result["failed"] += 1
+                record_receive_failure(
+                    cfg.db_path,
+                    backend="imap",
+                    resource_id=resource_id,
+                    message_id=resource_id,
+                    error=str(exc),
+                )
+
+        retry_counts = count_receive_retries(cfg.db_path)
+        result["pending_retries"] = retry_counts["pending"]
+        result["needs_attention"] = retry_counts["needs_attention"]
 
         log_event(
             cfg.db_path,
-            "SUCCESS",
+            "WARNING" if result["failed"] else "SUCCESS",
             "receive",
             f"收取完成：扫描 {result['fetched']} 封，新存 {result['saved']} 封，"
             f"跳过 {result['skipped']} 封，附件 {result['attachments']} 个",
@@ -414,7 +454,7 @@ def _process_one_unified(
     result: dict[str, Any],
 ) -> None:
     """把 IMAP 原始邮件转换后交给统一业务流程。"""
-    fetch_typ, fetch_data = conn.fetch(uid, "(RFC822)")
+    fetch_typ, fetch_data = conn.uid("fetch", uid, "(BODY.PEEK[])")
     if fetch_typ != "OK" or not fetch_data or not fetch_data[0]:
         raise RuntimeError("IMAP 未返回邮件原文")
     raw = fetch_data[0][1]
@@ -449,7 +489,16 @@ def _process_one_unified(
     else:
         result["skipped"] += 1
     if mark_seen and status in {"saved", "duplicate"}:
-        conn.store(uid, "+FLAGS", "\\Seen")
+        conn.uid("store", uid, "+FLAGS", "\\Seen")
+
+
+def _imap_date(value) -> str:
+    """生成不受 Windows 当前区域设置影响的 IMAP SINCE 日期。"""
+    months = (
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    )
+    return f"{value.day:02d}-{months[value.month - 1]}-{value.year:04d}"
 
 
 def _message_datetime(msg: Message):

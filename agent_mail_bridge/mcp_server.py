@@ -72,7 +72,11 @@ class McpServer:
                 line = raw_line.strip()
                 if not line:
                     continue
-                response = self.handle_line(line)
+                try:
+                    response = self.handle_line(line)
+                except Exception:  # noqa: BLE001
+                    # 单条请求异常必须结构化返回，诊断不得污染 stdout。
+                    response = _error_response(None, -32603, "MCP 内部错误，请查看应用日志")
                 if response is not None:
                     self._write(response)
             return 0
@@ -80,6 +84,8 @@ class McpServer:
             close_connection()
 
     def handle_line(self, line: str) -> dict[str, Any] | None:
+        # 接受某些 Windows 客户端在首条 UTF-8 JSON 前写入的 BOM。
+        line = line.lstrip("\ufeff")
         try:
             message = json.loads(line)
         except json.JSONDecodeError:
@@ -235,7 +241,7 @@ def _submit_result_tool() -> dict[str, Any]:
     return {
         "name": "submit_result",
         "title": "提交 Agent 结果",
-        "description": "将允许目录内的本地结果文件发送到固定 Gmail 收件人。",
+        "description": "验证允许目录内的结果文件，由产品原子 staging、校验 Hash 后发送到固定 Gmail 收件人。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -258,6 +264,12 @@ def _submit_result_tool() -> dict[str, Any]:
                 "request_id": {"type": "string"},
                 "error_code": {"type": ["string", "null"]},
                 "message": {"type": "string"},
+                "filename": {"type": "string"},
+                "size_bytes": {"type": "integer"},
+                "source_sha256": {"type": "string"},
+                "staged_sha256": {"type": "string"},
+                "attachment_pre_smtp_sha256": {"type": "string"},
+                "sent_archive_sha256": {"type": "string"},
             },
             "required": ["status", "ok", "request_id", "message"],
         },
@@ -330,10 +342,17 @@ def _error_response(
 
 
 def main() -> None:
-    for stream in (sys.stdin, sys.stdout, sys.stderr):
+    for stream, errors in (
+        (sys.stdin, "strict"),
+        (sys.stdout, "strict"),
+        (sys.stderr, "backslashreplace"),
+    ):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is not None:
-            reconfigure(encoding="utf-8")
+            options: dict[str, Any] = {"encoding": "utf-8", "errors": errors}
+            if stream is not sys.stdin:
+                options["write_through"] = True
+            reconfigure(**options)
     service = ApplicationService(load_config())
     raise SystemExit(McpServer(service).serve())
 

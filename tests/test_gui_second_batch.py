@@ -10,12 +10,13 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QThread
+from PySide6.QtCore import QThread, Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from agent_mail_bridge.application_service import ApplicationService
 from agent_mail_bridge.models import OperationStatus, ReceiveResult, ServiceResult
-from agent_mail_bridge.ui.main_window import AUTO_RECEIVE_DEFAULT_MINUTES, BridgeWindow
+from agent_mail_bridge.ui.main_window import AUTO_RECEIVE_DEFAULT_SECONDS, BridgeWindow
 from agent_mail_bridge.ui.account_management import AccountSettingsController
 from agent_mail_bridge.ui.settings_store import save_env_values
 from agent_mail_bridge.ui.theme import build_stylesheet, load_interface_font
@@ -79,25 +80,73 @@ def test_agent_page_exposes_safe_stdio_configuration(bridge_window):
     assert "codex mcp add agent-mail-bridge" in QApplication.clipboard().text()
 
 
-def test_auto_receive_interval_uses_minutes(bridge_window):
-    index = bridge_window.interval_combo.findData(AUTO_RECEIVE_DEFAULT_MINUTES)
+def test_auto_receive_starts_immediately_then_uses_default_seconds(bridge_window):
+    index = bridge_window.interval_combo.findData(AUTO_RECEIVE_DEFAULT_SECONDS)
     bridge_window.interval_combo.setCurrentIndex(index)
     bridge_window.auto_switch.setChecked(True)
     assert bridge_window.auto_timer.isActive()
-    # 3 分钟对应 180000 毫秒。
-    assert bridge_window.auto_timer.interval() == 180000
+    assert bridge_window.auto_timer.interval() == 3000
+    bridge_window._finish_auto_receive(ReceiveResult(OperationStatus.NO_CHANGES))
+    assert bridge_window.auto_timer.interval() == 60000
     bridge_window.auto_switch.setChecked(False)
     assert not bridge_window.auto_timer.isActive()
 
 
-def test_auto_receive_disables_manual_receive_actions(bridge_window):
+def test_auto_receive_keeps_guarded_manual_receive_action(bridge_window):
     bridge_window.auto_switch.setChecked(True)
-    assert not bridge_window.receive_button.isEnabled()
-    assert all(not button.isEnabled() for button in bridge_window.manual_receive_buttons)
-    assert "自动收取已开启" in bridge_window.receive_button.toolTip()
-
-    bridge_window.auto_switch.setChecked(False)
     assert all(button.isEnabled() for button in bridge_window.manual_receive_buttons)
+    bridge_window.task_active = True
+    bridge_window._sync_manual_receive_actions()
+    assert all(not button.isEnabled() for button in bridge_window.manual_receive_buttons)
+    assert "正在运行" in bridge_window.receive_button.toolTip()
+
+
+def test_auto_receive_backoff_resets_and_status_is_observable(bridge_window):
+    bridge_window.task_active = False
+    bridge_window.auto_switch.setChecked(True)
+    bridge_window._finish_auto_receive(
+        ReceiveResult(
+            OperationStatus.FAILED,
+            error_code="network_error",
+            message="网络暂时不可用",
+        )
+    )
+    assert bridge_window.auto_timer.interval() == 30000
+    assert bridge_window.auto_state_values["state"].text() == "连接退避"
+    assert "网络暂时不可用" in bridge_window.auto_state_values["last_result"].text()
+
+    bridge_window._finish_auto_receive(
+        ReceiveResult(OperationStatus.NO_CHANGES, message="检查完成，暂时没有新邮件")
+    )
+    assert bridge_window.auto_timer.interval() == 60000
+    assert bridge_window.auto_state_values["state"].text() == "正常运行"
+    assert bridge_window.auto_state_values["last_result"].text() == "暂无新邮件"
+
+    bridge_window.service.save_auto_receive_state(
+        next_check_at="2020-01-01 00:00:00"
+    )
+    bridge_window._watchdog_auto_receive()
+    assert bridge_window.auto_timer.interval() == 1
+
+
+def test_tray_hide_keeps_scheduler_and_window_controls_toggle(bridge_window, qt_app):
+    bridge_window.auto_switch.setChecked(True)
+    bridge_window.minimize_to_tray()
+    assert bridge_window.auto_timer.isActive()
+    bridge_window.show_from_tray()
+
+    bridge_window.title_bar._toggle_maximized()
+    qt_app.processEvents()
+    assert bridge_window.isMaximized()
+    assert bridge_window.title_bar.maximize_button.toolTip() == "还原"
+    bridge_window.title_bar._toggle_maximized()
+    qt_app.processEvents()
+    assert not bridge_window.isMaximized()
+    assert bridge_window.title_bar.maximize_button.toolTip() == "最大化"
+
+    QTest.mouseDClick(bridge_window.title_bar, Qt.MouseButton.LeftButton)
+    qt_app.processEvents()
+    assert bridge_window.isMaximized()
 
 
 def test_diagnose_only_disables_clicked_button_and_announces_recovery(bridge_window, qt_app):

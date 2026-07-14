@@ -1,7 +1,7 @@
 """SQLite 数据库模块。
 
 职责：
-1. 初始化 5 张表：received_messages / received_files / sent_files / mcp_calls / app_events。
+1. 初始化业务表、MCP 审计表、自动收件状态表与有限重试表。
 2. 提供线程安全的连接管理（每线程一个连接）。
 3. 提供增 / 改 / 查函数，供收件 / 发件 / 文件扫描 / GUI 调用。
 
@@ -13,7 +13,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -77,6 +77,10 @@ CREATE TABLE IF NOT EXISTS sent_files (
     original_filename TEXT,
     size_bytes INTEGER,
     source_origin TEXT NOT NULL DEFAULT 'controlled',
+    source_sha256 TEXT,
+    staged_sha256 TEXT,
+    attachment_sha256 TEXT,
+    sent_archive_sha256 TEXT,
     created_at TEXT,
     updated_at TEXT
 );
@@ -97,8 +101,48 @@ CREATE TABLE IF NOT EXISTS mcp_calls (
     status TEXT NOT NULL,
     error_code TEXT,
     message TEXT,
+    staged_path TEXT,
+    source_size_bytes INTEGER,
+    staged_size_bytes INTEGER,
+    source_sha256 TEXT,
+    staged_sha256 TEXT,
+    attachment_sha256 TEXT,
+    sent_archive_sha256 TEXT,
+    staging_at TEXT,
+    staging_status TEXT,
+    staging_failure_reason TEXT,
     created_at TEXT,
     updated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS auto_receive_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled INTEGER NOT NULL DEFAULT 0,
+    interval_seconds INTEGER NOT NULL DEFAULT 60,
+    last_check_at TEXT,
+    last_success_at TEXT,
+    last_result TEXT,
+    last_error TEXT,
+    consecutive_global_failures INTEGER NOT NULL DEFAULT 0,
+    next_check_at TEXT,
+    checkpoint TEXT,
+    updated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS receive_retries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    backend TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    message_id TEXT,
+    attachment_id TEXT NOT NULL DEFAULT '',
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    last_attempt_at TEXT,
+    next_retry_at TEXT,
+    terminal_status TEXT,
+    created_at TEXT,
+    updated_at TEXT,
+    UNIQUE (backend, resource_id, attachment_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_received_messages_saved_date
@@ -115,6 +159,8 @@ CREATE INDEX IF NOT EXISTS idx_mcp_calls_created
     ON mcp_calls(created_at);
 CREATE INDEX IF NOT EXISTS idx_mcp_calls_request_id
     ON mcp_calls(request_id);
+CREATE INDEX IF NOT EXISTS idx_receive_retries_next_retry
+    ON receive_retries(next_retry_at);
 """
 
 
@@ -133,7 +179,27 @@ _SENT_FILES_NEW_COLUMNS = {
     "original_filename": "TEXT",
     "size_bytes": "INTEGER",
     "source_origin": "TEXT NOT NULL DEFAULT 'controlled'",
+    "source_sha256": "TEXT",
+    "staged_sha256": "TEXT",
+    "attachment_sha256": "TEXT",
+    "sent_archive_sha256": "TEXT",
 }
+
+_MCP_CALLS_NEW_COLUMNS = {
+    "staged_path": "TEXT",
+    "source_size_bytes": "INTEGER",
+    "staged_size_bytes": "INTEGER",
+    "source_sha256": "TEXT",
+    "staged_sha256": "TEXT",
+    "attachment_sha256": "TEXT",
+    "sent_archive_sha256": "TEXT",
+    "staging_at": "TEXT",
+    "staging_status": "TEXT",
+    "staging_failure_reason": "TEXT",
+}
+
+RECEIVE_RETRY_DELAYS_SECONDS = (60, 300, 1800, 7200)
+RECEIVE_RETRY_TERMINAL_COUNT = 5
 
 
 def init_db(db_path: Path | str) -> None:
@@ -148,6 +214,7 @@ def init_db(db_path: Path | str) -> None:
         conn.executescript(SCHEMA_SQL)
         _migrate_received_messages(conn)
         _migrate_sent_files(conn)
+        _migrate_mcp_calls(conn)
         _ensure_unique_indexes(conn)
         conn.commit()
 
@@ -176,6 +243,16 @@ def _migrate_sent_files(conn: sqlite3.Connection) -> None:
     for col, col_type in _SENT_FILES_NEW_COLUMNS.items():
         if col not in existing:
             conn.execute(f"ALTER TABLE sent_files ADD COLUMN {col} {col_type}")
+
+
+def _migrate_mcp_calls(conn: sqlite3.Connection) -> None:
+    """为旧数据库补充 MCP staging 与完整性审计字段。"""
+    existing = {
+        row["name"] for row in conn.execute("PRAGMA table_info(mcp_calls)").fetchall()
+    }
+    for col, col_type in _MCP_CALLS_NEW_COLUMNS.items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE mcp_calls ADD COLUMN {col} {col_type}")
 
 
 def _ensure_unique_indexes(conn: sqlite3.Connection) -> None:
@@ -648,6 +725,8 @@ def create_or_retry_send_attempt(
     original_filename: str | None = None,
     size_bytes: int | None = None,
     source_origin: str = "controlled",
+    source_sha256: str | None = None,
+    staged_sha256: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """创建发送尝试；失败记录可重试，已发送记录按重复返回。"""
     now = _now()
@@ -666,10 +745,12 @@ def create_or_retry_send_attempt(
                     """
                     UPDATE sent_files
                     SET status = 'attempt_created', error_message = NULL,
-                        attempt_count = attempt_count + 1, updated_at = ?
+                        attempt_count = attempt_count + 1,
+                        source_sha256 = COALESCE(?, source_sha256),
+                        staged_sha256 = COALESCE(?, staged_sha256), updated_at = ?
                     WHERE request_id = ?
                     """,
-                    (now, request_id),
+                    (source_sha256, staged_sha256, now, request_id),
                 )
                 conn.commit()
                 return "retry", get_send_by_request_id(db_path, request_id) or current
@@ -679,12 +760,13 @@ def create_or_retry_send_attempt(
                 INSERT INTO sent_files
                     (request_id, attempt_count, source_path, sha256, subject,
                      from_email, to_email, status, original_filename, size_bytes,
-                     source_origin, created_at, updated_at)
-                VALUES (?, 1, ?, ?, ?, ?, ?, 'attempt_created', ?, ?, ?, ?, ?)
+                     source_origin, source_sha256, staged_sha256, created_at, updated_at)
+                VALUES (?, 1, ?, ?, ?, ?, ?, 'attempt_created', ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     request_id, source_path, sha256, subject, from_email, to_email,
-                    original_filename, size_bytes, source_origin, now, now,
+                    original_filename, size_bytes, source_origin,
+                    source_sha256, staged_sha256, now, now,
                 ),
             )
             conn.commit()
@@ -703,6 +785,8 @@ def update_send_attempt(
     sent_copy_path: str | None = None,
     sent_at: str | None = None,
     error_message: str | None = None,
+    attachment_sha256: str | None = None,
+    sent_archive_sha256: str | None = None,
 ) -> None:
     """更新一次发送尝试的准确最终状态。"""
     with _get_conn(db_path) as conn:
@@ -711,12 +795,16 @@ def update_send_attempt(
             UPDATE sent_files
             SET status = ?, send_copy_path = COALESCE(?, send_copy_path),
                 sent_copy_path = COALESCE(?, sent_copy_path),
-                sent_at = COALESCE(?, sent_at), error_message = ?, updated_at = ?
+                sent_at = COALESCE(?, sent_at), error_message = ?,
+                attachment_sha256 = COALESCE(?, attachment_sha256),
+                sent_archive_sha256 = COALESCE(?, sent_archive_sha256),
+                updated_at = ?
             WHERE request_id = ?
             """,
             (
                 status, send_copy_path, sent_copy_path, sent_at,
-                error_message, _now(), request_id,
+                error_message, attachment_sha256, sent_archive_sha256,
+                _now(), request_id,
             ),
         )
         conn.commit()
@@ -798,6 +886,46 @@ def update_mcp_call(
         conn.commit()
 
 
+def update_mcp_staging(
+    db_path: Path | str,
+    call_id: int,
+    *,
+    staging_status: str,
+    staged_path: str | None = None,
+    source_size_bytes: int | None = None,
+    staged_size_bytes: int | None = None,
+    source_sha256: str | None = None,
+    staged_sha256: str | None = None,
+    attachment_sha256: str | None = None,
+    sent_archive_sha256: str | None = None,
+    failure_reason: str | None = None,
+) -> None:
+    """持久化 MCP 受控 staging 与端到端本地 Hash 事实。"""
+    with _get_conn(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE mcp_calls
+            SET staged_path = COALESCE(?, staged_path),
+                source_size_bytes = COALESCE(?, source_size_bytes),
+                staged_size_bytes = COALESCE(?, staged_size_bytes),
+                source_sha256 = COALESCE(?, source_sha256),
+                staged_sha256 = COALESCE(?, staged_sha256),
+                attachment_sha256 = COALESCE(?, attachment_sha256),
+                sent_archive_sha256 = COALESCE(?, sent_archive_sha256),
+                staging_at = COALESCE(staging_at, ?), staging_status = ?,
+                staging_failure_reason = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                staged_path, source_size_bytes, staged_size_bytes,
+                source_sha256, staged_sha256, attachment_sha256,
+                sent_archive_sha256, _now(), staging_status,
+                failure_reason, _now(), call_id,
+            ),
+        )
+        conn.commit()
+
+
 def query_recent_mcp_calls(
     db_path: Path | str, limit: int = 100
 ) -> list[dict[str, Any]]:
@@ -807,6 +935,222 @@ def query_recent_mcp_calls(
             "SELECT * FROM mcp_calls ORDER BY id DESC LIMIT ?", (max(1, limit),)
         ).fetchall()
         return [dict(row) for row in rows]
+
+
+# ============================================================
+# auto_receive_state / receive_retries
+# ============================================================
+
+def get_auto_receive_state(db_path: Path | str) -> dict[str, Any]:
+    """读取持久化调度状态；首次使用返回健康的默认状态。"""
+    with _get_conn(db_path) as conn:
+        row = conn.execute("SELECT * FROM auto_receive_state WHERE id = 1").fetchone()
+        if row is not None:
+            return dict(row)
+    return {
+        "id": 1,
+        "enabled": 0,
+        "interval_seconds": 60,
+        "last_check_at": None,
+        "last_success_at": None,
+        "last_result": None,
+        "last_error": None,
+        "consecutive_global_failures": 0,
+        "next_check_at": None,
+        "checkpoint": None,
+        "updated_at": None,
+    }
+
+
+def save_auto_receive_state(
+    db_path: Path | str,
+    **changes: Any,
+) -> dict[str, Any]:
+    """以白名单字段更新单行调度状态，跨重启保留真实运行事实。"""
+    allowed = {
+        "enabled", "interval_seconds", "last_check_at", "last_success_at",
+        "last_result", "last_error", "consecutive_global_failures",
+        "next_check_at", "checkpoint",
+    }
+    values = {key: value for key, value in changes.items() if key in allowed}
+    current = get_auto_receive_state(db_path)
+    current.update(values)
+    now = _now()
+    with _get_conn(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO auto_receive_state
+                (id, enabled, interval_seconds, last_check_at, last_success_at,
+                 last_result, last_error, consecutive_global_failures,
+                 next_check_at, checkpoint, updated_at)
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                enabled=excluded.enabled,
+                interval_seconds=excluded.interval_seconds,
+                last_check_at=excluded.last_check_at,
+                last_success_at=excluded.last_success_at,
+                last_result=excluded.last_result,
+                last_error=excluded.last_error,
+                consecutive_global_failures=excluded.consecutive_global_failures,
+                next_check_at=excluded.next_check_at,
+                checkpoint=excluded.checkpoint,
+                updated_at=excluded.updated_at
+            """,
+            (
+                1 if current.get("enabled") else 0,
+                max(30, int(current.get("interval_seconds") or 60)),
+                current.get("last_check_at"), current.get("last_success_at"),
+                current.get("last_result"), current.get("last_error"),
+                max(0, int(current.get("consecutive_global_failures") or 0)),
+                current.get("next_check_at"), current.get("checkpoint"), now,
+            ),
+        )
+        conn.commit()
+    return get_auto_receive_state(db_path)
+
+
+def get_receive_retry(
+    db_path: Path | str,
+    backend: str,
+    resource_id: str,
+    attachment_id: str = "",
+) -> dict[str, Any] | None:
+    with _get_conn(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM receive_retries
+            WHERE backend = ? AND resource_id = ? AND attachment_id = ?
+            """,
+            (backend, resource_id, attachment_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def receive_retry_is_due(
+    db_path: Path | str,
+    backend: str,
+    resource_id: str,
+    *,
+    attachment_id: str = "",
+    now: datetime | None = None,
+) -> bool:
+    """终态或未到 next_retry_at 的坏资源不会污染每轮轮询。"""
+    row = get_receive_retry(db_path, backend, resource_id, attachment_id)
+    if row is None:
+        return True
+    if row.get("terminal_status"):
+        return False
+    next_retry = row.get("next_retry_at")
+    if not next_retry:
+        return True
+    try:
+        due_at = datetime.fromisoformat(str(next_retry))
+    except ValueError:
+        return True
+    return (now or now_local()) >= due_at
+
+
+def query_due_receive_retries(
+    db_path: Path | str,
+    backend: str,
+    *,
+    now: datetime | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Return non-terminal retry resources even after they leave the overlap window."""
+    now_text = fmt_datetime(now or now_local())
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM receive_retries
+            WHERE backend = ? AND terminal_status IS NULL
+              AND (next_retry_at IS NULL OR next_retry_at <= ?)
+            ORDER BY COALESCE(next_retry_at, last_attempt_at) ASC, id ASC
+            LIMIT ?
+            """,
+            (backend, now_text, max(1, int(limit))),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def record_receive_failure(
+    db_path: Path | str,
+    *,
+    backend: str,
+    resource_id: str,
+    error: str,
+    message_id: str | None = None,
+    attachment_id: str = "",
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """记录单邮件或单附件有限重试，连接级失败不进入此表。"""
+    attempted_at = now or now_local()
+    previous = get_receive_retry(db_path, backend, resource_id, attachment_id)
+    retry_count = int(previous.get("retry_count") or 0) + 1 if previous else 1
+    terminal = "needs_attention" if retry_count >= RECEIVE_RETRY_TERMINAL_COUNT else None
+    if terminal:
+        next_retry_at = None
+    else:
+        delay_index = min(retry_count - 1, len(RECEIVE_RETRY_DELAYS_SECONDS) - 1)
+        next_retry_at = fmt_datetime(
+            attempted_at + timedelta(seconds=RECEIVE_RETRY_DELAYS_SECONDS[delay_index])
+        )
+    attempted_text = fmt_datetime(attempted_at)
+    with _get_conn(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO receive_retries
+                (backend, resource_id, message_id, attachment_id, retry_count,
+                 last_error, last_attempt_at, next_retry_at, terminal_status,
+                 created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(backend, resource_id, attachment_id) DO UPDATE SET
+                message_id=COALESCE(excluded.message_id, receive_retries.message_id),
+                retry_count=excluded.retry_count,
+                last_error=excluded.last_error,
+                last_attempt_at=excluded.last_attempt_at,
+                next_retry_at=excluded.next_retry_at,
+                terminal_status=excluded.terminal_status,
+                updated_at=excluded.updated_at
+            """,
+            (
+                backend, resource_id, message_id, attachment_id, retry_count,
+                error[:2000], attempted_text, next_retry_at, terminal,
+                attempted_text, attempted_text,
+            ),
+        )
+        conn.commit()
+    return get_receive_retry(db_path, backend, resource_id, attachment_id) or {}
+
+
+def clear_receive_retry(
+    db_path: Path | str,
+    backend: str,
+    resource_id: str,
+    attachment_id: str = "",
+) -> None:
+    with _get_conn(db_path) as conn:
+        conn.execute(
+            "DELETE FROM receive_retries WHERE backend = ? AND resource_id = ? AND attachment_id = ?",
+            (backend, resource_id, attachment_id),
+        )
+        conn.commit()
+
+
+def count_receive_retries(db_path: Path | str) -> dict[str, int]:
+    with _get_conn(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT
+                SUM(CASE WHEN terminal_status IS NULL THEN 1 ELSE 0 END) AS pending,
+                SUM(CASE WHEN terminal_status = 'needs_attention' THEN 1 ELSE 0 END) AS needs_attention
+            FROM receive_retries
+            """
+        ).fetchone()
+    return {
+        "pending": int(row["pending"] or 0),
+        "needs_attention": int(row["needs_attention"] or 0),
+    }
 
 
 # ============================================================

@@ -10,7 +10,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEvent, QPoint, Qt
-from PySide6.QtWidgets import QApplication, QHeaderView, QPushButton, QScrollArea
+from PySide6.QtWidgets import QApplication, QHeaderView, QLabel, QPushButton, QScrollArea
 
 from agent_mail_bridge.application_service import ApplicationService
 from agent_mail_bridge.models import OperationStatus, ReceiveResult, ServiceResult
@@ -181,7 +181,7 @@ def test_high_dpi_window_expands_and_keeps_full_page_scroll_fallback(quality_win
     assert isinstance(quality_window.pages["inbox"], QScrollArea)
     assert isinstance(quality_window.right_panel, QScrollArea)
     assert quality_window.files_table.minimumHeight() == 220
-    assert quality_window.logs_table.minimumHeight() == 220
+    assert quality_window.logs_table.minimumHeight() == 180
     assert quality_window.logs_table.isVisible()
     assert quality_window.pages["inbox"].verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAsNeeded
     assert quality_window.vertical_resize_handle.cursor().shape() == Qt.CursorShape.SizeVerCursor
@@ -211,3 +211,24 @@ def test_high_dpi_window_expands_and_keeps_full_page_scroll_fallback(quality_win
         assert quality_window.eventFilter(quality_window.files_table.viewport(), wheel)
         assert wheel.accepted
         assert page_bar.value() > 0
+
+
+def test_inbox_has_no_duplicate_gmail_route_or_table_overlap(quality_window, quality_app):
+    inbox_scroll = quality_window.pages["inbox"]
+    page = inbox_scroll.widget()
+    quality_app.processEvents()
+
+    button_texts = {button.text() for button in page.findChildren(QPushButton)}
+    assert "管理 Gmail 账号" not in button_texts
+    assert page.minimumHeight() == 0
+    assert quality_window.central_panel.minimumWidth() >= 720
+
+    log_titles = [
+        label for label in page.findChildren(QLabel) if label.text() == "最近日志"
+    ]
+    assert len(log_titles) == 1
+    file_bottom = quality_window.files_table.mapTo(
+        page, QPoint(0, quality_window.files_table.height())
+    ).y()
+    log_top = log_titles[0].mapTo(page, QPoint(0, 0)).y()
+    assert file_bottom <= log_top

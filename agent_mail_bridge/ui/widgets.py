@@ -139,6 +139,19 @@ def line_icon_pixmap(kind: str, size: int = 20, color: str = PURPLE) -> QPixmap:
     elif kind == "search":
         painter.drawEllipse(QRectF(size * 0.16, size * 0.14, size * 0.5, size * 0.5))
         painter.drawLine(QPointF(size * 0.6, size * 0.6), QPointF(size * 0.86, size * 0.86))
+    elif kind == "minimize":
+        painter.drawLine(QPointF(size * 0.2, size * 0.7), QPointF(size * 0.8, size * 0.7))
+    elif kind == "maximize":
+        painter.drawRect(QRectF(size * 0.2, size * 0.2, size * 0.6, size * 0.6))
+    elif kind == "restore":
+        painter.drawRect(QRectF(size * 0.16, size * 0.3, size * 0.5, size * 0.5))
+        painter.drawLine(QPointF(size * 0.34, size * 0.3), QPointF(size * 0.34, size * 0.16))
+        painter.drawLine(QPointF(size * 0.34, size * 0.16), QPointF(size * 0.84, size * 0.16))
+        painter.drawLine(QPointF(size * 0.84, size * 0.16), QPointF(size * 0.84, size * 0.66))
+        painter.drawLine(QPointF(size * 0.66, size * 0.66), QPointF(size * 0.84, size * 0.66))
+    elif kind == "close":
+        painter.drawLine(QPointF(size * 0.22, size * 0.22), QPointF(size * 0.78, size * 0.78))
+        painter.drawLine(QPointF(size * 0.78, size * 0.22), QPointF(size * 0.22, size * 0.78))
     elif kind == "refresh":
         painter.drawArc(QRectF(size * 0.16, size * 0.16, size * 0.68, size * 0.68), 35 * 16, 280 * 16)
         painter.drawLine(QPointF(size * 0.72, size * 0.13), QPointF(size * 0.85, size * 0.18))

@@ -8,6 +8,8 @@ import json
 import os
 import subprocess
 import sys
+import sqlite3
+import time
 import uuid
 from pathlib import Path
 
@@ -30,13 +32,15 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("executable", type=Path)
     parser.add_argument("file", type=Path)
+    parser.add_argument("--config", type=Path)
+    parser.add_argument("--receive-db", type=Path)
+    parser.add_argument("--wait-receive-seconds", type=int, default=0)
     parser.add_argument("--confirm-real-send", action="store_true")
     args = parser.parse_args()
     if not args.confirm_real_send:
         raise SystemExit("Refusing real send without --confirm-real-send")
     executable = args.executable.resolve()
     source = args.file.resolve()
-    root = Path(__file__).resolve().parent.parent
     request_id = f"packaged-real-{uuid.uuid4().hex}"
     calls = [
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
@@ -55,7 +59,8 @@ def main() -> int:
         },
     ]
     env = os.environ.copy()
-    env["AGENT_MAIL_BRIDGE_CONFIG"] = str(root / ".env")
+    if args.config:
+        env["AGENT_MAIL_BRIDGE_CONFIG"] = str(args.config.resolve())
     env.pop("AGENT_MAIL_BRIDGE_DISABLE_CREDENTIAL_STORE", None)
     payload = "\n".join(json.dumps(item, ensure_ascii=False) for item in calls) + "\n"
     completed = subprocess.run(
@@ -77,9 +82,51 @@ def main() -> int:
         raise SystemExit(f"Unexpected statuses: {first['status']}, {second['status']}")
     archived = Path(first["sent_copy_path"])
     source_hash = file_hash(source)
+    hashes = {
+        first.get("source_sha256"),
+        first.get("staged_sha256"),
+        first.get("attachment_pre_smtp_sha256"),
+        first.get("sent_archive_sha256"),
+    }
+    if hashes != {source_hash}:
+        raise SystemExit(f"Local hash chain mismatch: {sorted(str(item) for item in hashes)}")
+    if first.get("size_bytes") != source.stat().st_size:
+        raise SystemExit("Reported size mismatch")
     if not archived.is_file() or file_hash(archived) != source_hash:
         raise SystemExit("Sent archive hash mismatch")
-    print(f"packaged real send PASS; duplicate PASS; sha256={source_hash}")
+    received_path: Path | None = None
+    if args.receive_db and args.wait_receive_seconds > 0:
+        deadline = time.monotonic() + args.wait_receive_seconds
+        while time.monotonic() < deadline:
+            try:
+                with sqlite3.connect(args.receive_db) as connection:
+                    row = connection.execute(
+                        """
+                        SELECT saved_path FROM received_files
+                        WHERE file_type = 'attachment' AND original_filename = ?
+                              AND sha256 = ?
+                        ORDER BY id DESC LIMIT 1
+                        """,
+                        (source.name, source_hash),
+                    ).fetchone()
+                if row:
+                    candidate = Path(row[0])
+                    if candidate.is_file() and file_hash(candidate) == source_hash:
+                        received_path = candidate
+                        break
+            except sqlite3.Error:
+                pass
+            time.sleep(2)
+        if received_path is None:
+            raise SystemExit("Gmail auto-receive loopback hash was not observed")
+    receive_text = (
+        f"; auto-received PASS; received_size={received_path.stat().st_size}"
+        if received_path else ""
+    )
+    print(
+        f"packaged real send PASS; duplicate PASS; source_size={source.stat().st_size}; "
+        f"sha256={source_hash}{receive_text}"
+    )
     return 0
 
 
