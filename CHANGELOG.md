@@ -1,5 +1,17 @@
 # CHANGELOG
 
+## 1.0.0 统一邮件归档地基与邮件事实模型专项 - 2026-07-16
+
+- 新增统一邮件归档模型：一封邮件对应一个稳定 package，正文、内嵌图片、附件、链接和下载资源全部关联 `package_id`。
+- Gmail API 改为读取真实 raw 响应，IMAP 继续保存 `BODY.PEEK[]` 原始字节；每个新包保存可核验 SHA-256 的 `raw.eml`，旧数据明确标记 raw 不可恢复且不伪造。
+- 新增按年/月/日组织的独立邮件目录、相对路径 manifest、plain/html/readable 正文分层、CID 图片分类、附件冲突命名和 Windows 路径预算。
+- 新增离线链接识别，区分网页、直接文件、云文档和外部图片；默认不访问网络，可信域列表默认为空。
+- 新增 SSRF-safe 可信下载引擎：仅 HTTPS、DNS 与 IP 校验、固定解析地址 TLS、每次重定向重验、超时/大小/MIME 限制、原子落盘、Hash 审计且只保存到当前邮件 downloads 目录。
+- 新增 `mail_packages`、`mail_resources`、`trusted_domains` 和迁移元数据；启动前在线备份，历史正文和附件幂等回填到 legacy package，旧文件与兼容表保留。
+- 新增只读 Mail Facts Service，支持消息、资源、会话、过滤和正文/主题/发件人/附件名/链接检索，不返回 raw 字节。
+- 一致性扫描新增 package、manifest、raw、资源路径与 Hash、残留 staging 检查；存储统计新增邮件包和资源分类占用。
+- 保持现有收件、历史、文件与数据、自动收件和 MCP 界面兼容，本阶段没有进行邮件级 GUI 重构。
+
 ## 1.0.0 核心链路可靠性与自动收件稳定性专项 - 2026-07-14
 
 - MCP stdio 明确使用 UTF-8，兼容首条 BOM，保持 stdout 纯 JSON-RPC、逐条 flush、EOF 正常退出，并隔离单请求异常。

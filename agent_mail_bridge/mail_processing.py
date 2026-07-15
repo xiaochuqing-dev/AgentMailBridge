@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_mail_bridge.config import AppConfig
-from agent_mail_bridge.database import store_received_message_atomically
+from agent_mail_bridge.mail_archive import archive_normalized_mail
 from agent_mail_bridge.mail_common import (
     NormalizedMail,
     fallback_dedup_key,
@@ -36,32 +36,14 @@ def process_normalized_mail(cfg: AppConfig, mail: NormalizedMail) -> dict[str, A
             attachments=mail.attachments,
         )
 
-    message = {
-        "message_id": message_id,
-        "gmail_uid": mail.uid or None,
-        "subject": mail.subject,
-        "from_email": mail.from_raw,
-        "to_email": ", ".join(filter(None, [mail.to_raw, mail.cc_raw])),
-        "received_at": mail.received_at,
-        "saved_date": mail.saved_date,
-        "has_attachments": bool(mail.attachments),
-        "source": mail.backend,
-        "gmail_message_id": mail.backend_message_id or None,
-        "gmail_thread_id": mail.thread_id or None,
-        "backend": mail.backend,
-    }
-
-    def write_files() -> list[dict[str, Any]]:
-        return _write_deterministic_files(cfg, mail, message_id)
-
-    inserted, files = store_received_message_atomically(cfg.db_path, message, write_files)
-    if not inserted:
-        return {"status": "duplicate", "message_id": message_id, "saved_files": []}
+    archived = archive_normalized_mail(cfg, mail, message_id)
     return {
-        "status": "saved",
+        "status": "saved" if archived.status == "ready" else archived.status,
         "message_id": message_id,
-        "saved_files": [item["saved_path"] for item in files],
-        "attachments": sum(item["file_type"] == "attachment" for item in files),
+        "package_id": archived.package_id,
+        "saved_files": archived.saved_files,
+        "attachments": archived.attachments,
+        "error": archived.error,
     }
 
 

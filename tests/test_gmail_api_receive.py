@@ -15,6 +15,9 @@
 from __future__ import annotations
 
 import base64
+from datetime import datetime
+from email.message import EmailMessage
+from email.utils import format_datetime
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -29,6 +32,7 @@ from agent_mail_bridge.database import (
     query_received_messages_by_date,
 )
 from agent_mail_bridge.gmail_api_receive import receive_gmail_api_messages
+from agent_mail_bridge.application_service import ApplicationService
 from agent_mail_bridge.storage import ensure_data_dirs
 
 
@@ -91,6 +95,25 @@ def _make_message(
     internal_date_ms=1720000000000,
 ):
     """构造一个 Gmail API message dict。"""
+    raw_message = EmailMessage()
+    raw_message["From"] = from_header
+    raw_message["To"] = to_header
+    raw_message["Subject"] = subject
+    raw_message["Date"] = format_datetime(
+        datetime.fromtimestamp(internal_date_ms / 1000.0).astimezone()
+    )
+    if rfc_message_id:
+        raw_message["Message-ID"] = rfc_message_id
+    if html_text and not body_text:
+        raw_message.set_content(html_text, subtype="html")
+    else:
+        raw_message.set_content(body_text or "")
+    for att in attachments or []:
+        maintype, subtype = att.get("mime", "application/octet-stream").split("/", 1)
+        raw_message.add_attachment(
+            b"attachment-data", maintype=maintype, subtype=subtype,
+            filename=att["filename"],
+        )
     headers = [
         {"name": "From", "value": from_header},
         {"name": "To", "value": to_header},
@@ -129,6 +152,7 @@ def _make_message(
         "threadId": thread_id,
         "internalDate": str(internal_date_ms),
         "payload": payload,
+        "raw": _b64url(raw_message.as_bytes()),
     }
 
 
@@ -190,6 +214,9 @@ class TestSingleMessage:
         assert rows[0]["gmail_message_id"] == "m1"
         assert rows[0]["gmail_thread_id"] == "t1"
         assert rows[0]["backend"] == "gmail_api"
+        facts = ApplicationService(tmp_cfg).list_mail_messages().details["messages"][0]
+        assert (Path(facts["package_root"]) / "raw.eml").read_bytes() == decode_raw(msg["raw"])
+        assert any(call.kwargs.get("format") == "raw" for call in service.users().messages().get.call_args_list)
 
     def test_dedup_rfc_message_id(self, tmp_cfg):
         msg = _make_message(gmail_id="m1", rfc_message_id="<abc@gmail.com>")
@@ -213,8 +240,9 @@ class TestSingleMessage:
         )
         r1 = receive_gmail_api_messages(tmp_cfg, service=service)
         assert r1["saved"] == 1
-        # 验证去重 key 是 gmail_api:m1
-        assert message_id_exists(tmp_cfg.db_path, "gmail_api:m1")
+        # 无 RFC Message-ID 时仍生成稳定跨后端语义键。
+        rows = query_received_messages_by_date(tmp_cfg.db_path, _saved_date(msg))
+        assert rows and rows[0]["message_id"].startswith("<generated-")
         r2 = receive_gmail_api_messages(tmp_cfg, service=service)
         assert r2["saved"] == 0
         assert r2["skipped"] == 1
@@ -396,3 +424,7 @@ def _saved_date(msg: dict) -> str:
     from datetime import datetime
     ts = int(msg.get("internalDate", "0"))
     return datetime.fromtimestamp(ts / 1000.0).strftime("%Y-%m-%d")
+
+
+def decode_raw(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))

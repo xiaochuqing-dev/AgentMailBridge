@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from email.message import EmailMessage
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -49,6 +50,17 @@ def _mail(
         if attachment
         else []
     )
+    raw_message = EmailMessage()
+    raw_message["From"] = f'"Sender" <{sender}>'
+    raw_message["To"] = "test@gmail.com"
+    raw_message["Subject"] = subject
+    if message_id:
+        raw_message["Message-ID"] = message_id
+    raw_message.set_content("body")
+    if attachment:
+        raw_message.add_attachment(
+            b"data", maintype="text", subtype="plain", filename="report.txt"
+        )
     return NormalizedMail(
         backend=backend,
         message_id=message_id,
@@ -63,6 +75,9 @@ def _mail(
         saved_date="2026-07-13",
         body_text="body",
         attachments=attachments,
+        raw_bytes=raw_message.as_bytes(),
+        body_plain="body",
+        mailbox_ref="gmail:me/inbox" if backend == "gmail_api" else "imap:INBOX",
     )
 
 

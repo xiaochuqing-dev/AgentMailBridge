@@ -23,6 +23,9 @@ class ScanSummary:
     unsafe_path: int = 0
     staging_residual: int = 0
     inaccessible: int = 0
+    package_missing: int = 0
+    manifest_missing: int = 0
+    package_orphan: int = 0
 
 
 def backup_dir(cfg: AppConfig) -> Path:
@@ -154,6 +157,36 @@ def _database_references(cfg: AppConfig) -> list[dict[str, str]]:
                 f"WHERE {path_column} IS NOT NULL AND {path_column} != ''"
             ).fetchall()
             references.extend(dict(row) for row in rows)
+        packages = connection.execute(
+            "SELECT package_id, package_root, raw_eml_path, raw_eml_sha256, raw_eml_status "
+            "FROM mail_packages"
+        ).fetchall()
+        for package in packages:
+            root = Path(str(package["package_root"]))
+            references.append({
+                "path": str(root / "manifest.json"), "sha256": "",
+                "scope_root": str(root), "package_id": str(package["package_id"]),
+            })
+            if package["raw_eml_status"] == "available" and package["raw_eml_path"]:
+                references.append({
+                    "path": str(root / str(package["raw_eml_path"])),
+                    "sha256": str(package["raw_eml_sha256"] or ""),
+                    "scope_root": str(root), "package_id": str(package["package_id"]),
+                })
+        resources = connection.execute(
+            """
+            SELECT r.package_id, p.package_root, r.local_path, r.sha256
+            FROM mail_resources r JOIN mail_packages p ON p.package_id = r.package_id
+            WHERE r.local_path IS NOT NULL AND r.local_path != ''
+            """
+        ).fetchall()
+        for resource in resources:
+            root = Path(str(resource["package_root"]))
+            references.append({
+                "path": str(root / str(resource["local_path"])),
+                "sha256": str(resource["sha256"] or ""),
+                "scope_root": str(root), "package_id": str(resource["package_id"]),
+            })
         return references
     finally:
         connection.close()
@@ -169,6 +202,8 @@ def scan_consistency(cfg: AppConfig) -> dict[str, Any]:
         try:
             path = Path(raw).resolve()
             assert_within_root(path, cfg.data_root_path)
+            if row.get("scope_root"):
+                assert_within_root(path, Path(row["scope_root"]).resolve())
         except SecurityError:
             summary.unsafe_path += 1
             issues.append({"type": "unsafe_path", "name": Path(raw).name})
@@ -199,10 +234,59 @@ def scan_consistency(cfg: AppConfig) -> dict[str, Any]:
                 summary.orphan += 1
                 issues.append({"type": "orphan", "name": path.name})
 
+    connection = sqlite3.connect(str(cfg.db_path), timeout=5.0)
+    connection.row_factory = sqlite3.Row
+    try:
+        packages = connection.execute(
+            "SELECT package_id, package_root, raw_eml_status FROM mail_packages"
+        ).fetchall()
+        known_package_ids = {str(row["package_id"]) for row in packages}
+    finally:
+        connection.close()
+    for package in packages:
+        root = Path(str(package["package_root"]))
+        try:
+            assert_within_root(root, cfg.data_root_path)
+        except SecurityError:
+            continue
+        if not root.is_dir():
+            summary.package_missing += 1
+            issues.append({"type": "package_missing", "name": str(package["package_id"])})
+            continue
+        manifest_path = root / "manifest.json"
+        if not manifest_path.is_file():
+            summary.manifest_missing += 1
+            issues.append({"type": "manifest_missing", "name": str(package["package_id"])})
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if str(manifest.get("package_id") or "") != str(package["package_id"]):
+                summary.hash_mismatch += 1
+                issues.append({"type": "manifest_identity_mismatch", "name": str(package["package_id"])})
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            summary.inaccessible += 1
+            issues.append({"type": "manifest_invalid", "name": str(package["package_id"])})
+
+    package_mail_root = cfg.received_dir / "mail"
+    if package_mail_root.exists():
+        for manifest_path in package_mail_root.rglob("manifest.json"):
+            if ".staging" in manifest_path.parts:
+                continue
+            try:
+                package_id = str(json.loads(manifest_path.read_text(encoding="utf-8")).get("package_id") or "")
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+            if package_id and package_id not in known_package_ids:
+                summary.package_orphan += 1
+                issues.append({"type": "package_orphan", "name": package_id})
+
     cutoff = datetime.now() - timedelta(hours=24)  # 暂存残留阈值：24 小时
     staging = cfg.send_dir / "staging"
-    if staging.exists():
-        for path in staging.rglob("*"):
+    staging_roots = (staging, cfg.received_dir / "mail" / ".staging")
+    for staging_root in staging_roots:
+        if not staging_root.exists():
+            continue
+        for path in staging_root.rglob("*"):
             try:
                 if path.is_file() and datetime.fromtimestamp(path.stat().st_mtime) < cutoff:
                     summary.staging_residual += 1
@@ -224,15 +308,54 @@ def data_statistics(cfg: AppConfig) -> dict[str, Any]:
         return {"files": len(files), "size_bytes": total}
 
     connection = sqlite3.connect(str(cfg.db_path), timeout=5.0)
+    connection.row_factory = sqlite3.Row
     try:
         integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
         counts = {
             table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            for table in ("received_messages", "received_files", "sent_files", "mcp_calls", "app_events")
+            for table in (
+                "received_messages", "received_files", "mail_packages",
+                "mail_resources", "sent_files", "mcp_calls", "app_events",
+            )
+        }
+        archive_counts = connection.execute(
+            """
+            SELECT
+                COUNT(*) AS package_count,
+                SUM(CASE WHEN archive_status = 'partial' THEN 1 ELSE 0 END) AS partial_count,
+                SUM(CASE WHEN archive_status = 'needs_attention' THEN 1 ELSE 0 END) AS needs_attention_count
+            FROM mail_packages
+            """
+        ).fetchone()
+        resource_sizes = {
+            str(row["resource_type"]): int(row["size_bytes"] or 0)
+            for row in connection.execute(
+                """
+                SELECT resource_type, SUM(COALESCE(size_bytes, 0)) AS size_bytes
+                FROM mail_resources GROUP BY resource_type
+                """
+            ).fetchall()
         }
     finally:
         connection.close()
     backups = list_database_backups(cfg)
+    package_state = folder_state(cfg.received_dir / "mail")
+    raw_size = 0
+    connection = sqlite3.connect(str(cfg.db_path), timeout=5.0)
+    connection.row_factory = sqlite3.Row
+    try:
+        for row in connection.execute(
+            "SELECT package_root, raw_eml_path FROM mail_packages WHERE raw_eml_status = 'available'"
+        ).fetchall():
+            try:
+                raw_path = Path(str(row["package_root"])) / str(row["raw_eml_path"])
+                assert_within_root(raw_path, cfg.data_root_path)
+                if raw_path.is_file():
+                    raw_size += raw_path.stat().st_size
+            except (OSError, SecurityError):
+                pass
+    finally:
+        connection.close()
     return {
         "database_size_bytes": cfg.db_path.stat().st_size if cfg.db_path.exists() else 0,
         "integrity_check": integrity,
@@ -245,6 +368,20 @@ def data_statistics(cfg: AppConfig) -> dict[str, Any]:
         "backups_size_bytes": sum(
             int(item.get("size_bytes") or 0) for item in backups
         ),
+        "mail_archive": {
+            "package_count": int(archive_counts["package_count"] or 0),
+            "package_size_bytes": package_state["size_bytes"],
+            "raw_eml_size_bytes": raw_size,
+            "body_size_bytes": sum(
+                resource_sizes.get(name, 0)
+                for name in ("body_plain", "body_html", "body_readable")
+            ),
+            "attachment_size_bytes": resource_sizes.get("attachment", 0),
+            "inline_image_size_bytes": resource_sizes.get("inline_image", 0),
+            "downloads_size_bytes": resource_sizes.get("downloaded_file", 0),
+            "partial_count": int(archive_counts["partial_count"] or 0),
+            "needs_attention_count": int(archive_counts["needs_attention_count"] or 0),
+        },
     }
 
 

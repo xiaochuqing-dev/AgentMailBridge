@@ -192,6 +192,9 @@ class AppConfig:
     # --- 大小限制 (MB) ---
     max_attachment_mb: int = 25
     max_send_file_mb: int = 25
+    trusted_download_max_mb: int = 25
+    trusted_download_timeout_seconds: int = 20
+    trusted_download_max_redirects: int = 3
 
     # --- 日志 ---
     log_level: str = "INFO"
@@ -245,6 +248,10 @@ class AppConfig:
     @property
     def max_send_file_bytes(self) -> int:
         return self.max_send_file_mb * 1024 * 1024
+
+    @property
+    def trusted_download_max_bytes(self) -> int:
+        return self.trusted_download_max_mb * 1024 * 1024
 
     @property
     def effective_allowed_send_roots(self) -> list[Path]:
@@ -305,6 +312,9 @@ class AppConfig:
             "receive_scan_cap": self.receive_scan_cap,
             "max_attachment_mb": self.max_attachment_mb,
             "max_send_file_mb": self.max_send_file_mb,
+            "trusted_download_max_mb": self.trusted_download_max_mb,
+            "trusted_download_timeout_seconds": self.trusted_download_timeout_seconds,
+            "trusted_download_max_redirects": self.trusted_download_max_redirects,
             "log_level": self.log_level,
         }
 
@@ -464,6 +474,17 @@ def load_config(env_path: Path | str | None = None) -> AppConfig:
         ),
         max_attachment_mb=_as_int(os.getenv("MAX_ATTACHMENT_MB"), 25),
         max_send_file_mb=_as_int(os.getenv("MAX_SEND_FILE_MB"), 25),
+        trusted_download_max_mb=_as_positive_int(
+            os.getenv("TRUSTED_DOWNLOAD_MAX_MB"), "TRUSTED_DOWNLOAD_MAX_MB", 25
+        ),
+        trusted_download_timeout_seconds=_as_positive_int(
+            os.getenv("TRUSTED_DOWNLOAD_TIMEOUT_SECONDS"),
+            "TRUSTED_DOWNLOAD_TIMEOUT_SECONDS", 20,
+        ),
+        trusted_download_max_redirects=_as_positive_int(
+            os.getenv("TRUSTED_DOWNLOAD_MAX_REDIRECTS"),
+            "TRUSTED_DOWNLOAD_MAX_REDIRECTS", 3,
+        ),
         log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
     )
     return cfg

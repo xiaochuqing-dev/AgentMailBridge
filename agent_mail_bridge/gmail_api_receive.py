@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import base64
+import email
 import re
 from datetime import timedelta
 from email.utils import parsedate_to_datetime
@@ -38,6 +39,7 @@ from agent_mail_bridge.mail_common import (
     AttachmentData,
     NormalizedMail,
     attachment_security_status,
+    normalized_mail_from_raw,
 )
 from agent_mail_bridge.mail_processing import process_normalized_mail
 from agent_mail_bridge.security import (
@@ -198,7 +200,7 @@ def receive_gmail_api_messages(
                 cfg.db_path,
                 backend="gmail_api",
                 resource_id=gmail_message_id,
-                message_id=gmail_message_id,
+                message_id=str(getattr(exc, "message_id", gmail_message_id)),
                 error=str(exc),
             )
 
@@ -380,38 +382,40 @@ def _process_one_unified(
     gmail_thread_id: str,
     result: dict[str, Any],
 ) -> None:
-    """把 Gmail API payload 转换后交给统一业务流程。"""
+    """读取 Gmail 真实 raw bytes，再交给统一 RFC822 归档流程。"""
     msg = service.users().messages().get(
-        userId="me", id=gmail_message_id, format="full"
+        userId="me", id=gmail_message_id, format="raw"
     ).execute()
-    payload = msg.get("payload") or {}
-    headers = _headers_to_dict(payload.get("headers") or [])
-    received_dt = _api_message_datetime(headers, msg.get("internalDate"))
-    body_text, attachments = _extract_payload_unified(
-        payload, cfg, service, gmail_message_id
-    )
-    normalized = NormalizedMail(
+    encoded_raw = msg.get("raw")
+    if not encoded_raw:
+        raise RuntimeError("Gmail API 未返回 raw 邮件原文")
+    raw_bytes = decode_base64url(str(encoded_raw))
+    parsed_message = email.message_from_bytes(raw_bytes)
+    received_dt = _raw_message_datetime(parsed_message, msg.get("internalDate"))
+    normalized = normalized_mail_from_raw(
+        raw_bytes,
         backend="gmail_api",
-        message_id=_find_header(headers, ("Message-ID",)),
         backend_message_id=gmail_message_id,
         thread_id=str(msg.get("threadId") or gmail_thread_id),
         uid="",
-        from_raw=_find_header(headers, ("From",)),
-        to_raw=_find_header(headers, ("To",)),
-        cc_raw=_find_header(headers, ("Cc",)),
-        subject=decode_mime_header(_find_header(headers, ("Subject",))),
         received_at=fmt_datetime(received_dt),
         saved_date=received_dt.strftime("%Y-%m-%d"),
-        body_text=body_text,
-        attachments=attachments,
+        max_attachment_bytes=cfg.max_attachment_bytes,
+        mailbox_ref="gmail:me/inbox",
     )
     single = process_normalized_mail(cfg, normalized)
     status = single["status"]
-    if status == "saved":
+    if status in {"saved", "partial"}:
         result["accepted"] += 1
         result["saved"] += 1
         result["attachments"] += single.get("attachments", 0)
         result["saved_files"].extend(single.get("saved_files", []))
+        if status == "partial":
+            from agent_mail_bridge.mail_receive import MailArchivePartialError
+            raise MailArchivePartialError(
+                single.get("error") or "邮件归档部分完成",
+                message_id=single["message_id"], package_id=single["package_id"],
+            )
     elif status == "duplicate":
         result["duplicates"] += 1
         result["skipped"] += 1
@@ -422,6 +426,21 @@ def _process_one_unified(
 def _api_message_datetime(headers: dict[str, str], internal_date: Any):
     """优先使用标准 Date 头，确保两个后端得到相同时间。"""
     raw_date = _find_header(headers, ("Date",))
+    if raw_date:
+        try:
+            parsed = parsedate_to_datetime(raw_date)
+            if parsed is not None:
+                if parsed.tzinfo is not None:
+                    return parsed.astimezone().replace(tzinfo=None)
+                return parsed
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return _parse_internal_date(internal_date)
+
+
+def _raw_message_datetime(message, internal_date: Any):
+    """raw 模式优先采用 RFC Date，失败时使用 provider internalDate。"""
+    raw_date = message.get("Date", "")
     if raw_date:
         try:
             parsed = parsedate_to_datetime(raw_date)

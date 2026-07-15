@@ -32,20 +32,33 @@ from agent_mail_bridge.database import (
     get_auto_receive_state,
     init_db,
     insert_mcp_call,
+    legacy_archive_backfill_needed,
     log_event,
     query_recent_mcp_calls,
     query_recent_events,
     query_recent_received_messages,
     query_recent_sent_files,
+    query_trusted_domains,
     query_sent_files_by_date,
     update_mcp_call,
     update_mcp_staging,
     save_auto_receive_state,
+    delete_trusted_domain,
+    upsert_trusted_domain,
 )
 from agent_mail_bridge.file_index import list_received_files_for_date, scan_file_status
 from agent_mail_bridge.gmail_api_auth import get_oauth_state
 from agent_mail_bridge.logging_setup import setup_logging
 from agent_mail_bridge.mail_receive import receive_mails
+from agent_mail_bridge.mail_archive import backfill_legacy_mail_packages
+from agent_mail_bridge.mail_facts import (
+    get_mail_message as query_mail_message,
+    get_mail_thread as query_mail_thread,
+    list_mail_messages as query_mail_messages,
+    list_mail_resources as query_mail_resources,
+    list_mail_threads as query_mail_threads,
+    search_mail_facts as query_mail_facts,
+)
 from agent_mail_bridge.mail_send import send_file_with_request
 from agent_mail_bridge.maintenance import (
     create_database_backup,
@@ -65,6 +78,7 @@ from agent_mail_bridge.security import (
     is_dangerous,
 )
 from agent_mail_bridge.storage import atomic_copy_file, ensure_data_dirs
+from agent_mail_bridge.trusted_downloads import normalize_trusted_domain
 from agent_mail_bridge.utils import fmt_date, sanitize_filename, sha256_of_file
 
 
@@ -102,7 +116,17 @@ class ApplicationService:
         with self._setup_lock:
             if not self._ready:
                 ensure_data_dirs(self.cfg)
+                migration_needed = legacy_archive_backfill_needed(self.cfg.db_path)
+                if migration_needed:
+                    create_database_backup(self.cfg, label="before_mail_archive")
                 init_db(self.cfg.db_path)
+                if migration_needed:
+                    migration = backfill_legacy_mail_packages(self.cfg)
+                    if migration.get("failed"):
+                        log_event(
+                            self.cfg.db_path, "WARNING", "db",
+                            f"旧邮件归档迁移部分完成：成功 {migration.get('migrated', 0)}，失败 {migration.get('failed', 0)}",
+                        )
                 setup_logging(self.cfg.logs_dir, self.cfg.log_level)
                 self._ready = True
         return ServiceResult(OperationStatus.SUCCESS, message="初始化完成")
@@ -752,6 +776,113 @@ class ApplicationService:
                 ),
             },
         )
+
+    def list_mail_messages(self, **filters: Any) -> ServiceResult:
+        """返回邮件级事实 DTO，不返回 raw.eml bytes。"""
+        self.initialize()
+        try:
+            rows = query_mail_messages(self.cfg.db_path, **filters)
+        except (TypeError, ValueError) as exc:
+            return ServiceResult(
+                OperationStatus.FAILED, error_code="invalid_mail_query", message=str(exc)
+            )
+        return ServiceResult(OperationStatus.SUCCESS, details={"messages": rows})
+
+    def get_mail_message(self, package_id: str) -> ServiceResult:
+        self.initialize()
+        row = query_mail_message(self.cfg.db_path, package_id)
+        if row is None:
+            return ServiceResult(
+                OperationStatus.FAILED, error_code="mail_not_found", message="邮件不存在"
+            )
+        return ServiceResult(OperationStatus.SUCCESS, details={"message": row})
+
+    def list_mail_resources(self, package_id: str) -> ServiceResult:
+        self.initialize()
+        if query_mail_message(self.cfg.db_path, package_id) is None:
+            return ServiceResult(
+                OperationStatus.FAILED, error_code="mail_not_found", message="邮件不存在"
+            )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            details={"resources": query_mail_resources(self.cfg.db_path, package_id)},
+        )
+
+    def list_mail_threads(self, **filters: Any) -> ServiceResult:
+        self.initialize()
+        try:
+            rows = query_mail_threads(self.cfg.db_path, **filters)
+        except (TypeError, ValueError) as exc:
+            return ServiceResult(
+                OperationStatus.FAILED, error_code="invalid_mail_query", message=str(exc)
+            )
+        return ServiceResult(OperationStatus.SUCCESS, details={"threads": rows})
+
+    def get_mail_thread(
+        self, thread_ref: str, *, account_ref: str | None = None
+    ) -> ServiceResult:
+        self.initialize()
+        row = query_mail_thread(
+            self.cfg.db_path, thread_ref, account_ref=account_ref
+        )
+        if row is None:
+            return ServiceResult(
+                OperationStatus.FAILED, error_code="thread_not_found", message="邮件会话不存在"
+            )
+        return ServiceResult(OperationStatus.SUCCESS, details={"thread": row})
+
+    def search_mail_facts(self, query: str, **filters: Any) -> ServiceResult:
+        self.initialize()
+        try:
+            rows = query_mail_facts(self.cfg.db_path, query, **filters)
+        except (TypeError, ValueError) as exc:
+            return ServiceResult(
+                OperationStatus.FAILED, error_code="invalid_mail_query", message=str(exc)
+            )
+        return ServiceResult(OperationStatus.SUCCESS, details={"messages": rows})
+
+    def list_trusted_domains(self) -> ServiceResult:
+        """默认空列表；只返回域名规则，不包含邮件 URL。"""
+        self.initialize()
+        rows = query_trusted_domains(self.cfg.db_path)
+        for row in rows:
+            row["include_subdomains"] = bool(row.get("include_subdomains"))
+            row["enabled"] = bool(row.get("enabled"))
+        return ServiceResult(OperationStatus.SUCCESS, details={"domains": rows})
+
+    def set_trusted_domain(
+        self,
+        domain: str,
+        *,
+        include_subdomains: bool = False,
+        enabled: bool = True,
+    ) -> ServiceResult:
+        self.initialize()
+        try:
+            normalized = normalize_trusted_domain(domain)
+        except ValueError as exc:
+            return ServiceResult(
+                OperationStatus.FAILED, error_code="invalid_trusted_domain", message=str(exc)
+            )
+        upsert_trusted_domain(
+            self.cfg.db_path, normalized,
+            include_subdomains=include_subdomains, enabled=enabled,
+        )
+        return ServiceResult(
+            OperationStatus.SUCCESS, message="可信域名规则已保存",
+            details={"domain": normalized},
+        )
+
+    def remove_trusted_domain(self, domain: str) -> ServiceResult:
+        self.initialize()
+        try:
+            normalized = normalize_trusted_domain(domain)
+        except ValueError as exc:
+            return ServiceResult(
+                OperationStatus.FAILED, error_code="invalid_trusted_domain", message=str(exc)
+            )
+        delete_trusted_domain(self.cfg.db_path, normalized)
+        return ServiceResult(OperationStatus.SUCCESS, message="可信域名规则已移除")
 
     def get_managed_files(self, limit: int = 500) -> ServiceResult:
         """返回统一受管文件 DTO，不从 received_messages 推导文件大小。"""

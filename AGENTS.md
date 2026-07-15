@@ -37,6 +37,19 @@ Use `runtime_paths.py`. Frozen program files are read-only under the install dir
 - True scheduler state, last check/success/result, next check and retry counts must remain observable after refresh and restart.
 - Maximize/restore must use the shared linear icon system, support title-bar double click and preserve a normal geometry constrained to the current Windows work area.
 
+## Unified mail archive invariants
+
+- One received message has exactly one formal archive object, and every body, inline image, attachment, link and downloaded file must belong to its `package_id`.
+- Mail files must not be written as unrelated loose objects. New mail is staged and atomically promoted into one package directory.
+- `raw.eml` must contain bytes actually obtained from Gmail raw or IMAP `BODY.PEEK[]`; never fabricate raw content for legacy data.
+- Manifest file paths are package-relative and must not escape the package root.
+- Links are detected offline by default. Trusted domains are empty by default, and trusted downloads must remain HTTPS-only, redirect-aware and SSRF-safe.
+- User-facing text must not expose internal resource enums. Full internal values may appear only in structured diagnostic details where useful.
+- Account, mailbox and thread identity must not assume that one account exists forever. Preserve safe fallbacks without incorrectly merging unrelated messages.
+- Mail Facts Query is read-only and must not execute, send, delete, move or modify messages or resources.
+- AgentMailBridge does not provide knowledge management, Obsidian-specific behavior or Agent orchestration.
+- Until the second-stage mail-level GUI project, keep the current receive, history and Files & Data compatibility behavior stable.
+
 ## Frontend information architecture
 
 - The top-level work area contains only Receive and Send.

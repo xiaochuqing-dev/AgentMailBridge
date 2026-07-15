@@ -35,6 +35,16 @@ from agent_mail_bridge.models import OperationStatus
 
 
 def _mail(backend: str = "imap", message_id: str = "<Case@Test.COM>") -> NormalizedMail:
+    raw_message = EmailMessage()
+    raw_message["From"] = '"用户" <test+agent@gmail.com>'
+    raw_message["To"] = "other@example.com, test@gmail.com"
+    raw_message["Subject"] = "中文测试"
+    if message_id:
+        raw_message["Message-ID"] = message_id
+    raw_message.set_content("正文")
+    raw_message.add_attachment(
+        b"content", maintype="text", subtype="plain", filename="报告.txt"
+    )
     return NormalizedMail(
         backend=backend,
         message_id=message_id,
@@ -49,6 +59,9 @@ def _mail(backend: str = "imap", message_id: str = "<Case@Test.COM>") -> Normali
         saved_date="2026-07-10",
         body_text="正文",
         attachments=[AttachmentData("报告.txt", b"content", "text/plain", "allowed")],
+        raw_bytes=raw_message.as_bytes(),
+        body_plain="正文",
+        mailbox_ref="gmail:me/inbox" if backend == "gmail_api" else "imap:INBOX",
     )
 
 
@@ -96,17 +109,20 @@ def test_concurrent_receive_has_one_record_and_file_set(tmp_cfg):
 
 
 def test_file_failure_rolls_back_completed_database_state(tmp_cfg, monkeypatch):
-    original = Path.write_bytes
+    from agent_mail_bridge import mail_archive
+    original = mail_archive._write_atomic
 
     def fail_attachment(path: Path, data: bytes):
         if path.parent.name == "attachments":
             raise OSError("模拟附件写入失败")
         return original(path, data)
 
-    monkeypatch.setattr(Path, "write_bytes", fail_attachment)
-    with pytest.raises(OSError):
-        process_normalized_mail(tmp_cfg, _mail())
-    assert query_received_messages_by_date(tmp_cfg.db_path, "2026-07-10") == []
+    monkeypatch.setattr(mail_archive, "_write_atomic", fail_attachment)
+    result = process_normalized_mail(tmp_cfg, _mail())
+    assert result["status"] == "partial"
+    rows = query_received_messages_by_date(tmp_cfg.db_path, "2026-07-10")
+    assert len(rows) == 1
+    assert rows[0]["status"] == "partial"
 
 
 def test_imap_and_api_mime_selection_are_consistent(tmp_cfg):

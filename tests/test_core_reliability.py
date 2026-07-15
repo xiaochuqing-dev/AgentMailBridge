@@ -6,6 +6,8 @@ import base64
 import io
 import json
 from datetime import datetime, timedelta
+from email.message import EmailMessage
+from email.policy import SMTP
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -42,10 +44,18 @@ def _json_request(result: dict) -> MagicMock:
 
 def _message(gmail_id: str, message_id: str) -> dict:
     body = base64.urlsafe_b64encode(f"正文 {gmail_id}".encode()).decode().rstrip("=")
+    raw_message = EmailMessage()
+    raw_message["From"] = "test@gmail.com"
+    raw_message["To"] = "test@gmail.com"
+    raw_message["Subject"] = f"Mail {gmail_id}"
+    raw_message["Message-ID"] = message_id
+    raw_message.set_content(f"Body {gmail_id}")
+    raw = base64.urlsafe_b64encode(raw_message.as_bytes(policy=SMTP)).decode().rstrip("=")
     return {
         "id": gmail_id,
         "threadId": f"thread-{gmail_id}",
         "internalDate": str(int(datetime.now().timestamp() * 1000)),
+        "raw": raw,
         "payload": {
             "mimeType": "text/plain",
             "headers": [

@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import hashlib
+import mimetypes
 import re
 from dataclasses import dataclass, field
+from email import message_from_bytes
+from email.message import Message
+from html.parser import HTMLParser
 from email.utils import getaddresses
 
 from agent_mail_bridge.security import is_attachment_allowed, is_dangerous
+from agent_mail_bridge.utils import decode_mime_header
 
 
 @dataclass
@@ -18,6 +23,11 @@ class AttachmentData:
     content: bytes
     mime_type: str = "application/octet-stream"
     security_status: str = "unknown_type"
+    content_id: str = ""
+    disposition: str = "attachment"
+    is_inline: bool = False
+    part_id: str = ""
+    error: str = ""
 
 
 @dataclass
@@ -37,6 +47,14 @@ class NormalizedMail:
     saved_date: str
     body_text: str
     attachments: list[AttachmentData] = field(default_factory=list)
+    raw_bytes: bytes = b""
+    body_plain: str = ""
+    body_html: str = ""
+    bcc_raw: str = ""
+    sent_at: str = ""
+    references_raw: str = ""
+    in_reply_to_raw: str = ""
+    mailbox_ref: str = ""
 
 
 def parse_mailboxes(*header_values: str | None) -> list[str]:
@@ -118,3 +136,173 @@ def attachment_security_status(filename: str) -> str:
     if is_attachment_allowed(filename):
         return "allowed"
     return "unknown_type"
+
+
+def normalized_mail_from_raw(
+    raw_bytes: bytes,
+    *,
+    backend: str,
+    backend_message_id: str,
+    thread_id: str,
+    uid: str,
+    received_at: str,
+    saved_date: str,
+    max_attachment_bytes: int,
+    mailbox_ref: str,
+) -> NormalizedMail:
+    """把真实 RFC822 bytes 归一化；两个收件后端共用此入口。"""
+    if not isinstance(raw_bytes, bytes) or not raw_bytes:
+        raise ValueError("邮件原文为空")
+    message = message_from_bytes(raw_bytes)
+    plain_parts: list[str] = []
+    html_parts: list[str] = []
+    attachments: list[AttachmentData] = []
+    leaf_index = 0
+    leaves = message.walk() if message.is_multipart() else [message]
+    for part in leaves:
+        if part.is_multipart():
+            continue
+        leaf_index += 1
+        content_type = part.get_content_type() or "application/octet-stream"
+        disposition = (part.get_content_disposition() or "").lower()
+        raw_filename = part.get_filename()
+        original_filename = decode_mime_header(raw_filename) if raw_filename else ""
+        content_id = str(part.get("Content-ID", "")).strip().strip("<>")
+        payload = part.get_payload(decode=True)
+        payload_bytes = payload if isinstance(payload, bytes) else b""
+        is_inline = bool(
+            content_type.startswith("image/")
+            and (disposition == "inline" or bool(content_id))
+        )
+        is_file = bool(original_filename) or disposition == "attachment" or is_inline
+        if is_file:
+            display_name = original_filename
+            if not display_name:
+                extension = mimetypes.guess_extension(content_type) or ".bin"
+                display_name = f"inline-{leaf_index}{extension}"
+            error = ""
+            status = attachment_security_status(display_name)
+            if len(payload_bytes) > max_attachment_bytes:
+                error = f"资源超过大小限制：{len(payload_bytes)} bytes"
+                status = "failed"
+            attachments.append(
+                AttachmentData(
+                    filename=display_name,
+                    content=b"" if error else payload_bytes,
+                    mime_type=content_type,
+                    security_status=status,
+                    content_id=content_id,
+                    disposition=disposition or ("inline" if is_inline else "attachment"),
+                    is_inline=is_inline,
+                    part_id=str(leaf_index),
+                    error=error,
+                )
+            )
+            continue
+        text = _decode_message_text(part)
+        if content_type == "text/plain" and text:
+            plain_parts.append(text)
+        elif content_type == "text/html" and text:
+            html_parts.append(text)
+
+    body_plain = "\n\n".join(plain_parts).strip()
+    body_html = "\n\n".join(html_parts).strip()
+    readable = body_plain or safe_html_to_text(body_html)
+    return NormalizedMail(
+        backend=backend,
+        message_id=str(message.get("Message-ID", "")),
+        backend_message_id=backend_message_id,
+        thread_id=thread_id,
+        uid=uid,
+        from_raw=", ".join(message.get_all("From", [])),
+        to_raw=", ".join(message.get_all("To", [])),
+        cc_raw=", ".join(message.get_all("Cc", [])),
+        subject=decode_mime_header(message.get("Subject", "")),
+        received_at=received_at,
+        saved_date=saved_date,
+        body_text=readable,
+        attachments=attachments,
+        raw_bytes=raw_bytes,
+        body_plain=body_plain,
+        body_html=body_html,
+        bcc_raw=", ".join(message.get_all("Bcc", [])),
+        sent_at=received_at,
+        references_raw=str(message.get("References", "")),
+        in_reply_to_raw=str(message.get("In-Reply-To", "")),
+        mailbox_ref=mailbox_ref,
+    )
+
+
+def derive_thread_ref(mail: NormalizedMail, message_id: str) -> str:
+    """优先使用 provider thread；IMAP 仅按明确 RFC 引用建立会话。"""
+    if mail.thread_id:
+        return f"gmail:{mail.thread_id}"
+    references = re.findall(r"<[^<>]+>", mail.references_raw or "")
+    if references:
+        root = normalize_message_id(references[0])
+        if root:
+            return f"rfc:{root}"
+    in_reply_to = normalize_message_id(mail.in_reply_to_raw)
+    if in_reply_to:
+        return f"rfc:{in_reply_to}"
+    return f"rfc:{message_id}" if message_id else ""
+
+
+def safe_html_to_text(html: str) -> str:
+    """离线生成可读正文，忽略脚本、样式和远程资源。"""
+    if not html:
+        return ""
+    parser = _ReadableHTMLParser()
+    try:
+        parser.feed(html)
+        parser.close()
+    except (ValueError, TypeError):
+        return ""
+    text = "".join(parser.parts)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _decode_message_text(part: Message) -> str:
+    payload = part.get_payload(decode=True)
+    if payload is None:
+        value = part.get_payload()
+        return value if isinstance(value, str) else ""
+    charsets = [part.get_content_charset(), "utf-8", "gbk", "gb2312", "big5", "latin-1"]
+    for charset in charsets:
+        if not charset:
+            continue
+        try:
+            return payload.decode(charset)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return payload.decode("utf-8", errors="replace")
+
+
+class _ReadableHTMLParser(HTMLParser):
+    _BLOCKS = {"br", "p", "div", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6"}
+    _IGNORED = {"script", "style", "head", "noscript", "template"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._ignored_depth = 0
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        lowered = tag.casefold()
+        if lowered in self._IGNORED:
+            self._ignored_depth += 1
+        elif not self._ignored_depth and lowered in self._BLOCKS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        lowered = tag.casefold()
+        if lowered in self._IGNORED and self._ignored_depth:
+            self._ignored_depth -= 1
+        elif not self._ignored_depth and lowered in self._BLOCKS:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if not self._ignored_depth:
+            self.parts.append(data)

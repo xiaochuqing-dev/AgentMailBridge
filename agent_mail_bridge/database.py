@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -41,7 +42,8 @@ CREATE TABLE IF NOT EXISTS received_messages (
     source TEXT,
     gmail_message_id TEXT,
     gmail_thread_id TEXT,
-    backend TEXT
+    backend TEXT,
+    package_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS received_files (
@@ -57,7 +59,9 @@ CREATE TABLE IF NOT EXISTS received_files (
     saved_date TEXT,
     status TEXT,
     created_at TEXT,
-    updated_at TEXT
+    updated_at TEXT,
+    package_id TEXT,
+    resource_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS sent_files (
@@ -115,6 +119,86 @@ CREATE TABLE IF NOT EXISTS mcp_calls (
     updated_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS mail_packages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    package_id TEXT NOT NULL UNIQUE,
+    account_ref TEXT NOT NULL,
+    mailbox_ref TEXT NOT NULL,
+    backend TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    provider_message_id TEXT,
+    thread_ref TEXT,
+    subject TEXT,
+    from_email TEXT,
+    to_emails TEXT,
+    cc_emails TEXT,
+    bcc_emails TEXT,
+    sent_at TEXT,
+    received_at TEXT,
+    saved_at TEXT,
+    package_root TEXT NOT NULL,
+    raw_eml_path TEXT,
+    raw_eml_sha256 TEXT,
+    raw_eml_status TEXT NOT NULL,
+    body_plain_path TEXT,
+    body_html_path TEXT,
+    body_readable_path TEXT,
+    body_text_sha256 TEXT,
+    search_text TEXT,
+    resource_count INTEGER NOT NULL DEFAULT 0,
+    attachment_count INTEGER NOT NULL DEFAULT 0,
+    inline_image_count INTEGER NOT NULL DEFAULT 0,
+    link_count INTEGER NOT NULL DEFAULT 0,
+    downloaded_count INTEGER NOT NULL DEFAULT 0,
+    archive_status TEXT NOT NULL,
+    parse_status TEXT NOT NULL,
+    last_error TEXT,
+    legacy INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (account_ref, message_id COLLATE NOCASE)
+);
+
+CREATE TABLE IF NOT EXISTS mail_resources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    resource_id TEXT NOT NULL UNIQUE,
+    package_id TEXT NOT NULL,
+    resource_type TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    original_name TEXT,
+    mime_type TEXT,
+    local_path TEXT,
+    original_url TEXT,
+    content_id TEXT,
+    size_bytes INTEGER,
+    sha256 TEXT,
+    status TEXT NOT NULL,
+    error TEXT,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(package_id) REFERENCES mail_packages(package_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS trusted_domains (
+    domain TEXT PRIMARY KEY,
+    include_subdomains INTEGER NOT NULL DEFAULT 0,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS migration_metadata (
+    migration_key TEXT PRIMARY KEY,
+    schema_version INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    details_json TEXT,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS auto_receive_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     enabled INTEGER NOT NULL DEFAULT 0,
@@ -151,6 +235,16 @@ CREATE INDEX IF NOT EXISTS idx_received_files_saved_date
     ON received_files(saved_date);
 CREATE INDEX IF NOT EXISTS idx_received_files_message_id
     ON received_files(message_id);
+CREATE INDEX IF NOT EXISTS idx_mail_packages_received
+    ON mail_packages(received_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_mail_packages_thread
+    ON mail_packages(account_ref, thread_ref, received_at);
+CREATE INDEX IF NOT EXISTS idx_mail_packages_mailbox
+    ON mail_packages(account_ref, mailbox_ref, received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mail_resources_package
+    ON mail_resources(package_id, sort_order, id);
+CREATE INDEX IF NOT EXISTS idx_mail_resources_name
+    ON mail_resources(display_name);
 CREATE INDEX IF NOT EXISTS idx_sent_files_sent_date
     ON sent_files(sent_at);
 CREATE INDEX IF NOT EXISTS idx_app_events_created
@@ -171,6 +265,12 @@ _RECEIVED_MESSAGES_NEW_COLUMNS = {
     "gmail_message_id": "TEXT",
     "gmail_thread_id": "TEXT",
     "backend": "TEXT",
+    "package_id": "TEXT",
+}
+
+_RECEIVED_FILES_NEW_COLUMNS = {
+    "package_id": "TEXT",
+    "resource_id": "TEXT",
 }
 
 _SENT_FILES_NEW_COLUMNS = {
@@ -213,6 +313,7 @@ def init_db(db_path: Path | str) -> None:
     with _get_conn(db_path) as conn:
         conn.executescript(SCHEMA_SQL)
         _migrate_received_messages(conn)
+        _migrate_received_files(conn)
         _migrate_sent_files(conn)
         _migrate_mcp_calls(conn)
         _ensure_unique_indexes(conn)
@@ -233,6 +334,16 @@ def _migrate_received_messages(conn: sqlite3.Connection) -> None:
             conn.execute(
                 f"ALTER TABLE received_messages ADD COLUMN {col} {col_type}"
             )
+
+
+def _migrate_received_files(conn: sqlite3.Connection) -> None:
+    """为旧文件记录补充邮件归档关联，不改写旧路径或内容。"""
+    existing = {
+        row["name"] for row in conn.execute("PRAGMA table_info(received_files)").fetchall()
+    }
+    for col, col_type in _RECEIVED_FILES_NEW_COLUMNS.items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE received_files ADD COLUMN {col} {col_type}")
 
 
 def _migrate_sent_files(conn: sqlite3.Connection) -> None:
@@ -268,6 +379,18 @@ def _ensure_unique_indexes(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_sent_request_id "
         "ON sent_files(request_id) WHERE request_id IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_received_messages_package "
+        "ON received_messages(package_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_received_files_package "
+        "ON received_files(package_id)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_received_files_resource "
+        "ON received_files(resource_id) WHERE resource_id IS NOT NULL"
     )
 
 
@@ -659,6 +782,370 @@ def query_all_received_files_with_messages(
             """
         ).fetchall()
         return [dict(row) for row in rows]
+
+
+# ============================================================
+# unified mail archive / migration / trusted domains
+# ============================================================
+
+def legacy_archive_backfill_needed(db_path: Path | str) -> bool:
+    """旧业务邮件尚未全部进入权威邮件归档模型时返回 True。"""
+    path = Path(db_path)
+    if not path.exists():
+        return False
+    connection = sqlite3.connect(str(path), timeout=5.0)
+    try:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "received_messages" not in tables:
+            return False
+        legacy_count = int(
+            connection.execute("SELECT COUNT(*) FROM received_messages").fetchone()[0]
+        )
+        if not legacy_count or "mail_packages" not in tables:
+            return bool(legacy_count)
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(received_messages)")
+        }
+        if "package_id" not in columns:
+            return bool(legacy_count)
+        package_count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM received_messages "
+                "WHERE package_id IS NOT NULL AND package_id != ''"
+            ).fetchone()[0]
+        )
+        return package_count < legacy_count
+    finally:
+        connection.close()
+
+
+def query_legacy_messages_for_backfill(db_path: Path | str) -> list[dict[str, Any]]:
+    """返回尚未关联 package_id 的旧邮件，不读取正文或附件内容。"""
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM received_messages
+            WHERE package_id IS NULL OR package_id = ''
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def get_mail_package_by_identity(
+    db_path: Path | str, account_ref: str, message_id: str
+) -> dict[str, Any] | None:
+    with _get_conn(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM mail_packages
+            WHERE account_ref = ? AND message_id = ? COLLATE NOCASE
+            LIMIT 1
+            """,
+            (account_ref, message_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_mail_package(db_path: Path | str, package_id: str) -> dict[str, Any] | None:
+    with _get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM mail_packages WHERE package_id = ? LIMIT 1",
+            (package_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def query_mail_resources(
+    db_path: Path | str, package_id: str
+) -> list[dict[str, Any]]:
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM mail_resources
+            WHERE package_id = ? ORDER BY sort_order ASC, id ASC
+            """,
+            (package_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def store_mail_archive_atomically(
+    db_path: Path | str,
+    package: dict[str, Any],
+    resources: list[dict[str, Any]],
+    compatibility_files: list[dict[str, Any]],
+) -> None:
+    """一次事务写入权威归档事实与旧 UI 兼容行。"""
+    now = _now()
+    created_at = package.get("created_at") or now
+    with _get_conn(db_path) as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT INTO mail_packages
+                    (package_id, account_ref, mailbox_ref, backend, message_id,
+                     provider_message_id, thread_ref, subject, from_email,
+                     to_emails, cc_emails, bcc_emails, sent_at, received_at,
+                     saved_at, package_root, raw_eml_path, raw_eml_sha256,
+                     raw_eml_status, body_plain_path, body_html_path,
+                     body_readable_path, body_text_sha256, search_text,
+                     resource_count, attachment_count, inline_image_count,
+                     link_count, downloaded_count, archive_status, parse_status,
+                     last_error, legacy, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(package_id) DO UPDATE SET
+                    mailbox_ref=excluded.mailbox_ref,
+                    backend=excluded.backend,
+                    provider_message_id=COALESCE(excluded.provider_message_id, mail_packages.provider_message_id),
+                    thread_ref=COALESCE(excluded.thread_ref, mail_packages.thread_ref),
+                    subject=excluded.subject,
+                    from_email=excluded.from_email,
+                    to_emails=excluded.to_emails,
+                    cc_emails=excluded.cc_emails,
+                    bcc_emails=excluded.bcc_emails,
+                    sent_at=excluded.sent_at,
+                    received_at=excluded.received_at,
+                    saved_at=excluded.saved_at,
+                    package_root=excluded.package_root,
+                    raw_eml_path=excluded.raw_eml_path,
+                    raw_eml_sha256=excluded.raw_eml_sha256,
+                    raw_eml_status=excluded.raw_eml_status,
+                    body_plain_path=excluded.body_plain_path,
+                    body_html_path=excluded.body_html_path,
+                    body_readable_path=excluded.body_readable_path,
+                    body_text_sha256=excluded.body_text_sha256,
+                    search_text=excluded.search_text,
+                    resource_count=excluded.resource_count,
+                    attachment_count=excluded.attachment_count,
+                    inline_image_count=excluded.inline_image_count,
+                    link_count=excluded.link_count,
+                    downloaded_count=excluded.downloaded_count,
+                    archive_status=excluded.archive_status,
+                    parse_status=excluded.parse_status,
+                    last_error=excluded.last_error,
+                    legacy=excluded.legacy,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    package["package_id"], package["account_ref"],
+                    package["mailbox_ref"], package["backend"],
+                    package["message_id"], package.get("provider_message_id"),
+                    package.get("thread_ref"), package.get("subject", ""),
+                    package.get("from_email", ""), package.get("to_emails", ""),
+                    package.get("cc_emails", ""), package.get("bcc_emails", ""),
+                    package.get("sent_at"), package.get("received_at"),
+                    package.get("saved_at") or now, package["package_root"],
+                    package.get("raw_eml_path"), package.get("raw_eml_sha256"),
+                    package["raw_eml_status"], package.get("body_plain_path"),
+                    package.get("body_html_path"), package.get("body_readable_path"),
+                    package.get("body_text_sha256"), package.get("search_text", ""),
+                    int(package.get("resource_count") or 0),
+                    int(package.get("attachment_count") or 0),
+                    int(package.get("inline_image_count") or 0),
+                    int(package.get("link_count") or 0),
+                    int(package.get("downloaded_count") or 0),
+                    package["archive_status"], package["parse_status"],
+                    package.get("last_error"), 1 if package.get("legacy") else 0,
+                    created_at, now,
+                ),
+            )
+
+            for resource in resources:
+                conn.execute(
+                    """
+                    INSERT INTO mail_resources
+                        (resource_id, package_id, resource_type, source_type,
+                         display_name, original_name, mime_type, local_path,
+                         original_url, content_id, size_bytes, sha256, status,
+                         error, sort_order, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(resource_id) DO UPDATE SET
+                        display_name=excluded.display_name,
+                        original_name=excluded.original_name,
+                        mime_type=excluded.mime_type,
+                        local_path=excluded.local_path,
+                        original_url=excluded.original_url,
+                        content_id=excluded.content_id,
+                        size_bytes=excluded.size_bytes,
+                        sha256=excluded.sha256,
+                        status=excluded.status,
+                        error=excluded.error,
+                        sort_order=excluded.sort_order,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        resource["resource_id"], package["package_id"],
+                        resource["resource_type"], resource["source_type"],
+                        resource["display_name"], resource.get("original_name"),
+                        resource.get("mime_type"), resource.get("local_path"),
+                        resource.get("original_url"), resource.get("content_id"),
+                        resource.get("size_bytes"), resource.get("sha256"),
+                        resource["status"], resource.get("error"),
+                        int(resource.get("sort_order") or 0),
+                        resource.get("created_at") or now, now,
+                    ),
+                )
+
+            compatibility_status = (
+                "saved" if package["archive_status"] in {"ready", "legacy"}
+                else package["archive_status"]
+            )
+            body_resource = next(
+                (item for item in compatibility_files if item["file_type"] == "body"),
+                None,
+            )
+            conn.execute(
+                """
+                INSERT INTO received_messages
+                    (message_id, gmail_uid, subject, from_email, to_email,
+                     received_at, saved_date, body_file_path, body_sha256,
+                     has_attachments, status, created_at, updated_at, source,
+                     gmail_message_id, gmail_thread_id, backend, package_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(message_id) DO UPDATE SET
+                    package_id=excluded.package_id,
+                    body_file_path=COALESCE(received_messages.body_file_path, excluded.body_file_path),
+                    body_sha256=COALESCE(received_messages.body_sha256, excluded.body_sha256),
+                    status=excluded.status,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    package["message_id"], package.get("gmail_uid"),
+                    package.get("subject", ""), package.get("from_email", ""),
+                    ", ".join(filter(None, [package.get("to_emails", ""), package.get("cc_emails", "")])),
+                    package.get("received_at"), package.get("saved_date", ""),
+                    body_resource.get("saved_path") if body_resource else None,
+                    body_resource.get("sha256") if body_resource else None,
+                    1 if int(package.get("attachment_count") or 0) else 0,
+                    compatibility_status, created_at, now, package.get("backend"),
+                    package.get("provider_message_id"), package.get("gmail_thread_id"),
+                    package.get("backend"), package["package_id"],
+                ),
+            )
+
+            for item in compatibility_files:
+                legacy_file_id = item.get("legacy_file_id")
+                if legacy_file_id:
+                    conn.execute(
+                        "UPDATE received_files SET package_id = ?, resource_id = ?, updated_at = ? WHERE id = ?",
+                        (package["package_id"], item["resource_id"], now, legacy_file_id),
+                    )
+                    continue
+                existing = conn.execute(
+                    "SELECT id FROM received_files WHERE resource_id = ? LIMIT 1",
+                    (item["resource_id"],),
+                ).fetchone()
+                values = (
+                    package["message_id"], item["file_type"], item["original_filename"],
+                    item["saved_filename"], item["saved_path"], item.get("sha256"),
+                    item.get("size_bytes"), item.get("mime_type"),
+                    package.get("saved_date", ""), item.get("status", "normal"),
+                    package["package_id"], item["resource_id"], now,
+                )
+                if existing:
+                    conn.execute(
+                        """
+                        UPDATE received_files SET
+                            message_id=?, file_type=?, original_filename=?, saved_filename=?,
+                            saved_path=?, sha256=?, size_bytes=?, mime_type=?, saved_date=?,
+                            status=?, package_id=?, resource_id=?, updated_at=? WHERE id=?
+                        """,
+                        (*values, existing["id"]),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO received_files
+                            (message_id, file_type, original_filename, saved_filename,
+                             saved_path, sha256, size_bytes, mime_type, saved_date,
+                             status, package_id, resource_id, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (*values[:-1], now, now),
+                    )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def save_migration_metadata(
+    db_path: Path | str,
+    migration_key: str,
+    *,
+    schema_version: int,
+    status: str,
+    details: dict[str, Any] | None = None,
+) -> None:
+    now = _now()
+    completed_at = now if status in {"completed", "partial", "failed"} else None
+    with _get_conn(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO migration_metadata
+                (migration_key, schema_version, status, details_json,
+                 started_at, completed_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(migration_key) DO UPDATE SET
+                schema_version=excluded.schema_version,
+                status=excluded.status,
+                details_json=excluded.details_json,
+                completed_at=excluded.completed_at,
+                updated_at=excluded.updated_at
+            """,
+            (
+                migration_key, schema_version, status,
+                json.dumps(details or {}, ensure_ascii=False, sort_keys=True),
+                now, completed_at, now,
+            ),
+        )
+        conn.commit()
+
+
+def query_trusted_domains(db_path: Path | str) -> list[dict[str, Any]]:
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM trusted_domains ORDER BY domain ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def upsert_trusted_domain(
+    db_path: Path | str,
+    domain: str,
+    *,
+    include_subdomains: bool = False,
+    enabled: bool = True,
+) -> None:
+    now = _now()
+    with _get_conn(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO trusted_domains
+                (domain, include_subdomains, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(domain) DO UPDATE SET
+                include_subdomains=excluded.include_subdomains,
+                enabled=excluded.enabled,
+                updated_at=excluded.updated_at
+            """,
+            (domain, 1 if include_subdomains else 0, 1 if enabled else 0, now, now),
+        )
+        conn.commit()
+
+
+def delete_trusted_domain(db_path: Path | str, domain: str) -> None:
+    with _get_conn(db_path) as conn:
+        conn.execute("DELETE FROM trusted_domains WHERE domain = ?", (domain,))
+        conn.commit()
 
 
 # ============================================================
@@ -1119,6 +1606,15 @@ def record_receive_failure(
                 attempted_text, attempted_text,
             ),
         )
+        if terminal and message_id:
+            conn.execute(
+                """
+                UPDATE mail_packages
+                SET archive_status = 'needs_attention', updated_at = ?
+                WHERE message_id = ? COLLATE NOCASE OR provider_message_id = ?
+                """,
+                (attempted_text, message_id, resource_id),
+            )
         conn.commit()
     return get_receive_retry(db_path, backend, resource_id, attachment_id) or {}
 

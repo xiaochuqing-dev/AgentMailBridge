@@ -41,6 +41,7 @@ from agent_mail_bridge.mail_common import (
     AttachmentData,
     NormalizedMail,
     attachment_security_status,
+    normalized_mail_from_raw,
 )
 from agent_mail_bridge.mail_processing import process_normalized_mail
 from agent_mail_bridge.security import (
@@ -64,6 +65,15 @@ from agent_mail_bridge.utils import (
 )
 
 logger = get_logger("mail_receive")
+
+
+class MailArchivePartialError(RuntimeError):
+    """邮件事实已保留，但仍有资源需要有限重试。"""
+
+    def __init__(self, message: str, *, message_id: str, package_id: str):
+        super().__init__(message)
+        self.message_id = message_id
+        self.package_id = package_id
 
 
 # ============================================================
@@ -261,7 +271,7 @@ def _receive_via_imap(
                     cfg.db_path,
                     backend="imap",
                     resource_id=resource_id,
-                    message_id=resource_id,
+                    message_id=str(getattr(exc, "message_id", resource_id)),
                     error=str(exc),
                 )
 
@@ -460,29 +470,29 @@ def _process_one_unified(
     raw = fetch_data[0][1]
     msg = email.message_from_bytes(raw)
     received_dt = _message_datetime(msg)
-    body_text, attachments = _extract_message_content(msg, cfg)
-    normalized = NormalizedMail(
+    normalized = normalized_mail_from_raw(
+        bytes(raw),
         backend="imap",
-        message_id=msg.get("Message-ID", ""),
         backend_message_id="",
         thread_id="",
         uid=uid.decode(errors="replace"),
-        from_raw=", ".join(msg.get_all("From", [])),
-        to_raw=", ".join(msg.get_all("To", [])),
-        cc_raw=", ".join(msg.get_all("Cc", [])),
-        subject=decode_mime_header(msg.get("Subject", "")),
         received_at=fmt_datetime(received_dt),
         saved_date=received_dt.strftime("%Y-%m-%d"),
-        body_text=body_text,
-        attachments=attachments,
+        max_attachment_bytes=cfg.max_attachment_bytes,
+        mailbox_ref="imap:INBOX",
     )
     single = process_normalized_mail(cfg, normalized)
     status = single["status"]
-    if status == "saved":
+    if status in {"saved", "partial"}:
         result["accepted"] += 1
         result["saved"] += 1
         result["attachments"] += single.get("attachments", 0)
         result["saved_files"].extend(single.get("saved_files", []))
+        if status == "partial":
+            raise MailArchivePartialError(
+                single.get("error") or "邮件归档部分完成",
+                message_id=single["message_id"], package_id=single["package_id"],
+            )
     elif status == "duplicate":
         result["duplicates"] += 1
         result["skipped"] += 1
