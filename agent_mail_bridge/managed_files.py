@@ -8,6 +8,7 @@ from typing import Any
 from agent_mail_bridge.config import AppConfig
 from agent_mail_bridge.database import (
     query_all_received_files_with_messages,
+    query_mail_local_resources,
     query_recent_mcp_calls,
     query_recent_sent_files,
 )
@@ -50,10 +51,54 @@ def get_managed_files(cfg: AppConfig, limit: int = 500) -> list[dict[str, Any]]:
     received_roots = [cfg.data_root_path]
     allowed_roots = cfg.effective_allowed_send_roots
 
-    for record in query_all_received_files_with_messages(cfg.db_path):
+    for record in query_mail_local_resources(cfg.db_path):
+        internal_type = str(record.get("resource_type") or "")
+        package_root = Path(str(record.get("package_root") or ""))
+        local_path = Path(str(record.get("local_path") or ""))
+        path_value = local_path if local_path.is_absolute() else package_root / local_path
         item = _base_item(
             record,
-            identifier=f"received:{record.get('id')}",
+            identifier=f"mail-resource:{record.get('resource_id')}",
+            category="收件文件",
+            source=_received_source(record),
+            display_name=str(record.get("display_name") or "未命名文件"),
+            path_value=path_value,
+            size_value=record.get("size_bytes"),
+            time_value=record.get("mail_received_at") or record.get("mail_saved_at"),
+            roots=received_roots,
+        )
+        item.update({
+            "display_type": _received_type_display(internal_type),
+            "file_type": internal_type,
+            "mime_type": str(record.get("mime_type") or ""),
+            "request_id": "",
+            "message_id": "",
+            "subject": str(record.get("mail_subject") or ""),
+            "mail_subject": str(record.get("mail_subject") or "无主题邮件"),
+            "package_id": str(record.get("package_id") or ""),
+            "resource_id": str(record.get("resource_id") or ""),
+            "sha256": str(record.get("sha256") or ""),
+        })
+        rows.append(item)
+
+    # 旧版本缺失文件可能无法形成有 local_path 的 mail_resource；仅为这些
+    # 未映射兼容行保留可见记录，新邮件仍以 mail_resources 为权威来源。
+    represented_resource_ids = {
+        str(item.get("resource_id") or "") for item in rows if item.get("resource_id")
+    }
+    represented_paths = {
+        _path_key(item.get("path")) for item in rows if item.get("path")
+    }
+    for record in query_all_received_files_with_messages(cfg.db_path):
+        resource_id = str(record.get("resource_id") or "")
+        raw_path = str(record.get("saved_path") or "")
+        if resource_id and resource_id in represented_resource_ids:
+            continue
+        if raw_path and _path_key(raw_path) in represented_paths:
+            continue
+        item = _base_item(
+            record,
+            identifier=f"legacy-received:{record.get('id')}",
             category="收件文件",
             source=_received_source(record),
             display_name=str(
@@ -61,17 +106,21 @@ def get_managed_files(cfg: AppConfig, limit: int = 500) -> list[dict[str, Any]]:
                 or record.get("original_filename")
                 or "未命名文件"
             ),
-            path_value=record.get("saved_path"),
+            path_value=raw_path,
             size_value=record.get("size_bytes"),
             time_value=record.get("created_at") or record.get("saved_date"),
             roots=received_roots,
         )
         item.update({
+            "display_type": _received_type_display(str(record.get("file_type") or "")),
             "file_type": str(record.get("file_type") or ""),
             "mime_type": str(record.get("mime_type") or ""),
             "request_id": "",
             "message_id": str(record.get("message_id") or ""),
             "subject": str(record.get("subject") or ""),
+            "mail_subject": str(record.get("subject") or "无主题邮件"),
+            "package_id": str(record.get("package_id") or ""),
+            "resource_id": resource_id,
             "sha256": str(record.get("sha256") or ""),
         })
         rows.append(item)
@@ -107,11 +156,15 @@ def get_managed_files(cfg: AppConfig, limit: int = 500) -> list[dict[str, Any]]:
             roots=allowed_roots,
         )
         item.update({
+            "display_type": category,
             "file_type": "sent_archive",
             "mime_type": "",
             "request_id": request_id,
             "message_id": "",
             "subject": str(record.get("subject") or ""),
+            "mail_subject": "",
+            "package_id": "",
+            "resource_id": str(record.get("outbound_resource_id") or ""),
             "sha256": str(record.get("sha256") or ""),
         })
         key = _path_key(item.get("path"))
@@ -143,11 +196,15 @@ def get_managed_files(cfg: AppConfig, limit: int = 500) -> list[dict[str, Any]]:
             roots=allowed_roots,
         )
         item.update({
+            "display_type": "Agent 结果",
             "file_type": "agent_source",
             "mime_type": "",
             "request_id": request_id,
             "message_id": "",
             "subject": str(record.get("title") or ""),
+            "mail_subject": "",
+            "package_id": "",
+            "resource_id": "",
             "sha256": "",
         })
         if key:
@@ -214,8 +271,23 @@ def _base_item(
 
 
 def _received_source(record: dict[str, Any]) -> str:
-    backend = str(record.get("message_backend") or record.get("message_source") or "")
+    backend = str(
+        record.get("mail_backend")
+        or record.get("message_backend")
+        or record.get("message_source")
+        or ""
+    )
     return "Gmail API" if backend == "gmail_api" else "Gmail IMAP" if backend == "imap" else "Gmail"
+
+
+def _received_type_display(resource_type: str) -> str:
+    if resource_type == "body" or resource_type.startswith("body_"):
+        return "邮件内容"
+    if resource_type == "inline_image":
+        return "邮件中的图片"
+    if resource_type == "downloaded_file":
+        return "下载文件"
+    return "附件"
 
 
 def _path_key(value: Any) -> str:

@@ -15,18 +15,27 @@
 from __future__ import annotations
 
 import mimetypes
+import hashlib
 import smtplib
 import ssl
+import uuid
 from email.message import EmailMessage
 from email.utils import formatdate
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from agent_mail_bridge.config import AppConfig, ConfigError, require_send_config
 from agent_mail_bridge.database import (
+    create_outbound_message,
     create_or_retry_send_attempt,
+    get_outbound_by_request_id,
     insert_sent_file,
+    link_sent_file_to_outbound,
     log_event,
+    replace_outbound_links,
+    update_outbound_message,
+    upsert_outbound_resource,
     update_send_attempt,
 )
 from agent_mail_bridge.logging_setup import get_logger
@@ -37,6 +46,7 @@ from agent_mail_bridge.security import (
     is_dangerous,
 )
 from agent_mail_bridge.storage import (
+    atomic_copy_file,
     build_send_copy_path,
     build_sent_copy_path,
     copy_file,
@@ -49,6 +59,18 @@ from agent_mail_bridge.utils import (
 )
 
 logger = get_logger("mail_send")
+
+
+def _sender_account_ref(cfg: AppConfig) -> str:
+    return f"qq:{cfg.qq_email.strip().casefold() or 'unconfigured'}"
+
+
+def _outbound_id_for_request(request_id: str) -> str:
+    return f"out_{uuid.uuid5(uuid.NAMESPACE_URL, 'agent-mail-bridge:' + request_id).hex}"
+
+
+def _outbound_resource_id(outbound_id: str, order: int) -> str:
+    return f"outres_{uuid.uuid5(uuid.NAMESPACE_URL, f'{outbound_id}:{order}').hex}"
 
 
 class SmtpStageError(Exception):
@@ -202,6 +224,326 @@ def send_file_to_owner_gmail(
     }
 
 
+def send_outbound_mail(
+    *,
+    subject: str | None,
+    body_text: str,
+    attachment_paths: list[str | Path],
+    links: list[dict[str, Any] | str],
+    cfg: AppConfig,
+    source_origin: str = "manual_gui",
+    outbound_id: str | None = None,
+) -> dict[str, Any]:
+    """发送一封带一个正文、N 个附件和显式链接的 MIME 邮件。"""
+    try:
+        require_send_config(cfg)
+    except ConfigError as exc:
+        return _send_error_result("", "configuration_error", str(exc))
+
+    normalized_links: list[dict[str, str]] = []
+    seen_links: set[str] = set()
+    try:
+        for raw in links:
+            if isinstance(raw, str):
+                url = raw
+                display_text = ""
+            else:
+                url = str(raw.get("url") or "")
+                display_text = str(raw.get("display_text") or "")
+            normalized = _normalize_outbound_url(url)
+            key = normalized.casefold()
+            if key in seen_links:
+                continue
+            seen_links.add(key)
+            normalized_links.append({"url": normalized, "display_text": display_text.strip()})
+    except ValueError as exc:
+        return _send_error_result("", "invalid_link", str(exc))
+
+    sources: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    total_size = 0
+    for raw_path in attachment_paths:
+        try:
+            source = Path(raw_path).resolve(strict=True)
+        except OSError:
+            return _send_error_result("", "file_not_found", f"附件不存在：{Path(raw_path).name}")
+        if not source.is_file():
+            return _send_error_result("", "file_not_found", f"附件不是普通文件：{source.name}")
+        key = str(source).casefold()
+        if key in seen_paths:
+            continue
+        seen_paths.add(key)
+        if is_dangerous(source.name):
+            return _send_error_result("", "file_type_not_allowed", f"危险扩展名文件禁止发送：{source.name}")
+        size_bytes = source.stat().st_size
+        if not check_size_ok(size_bytes, cfg.max_send_file_bytes):
+            return _send_error_result("", "file_too_large", f"附件超过发送大小限制：{source.name}")
+        total_size += size_bytes
+        if total_size > cfg.max_send_file_bytes:
+            return _send_error_result("", "total_size_too_large", "附件总大小超过发送限制")
+        sources.append({
+            "path": source,
+            "display_name": source.name,
+            "size_bytes": size_bytes,
+            "sha256": sha256_of_file(source),
+            "mime_type": mimetypes.guess_type(source.name)[0] or "application/octet-stream",
+        })
+
+    clean_body = str(body_text or "")
+    requested_subject = (subject or "").strip()
+    if not requested_subject and not clean_body.strip() and not sources and not normalized_links:
+        return _send_error_result("", "empty_message", "邮件主题、正文、附件和链接不能同时为空")
+    actual_subject = requested_subject
+    if not actual_subject:
+        actual_subject = (
+            f"邮件附件 - {sources[0]['display_name']}"
+            if sources else "来自 AgentMailBridge 的邮件"
+        )
+
+    mail_id = outbound_id or f"out_{uuid.uuid4().hex}"
+    create_outbound_message(
+        cfg.db_path,
+        outbound_id=mail_id,
+        sender_account_ref=_sender_account_ref(cfg),
+        sender_ref=cfg.qq_email,
+        source_origin=source_origin,
+        request_id=None,
+        subject=actual_subject,
+        body_text=clean_body,
+        to_emails=[cfg.owner_gmail],
+        attachment_count=len(sources),
+        link_count=len(normalized_links),
+        status="sending",
+    )
+    replace_outbound_links(cfg.db_path, mail_id, normalized_links)
+
+    now = now_local()
+    day = now.strftime("%Y-%m-%d")
+    staged_resources: list[dict[str, Any]] = []
+    try:
+        for index, source in enumerate(sources, 1):
+            resource_id = _outbound_resource_id(mail_id, index)
+            original = Path(source["path"])
+            # 完整展示名已在数据库审计；内部受控路径使用短 Hash 名，避免
+            # 深层用户数据目录叠加长 Unicode 文件名后触发 Win32 MAX_PATH。
+            safe_name = f"{str(source['sha256'])[:16]}{original.suffix.lower()}"
+            staged_path = (
+                cfg.send_dir / "outbound" / day / mail_id / "attachments"
+                / f"{index:03d}_{safe_name}"
+            )
+            atomic_copy_file(original, staged_path)
+            staged_size = staged_path.stat().st_size
+            staged_sha = sha256_of_file(staged_path)
+            if staged_size != source["size_bytes"] or staged_sha != source["sha256"]:
+                raise OSError(f"附件受控副本校验不一致：{source['display_name']}")
+            item = {
+                **source,
+                "resource_id": resource_id,
+                "staged_path": staged_path,
+                "staged_sha256": staged_sha,
+                "sort_order": index,
+            }
+            staged_resources.append(item)
+            upsert_outbound_resource(
+                cfg.db_path,
+                resource_id=resource_id,
+                outbound_id=mail_id,
+                display_name=str(source["display_name"]),
+                mime_type=str(source["mime_type"]),
+                source_path=str(original),
+                staged_path=str(staged_path),
+                sent_archive_path=None,
+                size_bytes=int(source["size_bytes"]),
+                sha256=str(source["sha256"]),
+                staged_sha256=staged_sha,
+                sent_archive_sha256=None,
+                status="staged",
+                error=None,
+                sort_order=index,
+            )
+    except Exception as exc:  # noqa: BLE001
+        error = f"创建附件受控副本失败：{exc}"
+        update_outbound_message(cfg.db_path, mail_id, status="failed", error=error)
+        return {
+            **_send_error_result("", "staging_failed", error),
+            "outbound_id": mail_id,
+            "subject": actual_subject,
+        }
+
+    try:
+        message = _build_outbound_email(
+            cfg=cfg,
+            subject=actual_subject,
+            body_text=clean_body,
+            resources=staged_resources,
+            links=normalized_links,
+        )
+        _smtp_send_with_stage(cfg, message)
+    except Exception as exc:  # noqa: BLE001
+        stage = exc.stage if isinstance(exc, SmtpStageError) else "send"
+        error = str(exc) if isinstance(exc, SmtpStageError) else f"构建或发送邮件失败：{exc}"
+        update_outbound_message(cfg.db_path, mail_id, status="failed", error=error)
+        for item in staged_resources:
+            upsert_outbound_resource(
+                cfg.db_path,
+                resource_id=item["resource_id"], outbound_id=mail_id,
+                display_name=item["display_name"], mime_type=item["mime_type"],
+                source_path=str(item["path"]), staged_path=str(item["staged_path"]),
+                sent_archive_path=None, size_bytes=item["size_bytes"],
+                sha256=item["sha256"], staged_sha256=item["staged_sha256"],
+                sent_archive_sha256=None, status="failed", error=error,
+                sort_order=item["sort_order"],
+            )
+            insert_sent_file(
+                cfg.db_path,
+                source_path=str(item["path"]), send_copy_path=str(item["staged_path"]),
+                sent_copy_path=None, sha256=item["sha256"], subject=actual_subject,
+                from_email=cfg.qq_email, to_email=cfg.owner_gmail, sent_at=None,
+                status="failed", error_message=error,
+                original_filename=item["display_name"], size_bytes=item["size_bytes"],
+                source_origin=source_origin, source_sha256=item["sha256"],
+                staged_sha256=item["staged_sha256"],
+                attachment_sha256=item["staged_sha256"],
+                outbound_id=mail_id, outbound_resource_id=item["resource_id"],
+            )
+        return {
+            **_send_error_result("", f"smtp_{stage}_failed", error),
+            "outbound_id": mail_id,
+            "subject": actual_subject,
+        }
+
+    sent_at = fmt_datetime(now_local())
+    archive_errors: list[str] = []
+    for item in staged_resources:
+        archive_path = (
+            cfg.sent_dir / "outbound" / day / mail_id / "attachments"
+            / Path(item["staged_path"]).name
+        )
+        archive_sha = ""
+        resource_status = "sent"
+        resource_error: str | None = None
+        try:
+            atomic_copy_file(item["staged_path"], archive_path)
+            archive_sha = sha256_of_file(archive_path)
+            if archive_path.stat().st_size != item["size_bytes"] or archive_sha != item["staged_sha256"]:
+                raise OSError("发送归档与 SMTP 附件来源校验不一致")
+        except Exception as exc:  # noqa: BLE001
+            resource_status = "sent_archive_failed"
+            resource_error = str(exc)
+            archive_errors.append(f"{item['display_name']}：{exc}")
+            archive_path = Path()
+        upsert_outbound_resource(
+            cfg.db_path,
+            resource_id=item["resource_id"], outbound_id=mail_id,
+            display_name=item["display_name"], mime_type=item["mime_type"],
+            source_path=str(item["path"]), staged_path=str(item["staged_path"]),
+            sent_archive_path=str(archive_path) if str(archive_path) not in {"", "."} else None,
+            size_bytes=item["size_bytes"], sha256=item["sha256"],
+            staged_sha256=item["staged_sha256"],
+            sent_archive_sha256=archive_sha or None,
+            status=resource_status, error=resource_error,
+            sort_order=item["sort_order"],
+        )
+        insert_sent_file(
+            cfg.db_path,
+            source_path=str(item["path"]), send_copy_path=str(item["staged_path"]),
+            sent_copy_path=str(archive_path) if str(archive_path) not in {"", "."} else None,
+            sha256=item["sha256"], subject=actual_subject,
+            from_email=cfg.qq_email, to_email=cfg.owner_gmail, sent_at=sent_at,
+            status=resource_status, error_message=resource_error,
+            original_filename=item["display_name"], size_bytes=item["size_bytes"],
+            source_origin=source_origin, source_sha256=item["sha256"],
+            staged_sha256=item["staged_sha256"],
+            attachment_sha256=item["staged_sha256"],
+            sent_archive_sha256=archive_sha or None,
+            outbound_id=mail_id, outbound_resource_id=item["resource_id"],
+        )
+
+    final_status = "partial" if archive_errors else "sent"
+    error_text = "；".join(archive_errors) if archive_errors else None
+    update_outbound_message(
+        cfg.db_path, mail_id, status=final_status, sent_at=sent_at, error=error_text
+    )
+    log_event(
+        cfg.db_path,
+        "WARNING" if archive_errors else "SUCCESS",
+        "send",
+        f"邮件发送完成：{len(staged_resources)} 个附件，{len(normalized_links)} 个链接",
+    )
+    return {
+        "ok": True,
+        "status": "partial" if archive_errors else "success",
+        "send_status": "sent_archive_failed" if archive_errors else "sent",
+        "outbound_id": mail_id,
+        "subject": actual_subject,
+        "body_text": clean_body,
+        "to": cfg.owner_gmail,
+        "sent_at": sent_at,
+        "attachment_count": len(staged_resources),
+        "link_count": len(normalized_links),
+        "error": error_text or "发送完成",
+    }
+
+
+def _normalize_outbound_url(value: str) -> str:
+    raw = str(value or "").strip()
+    try:
+        parsed = urlsplit(raw)
+    except ValueError as exc:
+        raise ValueError("链接格式无效") from exc
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("链接必须是完整的 HTTP 或 HTTPS 地址")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("链接端口无效") from exc
+    host = parsed.hostname.rstrip(".").casefold()
+    netloc = host if port is None else f"{host}:{port}"
+    return urlunsplit((parsed.scheme.casefold(), netloc, parsed.path or "/", parsed.query, ""))
+
+
+def _build_outbound_email(
+    *,
+    cfg: AppConfig,
+    subject: str,
+    body_text: str,
+    resources: list[dict[str, Any]],
+    links: list[dict[str, str]],
+) -> EmailMessage:
+    message = EmailMessage()
+    message["From"] = cfg.qq_email
+    message["To"] = cfg.owner_gmail
+    message["Subject"] = subject
+    message["Date"] = formatdate(localtime=True)
+    sections: list[str] = []
+    if body_text:
+        sections.append(body_text.rstrip())
+    if links:
+        link_lines = ["相关链接："]
+        for item in links:
+            label = item.get("display_text", "").strip()
+            link_lines.append(
+                f"- {label}：{item['url']}" if label else f"- {item['url']}"
+            )
+        sections.append("\n".join(link_lines))
+    message.set_content("\n\n".join(sections))
+    for item in resources:
+        staged = Path(item["staged_path"])
+        data = staged.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        if len(data) != int(item["size_bytes"]) or digest != item["staged_sha256"]:
+            raise SmtpStageError("send", f"附件发送前校验失败：{item['display_name']}")
+        mime_type = str(item.get("mime_type") or "application/octet-stream")
+        maintype, subtype = mime_type.split("/", 1)
+        message.add_attachment(
+            data,
+            maintype=maintype,
+            subtype=subtype,
+            filename=str(item["display_name"]),
+        )
+    return message
+
+
 # ============================================================
 # 内部：构建邮件
 # ============================================================
@@ -313,6 +655,7 @@ def send_file_with_request(
     source_origin: str = "controlled",
     source_sha256: str | None = None,
     staged_sha256: str | None = None,
+    original_source_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """按 request_id 幂等发送，并准确区分 SMTP 与归档状态。"""
     try:
@@ -357,6 +700,57 @@ def send_file_with_request(
         source_sha256=source_sha,
         staged_sha256=staged_sha,
     )
+    existing_outbound = get_outbound_by_request_id(cfg.db_path, request_id)
+    outbound_id = str(
+        (existing_outbound or {}).get("outbound_id") or _outbound_id_for_request(request_id)
+    )
+    outbound_resource_id = _outbound_resource_id(outbound_id, 1)
+    outbound_origin = "agent_mcp" if source_origin in {"mcp_staged", "controlled"} else source_origin
+    default_body = f"Agent 已通过 AgentMailBridge 交付文件：{confirmed_name}。"
+    initial_outbound_status = (
+        "sent" if str(previous.get("status") or "") == "sent"
+        else "partial" if str(previous.get("status") or "") == "sent_archive_failed"
+        else "sending"
+    )
+    create_outbound_message(
+        cfg.db_path,
+        outbound_id=outbound_id,
+        sender_account_ref=_sender_account_ref(cfg),
+        sender_ref=cfg.qq_email,
+        source_origin=outbound_origin,
+        request_id=request_id,
+        subject=actual_subject,
+        body_text=default_body,
+        to_emails=[cfg.owner_gmail],
+        attachment_count=1,
+        link_count=0,
+        status=initial_outbound_status,
+    )
+    if attempt_state != "duplicate":
+        update_outbound_message(cfg.db_path, outbound_id, status="sending", error=None)
+    upsert_outbound_resource(
+        cfg.db_path,
+        resource_id=outbound_resource_id,
+        outbound_id=outbound_id,
+        display_name=confirmed_name,
+        mime_type=mimetypes.guess_type(confirmed_name)[0] or "application/octet-stream",
+        source_path=str(Path(original_source_path).resolve()) if original_source_path else str(source_path),
+        staged_path=str(source_path),
+        sent_archive_path=previous.get("sent_copy_path"),
+        size_bytes=size_bytes,
+        sha256=source_sha,
+        staged_sha256=staged_sha,
+        sent_archive_sha256=previous.get("sent_archive_sha256"),
+        status=initial_outbound_status if attempt_state == "duplicate" else "staged",
+        error=previous.get("error_message") if attempt_state == "duplicate" else None,
+        sort_order=1,
+    )
+    link_sent_file_to_outbound(
+        cfg.db_path,
+        outbound_id=outbound_id,
+        resource_id=outbound_resource_id,
+        request_id=request_id,
+    )
     if attempt_state == "duplicate":
         return {
             "ok": False,
@@ -378,6 +772,7 @@ def send_file_with_request(
             "staged_sha256": previous.get("staged_sha256") or previous.get("sha256") or staged_sha,
             "attachment_pre_smtp_sha256": previous.get("attachment_sha256") or "",
             "sent_archive_sha256": previous.get("sent_archive_sha256") or "",
+            "outbound_id": outbound_id,
         }
 
     now = now_local()
@@ -392,7 +787,21 @@ def send_file_with_request(
         update_send_attempt(
             cfg.db_path, request_id, status="failed", error_message=error
         )
-        return _send_error_result(request_id, "file_copy_failed", error)
+        update_outbound_message(cfg.db_path, outbound_id, status="failed", error=error)
+        upsert_outbound_resource(
+            cfg.db_path,
+            resource_id=outbound_resource_id, outbound_id=outbound_id,
+            display_name=confirmed_name,
+            mime_type=mimetypes.guess_type(confirmed_name)[0] or "application/octet-stream",
+            source_path=str(Path(original_source_path).resolve()) if original_source_path else str(source_path),
+            staged_path=str(source_path), sent_archive_path=None,
+            size_bytes=size_bytes, sha256=source_sha, staged_sha256=staged_sha,
+            sent_archive_sha256=None, status="failed", error=error, sort_order=1,
+        )
+        return {
+            **_send_error_result(request_id, "file_copy_failed", error),
+            "outbound_id": outbound_id,
+        }
 
     try:
         message = _build_email(
@@ -409,7 +818,21 @@ def send_file_with_request(
             send_copy_path=str(send_copy_path), error_message=error,
             attachment_sha256=attachment_sha,
         )
-        return _send_error_result(request_id, f"smtp_{exc.stage}_failed", error)
+        update_outbound_message(cfg.db_path, outbound_id, status="failed", error=error)
+        upsert_outbound_resource(
+            cfg.db_path,
+            resource_id=outbound_resource_id, outbound_id=outbound_id,
+            display_name=confirmed_name,
+            mime_type=mimetypes.guess_type(confirmed_name)[0] or "application/octet-stream",
+            source_path=str(Path(original_source_path).resolve()) if original_source_path else str(source_path),
+            staged_path=str(send_copy_path), sent_archive_path=None,
+            size_bytes=size_bytes, sha256=source_sha, staged_sha256=attachment_sha,
+            sent_archive_sha256=None, status="failed", error=error, sort_order=1,
+        )
+        return {
+            **_send_error_result(request_id, f"smtp_{exc.stage}_failed", error),
+            "outbound_id": outbound_id,
+        }
 
     sent_at = fmt_datetime(now_local())
     update_send_attempt(
@@ -430,6 +853,20 @@ def send_file_with_request(
             sent_at=sent_at, error_message=error,
             attachment_sha256=attachment_sha,
         )
+        update_outbound_message(
+            cfg.db_path, outbound_id, status="partial", sent_at=sent_at, error=error
+        )
+        upsert_outbound_resource(
+            cfg.db_path,
+            resource_id=outbound_resource_id, outbound_id=outbound_id,
+            display_name=confirmed_name,
+            mime_type=mimetypes.guess_type(confirmed_name)[0] or "application/octet-stream",
+            source_path=str(Path(original_source_path).resolve()) if original_source_path else str(source_path),
+            staged_path=str(send_copy_path), sent_archive_path=None,
+            size_bytes=size_bytes, sha256=source_sha, staged_sha256=attachment_sha,
+            sent_archive_sha256=None, status="sent_archive_failed", error=error,
+            sort_order=1,
+        )
         return {
             "ok": True,
             "status": "partial",
@@ -449,6 +886,7 @@ def send_file_with_request(
             "staged_sha256": staged_sha,
             "attachment_pre_smtp_sha256": attachment_sha,
             "sent_archive_sha256": "",
+            "outbound_id": outbound_id,
         }
 
     update_send_attempt(
@@ -456,6 +894,19 @@ def send_file_with_request(
         sent_copy_path=str(sent_copy_path), sent_at=sent_at,
         attachment_sha256=attachment_sha,
         sent_archive_sha256=archive_sha,
+    )
+    update_outbound_message(
+        cfg.db_path, outbound_id, status="sent", sent_at=sent_at, error=None
+    )
+    upsert_outbound_resource(
+        cfg.db_path,
+        resource_id=outbound_resource_id, outbound_id=outbound_id,
+        display_name=confirmed_name,
+        mime_type=mimetypes.guess_type(confirmed_name)[0] or "application/octet-stream",
+        source_path=str(Path(original_source_path).resolve()) if original_source_path else str(source_path),
+        staged_path=str(send_copy_path), sent_archive_path=str(sent_copy_path),
+        size_bytes=size_bytes, sha256=source_sha, staged_sha256=attachment_sha,
+        sent_archive_sha256=archive_sha, status="sent", error=None, sort_order=1,
     )
     return {
         "ok": True,
@@ -474,6 +925,7 @@ def send_file_with_request(
         "staged_sha256": staged_sha,
         "attachment_pre_smtp_sha256": attachment_sha,
         "sent_archive_sha256": archive_sha,
+        "outbound_id": outbound_id,
     }
 
 
@@ -487,8 +939,12 @@ def _send_error_result(request_id: str, error_code: str, message: str) -> dict[s
             "file_not_found",
             "file_type_not_allowed",
             "file_too_large",
+            "total_size_too_large",
             "file_copy_failed",
             "staged_hash_mismatch",
+            "invalid_link",
+            "empty_message",
+            "staging_failed",
         }
         else "failed"
     )

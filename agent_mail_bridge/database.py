@@ -85,6 +85,8 @@ CREATE TABLE IF NOT EXISTS sent_files (
     staged_sha256 TEXT,
     attachment_sha256 TEXT,
     sent_archive_sha256 TEXT,
+    outbound_id TEXT,
+    outbound_resource_id TEXT,
     created_at TEXT,
     updated_at TEXT
 );
@@ -181,6 +183,60 @@ CREATE TABLE IF NOT EXISTS mail_resources (
     FOREIGN KEY(package_id) REFERENCES mail_packages(package_id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS outbound_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    outbound_id TEXT NOT NULL UNIQUE,
+    sender_account_ref TEXT NOT NULL,
+    sender_ref TEXT NOT NULL,
+    source_origin TEXT NOT NULL,
+    request_id TEXT,
+    subject TEXT NOT NULL,
+    body_text TEXT NOT NULL DEFAULT '',
+    to_emails TEXT NOT NULL,
+    status TEXT NOT NULL,
+    error TEXT,
+    attachment_count INTEGER NOT NULL DEFAULT 0,
+    link_count INTEGER NOT NULL DEFAULT 0,
+    legacy_limited INTEGER NOT NULL DEFAULT 0,
+    legacy_sent_file_id INTEGER UNIQUE,
+    created_at TEXT NOT NULL,
+    sent_at TEXT,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS outbound_resources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    resource_id TEXT NOT NULL UNIQUE,
+    outbound_id TEXT NOT NULL,
+    resource_type TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    mime_type TEXT,
+    source_path TEXT,
+    staged_path TEXT,
+    sent_archive_path TEXT,
+    size_bytes INTEGER,
+    sha256 TEXT,
+    staged_sha256 TEXT,
+    sent_archive_sha256 TEXT,
+    status TEXT NOT NULL,
+    error TEXT,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(outbound_id) REFERENCES outbound_messages(outbound_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS outbound_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    outbound_id TEXT NOT NULL,
+    url TEXT NOT NULL,
+    display_text TEXT,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(outbound_id) REFERENCES outbound_messages(outbound_id) ON DELETE CASCADE,
+    UNIQUE(outbound_id, url)
+);
+
 CREATE TABLE IF NOT EXISTS trusted_domains (
     domain TEXT PRIMARY KEY,
     include_subdomains INTEGER NOT NULL DEFAULT 0,
@@ -245,6 +301,12 @@ CREATE INDEX IF NOT EXISTS idx_mail_resources_package
     ON mail_resources(package_id, sort_order, id);
 CREATE INDEX IF NOT EXISTS idx_mail_resources_name
     ON mail_resources(display_name);
+CREATE INDEX IF NOT EXISTS idx_outbound_messages_sent
+    ON outbound_messages(COALESCE(sent_at, created_at) DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_outbound_resources_message
+    ON outbound_resources(outbound_id, sort_order, id);
+CREATE INDEX IF NOT EXISTS idx_outbound_links_message
+    ON outbound_links(outbound_id, sort_order, id);
 CREATE INDEX IF NOT EXISTS idx_sent_files_sent_date
     ON sent_files(sent_at);
 CREATE INDEX IF NOT EXISTS idx_app_events_created
@@ -283,6 +345,8 @@ _SENT_FILES_NEW_COLUMNS = {
     "staged_sha256": "TEXT",
     "attachment_sha256": "TEXT",
     "sent_archive_sha256": "TEXT",
+    "outbound_id": "TEXT",
+    "outbound_resource_id": "TEXT",
 }
 
 _MCP_CALLS_NEW_COLUMNS = {
@@ -317,6 +381,7 @@ def init_db(db_path: Path | str) -> None:
         _migrate_sent_files(conn)
         _migrate_mcp_calls(conn)
         _ensure_unique_indexes(conn)
+        _backfill_legacy_outbound_messages(conn)
         conn.commit()
 
 
@@ -381,6 +446,10 @@ def _ensure_unique_indexes(conn: sqlite3.Connection) -> None:
         "ON sent_files(request_id) WHERE request_id IS NOT NULL"
     )
     conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_outbound_request_id "
+        "ON outbound_messages(request_id) WHERE request_id IS NOT NULL"
+    )
+    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_received_messages_package "
         "ON received_messages(package_id)"
     )
@@ -392,6 +461,101 @@ def _ensure_unique_indexes(conn: sqlite3.Connection) -> None:
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_received_files_resource "
         "ON received_files(resource_id) WHERE resource_id IS NOT NULL"
     )
+
+
+def _backfill_legacy_outbound_messages(conn: sqlite3.Connection) -> None:
+    """把旧 sent_files 幂等映射成邮件级发送事实，不伪造正文。"""
+    now = _now()
+    rows = conn.execute(
+        """
+        SELECT * FROM sent_files
+        WHERE outbound_id IS NULL OR outbound_id = ''
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    for raw in rows:
+        row = dict(raw)
+        sent_file_id = int(row["id"])
+        outbound_id = f"legacy_out_{sent_file_id}"
+        resource_id = f"legacy_out_res_{sent_file_id}"
+        raw_origin = str(row.get("source_origin") or "legacy")
+        if raw_origin == "manual_gui":
+            source_origin = "manual_gui"
+        elif row.get("request_id"):
+            source_origin = "agent_mcp"
+        else:
+            source_origin = "legacy"
+        raw_status = str(row.get("status") or "failed")
+        status = (
+            "sent" if raw_status == "sent"
+            else "partial" if raw_status == "sent_archive_failed"
+            else "failed"
+        )
+        created_at = str(row.get("created_at") or row.get("sent_at") or now)
+        display_name = str(
+            row.get("original_filename")
+            or Path(str(row.get("sent_copy_path") or row.get("send_copy_path") or row.get("source_path") or "")).name
+            or "旧版本附件"
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO outbound_messages
+                (outbound_id, sender_account_ref, sender_ref, source_origin,
+                 request_id, subject, body_text, to_emails, status, error,
+                 attachment_count, link_count, legacy_limited,
+                 legacy_sent_file_id, created_at, sent_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, 1, 0, 1, ?, ?, ?, ?)
+            """,
+            (
+                outbound_id,
+                f"qq:{str(row.get('from_email') or '').strip().casefold() or 'legacy'}",
+                str(row.get("from_email") or ""),
+                source_origin,
+                row.get("request_id"),
+                str(row.get("subject") or display_name),
+                json.dumps([str(row.get("to_email") or "")], ensure_ascii=False),
+                status,
+                row.get("error_message"),
+                sent_file_id,
+                created_at,
+                row.get("sent_at"),
+                now,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO outbound_resources
+                (resource_id, outbound_id, resource_type, display_name,
+                 source_path, staged_path, sent_archive_path, size_bytes,
+                 sha256, staged_sha256, sent_archive_sha256, status, error,
+                 sort_order, created_at, updated_at)
+            VALUES (?, ?, 'attachment', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+            """,
+            (
+                resource_id,
+                outbound_id,
+                display_name,
+                row.get("source_path"),
+                row.get("send_copy_path"),
+                row.get("sent_copy_path"),
+                row.get("size_bytes"),
+                row.get("source_sha256") or row.get("sha256"),
+                row.get("staged_sha256") or row.get("sha256"),
+                row.get("sent_archive_sha256"),
+                status,
+                row.get("error_message"),
+                created_at,
+                now,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE sent_files
+            SET outbound_id = ?, outbound_resource_id = ?, updated_at = COALESCE(updated_at, ?)
+            WHERE id = ?
+            """,
+            (outbound_id, resource_id, now, sent_file_id),
+        )
 
 
 def get_connection(db_path: Path | str) -> sqlite3.Connection:
@@ -824,6 +988,42 @@ def legacy_archive_backfill_needed(db_path: Path | str) -> bool:
         connection.close()
 
 
+def outbound_mail_migration_needed(db_path: Path | str) -> bool:
+    """旧数据库尚无邮件级发件表或 sent_files 关联列时返回 True。"""
+    path = Path(db_path)
+    if not path.exists():
+        return False
+    connection = sqlite3.connect(str(path), timeout=5.0)
+    try:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "sent_files" not in tables:
+            return False
+        required_tables = {
+            "outbound_messages", "outbound_resources", "outbound_links"
+        }
+        if not required_tables.issubset(tables):
+            return True
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(sent_files)")
+        }
+        if not {"outbound_id", "outbound_resource_id"}.issubset(columns):
+            return True
+        unlinked = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM sent_files "
+                "WHERE outbound_id IS NULL OR outbound_id = ''"
+            ).fetchone()[0]
+        )
+        return unlinked > 0
+    finally:
+        connection.close()
+
+
 def query_legacy_messages_for_backfill(db_path: Path | str) -> list[dict[str, Any]]:
     """返回尚未关联 package_id 的旧邮件，不读取正文或附件内容。"""
     with _get_conn(db_path) as conn:
@@ -871,6 +1071,25 @@ def query_mail_resources(
             WHERE package_id = ? ORDER BY sort_order ASC, id ASC
             """,
             (package_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def query_mail_local_resources(db_path: Path | str) -> list[dict[str, Any]]:
+    """列出所有有本地文件的邮件资源，并携带所属邮件事实。"""
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT r.*, p.subject AS mail_subject, p.from_email AS mail_from,
+                   p.backend AS mail_backend, p.received_at AS mail_received_at,
+                   p.saved_at AS mail_saved_at, p.package_root,
+                   p.archive_status AS mail_archive_status, p.legacy AS mail_legacy
+            FROM mail_resources r
+            JOIN mail_packages p ON p.package_id = r.package_id
+            WHERE r.local_path IS NOT NULL AND r.local_path != ''
+            ORDER BY COALESCE(p.received_at, p.saved_at) DESC,
+                     r.sort_order ASC, r.id ASC
+            """
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -1167,6 +1386,15 @@ def insert_sent_file(
     error_message: str | None = None,
     request_id: str | None = None,
     attempt_count: int = 1,
+    original_filename: str | None = None,
+    size_bytes: int | None = None,
+    source_origin: str = "controlled",
+    source_sha256: str | None = None,
+    staged_sha256: str | None = None,
+    attachment_sha256: str | None = None,
+    sent_archive_sha256: str | None = None,
+    outbound_id: str | None = None,
+    outbound_resource_id: str | None = None,
 ) -> int:
     """插入一条发送记录（成功或失败均可记录）。"""
     now = _now()
@@ -1176,13 +1404,19 @@ def insert_sent_file(
             INSERT INTO sent_files
                 (request_id, attempt_count, source_path, send_copy_path, sent_copy_path, sha256,
                  subject, from_email, to_email, sent_at, status,
-                 error_message, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 error_message, original_filename, size_bytes, source_origin,
+                 source_sha256, staged_sha256, attachment_sha256,
+                 sent_archive_sha256, outbound_id, outbound_resource_id,
+                 created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 request_id, attempt_count, source_path, send_copy_path, sent_copy_path, sha256,
                 subject, from_email, to_email, sent_at, status,
-                error_message, now, now,
+                error_message, original_filename, size_bytes, source_origin,
+                source_sha256, staged_sha256, attachment_sha256,
+                sent_archive_sha256, outbound_id, outbound_resource_id,
+                now, now,
             ),
         )
         conn.commit()
@@ -1422,6 +1656,257 @@ def query_recent_mcp_calls(
             "SELECT * FROM mcp_calls ORDER BY id DESC LIMIT ?", (max(1, limit),)
         ).fetchall()
         return [dict(row) for row in rows]
+
+
+def link_sent_file_to_outbound(
+    db_path: Path | str,
+    *,
+    outbound_id: str,
+    resource_id: str,
+    request_id: str | None = None,
+    sent_file_id: int | None = None,
+) -> None:
+    """把兼容文件事实关联到邮件级发送对象。"""
+    if request_id is None and sent_file_id is None:
+        raise ValueError("request_id 与 sent_file_id 至少提供一个")
+    with _get_conn(db_path) as conn:
+        if request_id is not None:
+            conn.execute(
+                """
+                UPDATE sent_files
+                SET outbound_id = ?, outbound_resource_id = ?, updated_at = ?
+                WHERE request_id = ?
+                """,
+                (outbound_id, resource_id, _now(), request_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE sent_files
+                SET outbound_id = ?, outbound_resource_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (outbound_id, resource_id, _now(), sent_file_id),
+            )
+        conn.commit()
+
+
+# ============================================================
+# outbound mail facts
+# ============================================================
+
+def create_outbound_message(
+    db_path: Path | str,
+    *,
+    outbound_id: str,
+    sender_account_ref: str,
+    sender_ref: str,
+    source_origin: str,
+    request_id: str | None,
+    subject: str,
+    body_text: str,
+    to_emails: list[str],
+    attachment_count: int,
+    link_count: int,
+    status: str = "sending",
+    error: str | None = None,
+) -> dict[str, Any]:
+    """创建一封发送邮件；相同 outbound_id 不会产生第二封。"""
+    now = _now()
+    with _get_conn(db_path) as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO outbound_messages
+                (outbound_id, sender_account_ref, sender_ref, source_origin,
+                 request_id, subject, body_text, to_emails, status, error,
+                 attachment_count, link_count, legacy_limited,
+                 created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+            """,
+            (
+                outbound_id, sender_account_ref, sender_ref, source_origin,
+                request_id, subject, body_text,
+                json.dumps(to_emails, ensure_ascii=False), status, error,
+                int(attachment_count), int(link_count), now, now,
+            ),
+        )
+        conn.commit()
+    return get_outbound_message(db_path, outbound_id) or {}
+
+
+def update_outbound_message(
+    db_path: Path | str,
+    outbound_id: str,
+    *,
+    status: str,
+    sent_at: str | None = None,
+    error: str | None = None,
+) -> None:
+    with _get_conn(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE outbound_messages
+            SET status = ?, sent_at = COALESCE(?, sent_at), error = ?, updated_at = ?
+            WHERE outbound_id = ?
+            """,
+            (status, sent_at, error, _now(), outbound_id),
+        )
+        conn.commit()
+
+
+def upsert_outbound_resource(
+    db_path: Path | str,
+    *,
+    resource_id: str,
+    outbound_id: str,
+    display_name: str,
+    mime_type: str | None,
+    source_path: str | None,
+    staged_path: str | None,
+    sent_archive_path: str | None,
+    size_bytes: int | None,
+    sha256: str | None,
+    staged_sha256: str | None,
+    sent_archive_sha256: str | None,
+    status: str,
+    error: str | None,
+    sort_order: int,
+) -> None:
+    now = _now()
+    with _get_conn(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO outbound_resources
+                (resource_id, outbound_id, resource_type, display_name,
+                 mime_type, source_path, staged_path, sent_archive_path,
+                 size_bytes, sha256, staged_sha256, sent_archive_sha256,
+                 status, error, sort_order, created_at, updated_at)
+            VALUES (?, ?, 'attachment', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(resource_id) DO UPDATE SET
+                display_name=excluded.display_name,
+                mime_type=COALESCE(excluded.mime_type, outbound_resources.mime_type),
+                source_path=COALESCE(excluded.source_path, outbound_resources.source_path),
+                staged_path=COALESCE(excluded.staged_path, outbound_resources.staged_path),
+                sent_archive_path=COALESCE(excluded.sent_archive_path, outbound_resources.sent_archive_path),
+                size_bytes=COALESCE(excluded.size_bytes, outbound_resources.size_bytes),
+                sha256=COALESCE(excluded.sha256, outbound_resources.sha256),
+                staged_sha256=COALESCE(excluded.staged_sha256, outbound_resources.staged_sha256),
+                sent_archive_sha256=COALESCE(excluded.sent_archive_sha256, outbound_resources.sent_archive_sha256),
+                status=excluded.status, error=excluded.error,
+                sort_order=excluded.sort_order, updated_at=excluded.updated_at
+            """,
+            (
+                resource_id, outbound_id, display_name, mime_type,
+                source_path, staged_path, sent_archive_path, size_bytes,
+                sha256, staged_sha256, sent_archive_sha256, status, error,
+                int(sort_order), now, now,
+            ),
+        )
+        conn.commit()
+
+
+def replace_outbound_links(
+    db_path: Path | str,
+    outbound_id: str,
+    links: list[dict[str, Any]],
+) -> None:
+    """保存当前新邮件的显式链接清单。"""
+    with _get_conn(db_path) as conn:
+        conn.execute("DELETE FROM outbound_links WHERE outbound_id = ?", (outbound_id,))
+        for index, link in enumerate(links, 1):
+            conn.execute(
+                """
+                INSERT INTO outbound_links
+                    (outbound_id, url, display_text, sort_order, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    outbound_id,
+                    str(link.get("url") or ""),
+                    str(link.get("display_text") or ""),
+                    int(link.get("sort_order") or index),
+                    _now(),
+                ),
+            )
+        conn.commit()
+
+
+def get_outbound_message(
+    db_path: Path | str, outbound_id: str
+) -> dict[str, Any] | None:
+    with _get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM outbound_messages WHERE outbound_id = ? LIMIT 1",
+            (outbound_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        result = _outbound_message_dto(dict(row))
+        resources = conn.execute(
+            """
+            SELECT * FROM outbound_resources
+            WHERE outbound_id = ? ORDER BY sort_order ASC, id ASC
+            """,
+            (outbound_id,),
+        ).fetchall()
+        links = conn.execute(
+            """
+            SELECT * FROM outbound_links
+            WHERE outbound_id = ? ORDER BY sort_order ASC, id ASC
+            """,
+            (outbound_id,),
+        ).fetchall()
+        result["resources"] = [dict(item) for item in resources]
+        result["links"] = [dict(item) for item in links]
+        return result
+
+
+def get_outbound_by_request_id(
+    db_path: Path | str, request_id: str
+) -> dict[str, Any] | None:
+    with _get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT outbound_id FROM outbound_messages WHERE request_id = ? LIMIT 1",
+            (request_id,),
+        ).fetchone()
+    return get_outbound_message(db_path, str(row["outbound_id"])) if row else None
+
+
+def query_recent_outbound_messages(
+    db_path: Path | str, limit: int = 100
+) -> list[dict[str, Any]]:
+    safe_limit = max(1, min(int(limit), 500))
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM outbound_messages
+            ORDER BY COALESCE(sent_at, created_at) DESC, id DESC LIMIT ?
+            """,
+            (safe_limit,),
+        ).fetchall()
+        return [_outbound_message_dto(dict(row)) for row in rows]
+
+
+def _outbound_message_dto(row: dict[str, Any]) -> dict[str, Any]:
+    try:
+        recipients = json.loads(str(row.get("to_emails") or "[]"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        recipients = [str(row.get("to_emails") or "")]
+    row["to"] = [str(item) for item in recipients if str(item)]
+    row["legacy_limited"] = bool(row.get("legacy_limited"))
+    row["attachment_count"] = int(row.get("attachment_count") or 0)
+    row["link_count"] = int(row.get("link_count") or 0)
+    return row
+
+
+def backfill_legacy_outbound_messages(db_path: Path | str) -> dict[str, int]:
+    """公开的幂等迁移入口，主要用于升级验证。"""
+    with _get_conn(db_path) as conn:
+        before = int(conn.execute("SELECT COUNT(*) FROM outbound_messages").fetchone()[0])
+        _backfill_legacy_outbound_messages(conn)
+        conn.commit()
+        after = int(conn.execute("SELECT COUNT(*) FROM outbound_messages").fetchone()[0])
+    return {"migrated": after - before, "total": after}
 
 
 # ============================================================

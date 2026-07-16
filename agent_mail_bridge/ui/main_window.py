@@ -9,8 +9,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, Signal, Slot
-from PySide6.QtGui import QAction, QCloseEvent, QColor, QFont, QIcon, QPalette, QPixmap
+from PySide6.QtCore import QEvent, QObject, QPoint, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QFont, QIcon, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -37,6 +38,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QSizeGrip,
     QSpinBox,
+    QSplitter,
     QStackedWidget,
     QStyle,
     QTableWidgetItem,
@@ -366,6 +368,7 @@ class BridgeWindow(QMainWindow):
         saved_theme = os.getenv("GUI_THEME", "light").strip().lower()
         self.theme_mode = saved_theme if saved_theme in {"light", "dark"} else "light"
         self.file_rows: list[dict] = []
+        self.mail_rows: list[dict] = []
         self.log_rows: list[dict] = []
         self.history_rows: dict[str, list[dict]] = {"received": [], "sent": []}
         self.mcp_rows: list[dict] = []
@@ -373,6 +376,10 @@ class BridgeWindow(QMainWindow):
         self.health_fix_target = ""
         self.selected_send_path = ""
         self.send_selection: SendFileSelection | None = None
+        self.send_selections: list[SendFileSelection] = []
+        self.send_links: list[dict[str, str]] = []
+        self._detail_return_page = "inbox"
+        self._mail_detail_return_widget: QWidget | None = None
         self.last_refresh_at: datetime | None = None
         self.last_error_details = ""
         self._config_dirty = False
@@ -590,6 +597,16 @@ class BridgeWindow(QMainWindow):
             "about": self._build_about_page(),
         }
         for page in self.pages.values():
+            self.page_stack.addWidget(page)
+        # 邮件、会话和发件详情是二级工作面，不增加新的顶级路由。
+        self.mail_detail_page = self._build_mail_detail_page()
+        self.mail_thread_page = self._build_mail_thread_page()
+        self.outbound_detail_page = self._build_outbound_detail_page()
+        for page in (
+            self.mail_detail_page,
+            self.mail_thread_page,
+            self.outbound_detail_page,
+        ):
             self.page_stack.addWidget(page)
         layout.addWidget(self.page_stack, 1)
         return panel
@@ -888,11 +905,11 @@ class BridgeWindow(QMainWindow):
         layout.addWidget(self.message_bar)
 
         file_header = QHBoxLayout()
-        file_title = QLabel("今日收到文件")
+        file_title = QLabel("今日收到邮件")
         file_title.setObjectName("sectionTitle")
         self.inbox_search = QLineEdit()
         self.inbox_search.setObjectName("inboxSearch")
-        self.inbox_search.setPlaceholderText("搜索收到的文件")
+        self.inbox_search.setPlaceholderText("搜索主题、发件人或邮件内容")
         self.inbox_search.setClearButtonEnabled(True)
         self.inbox_search.addAction(
             QIcon(line_icon_pixmap("search", 17, TEXT_MUTED)),
@@ -901,17 +918,18 @@ class BridgeWindow(QMainWindow):
         self.inbox_search.setMinimumWidth(260)
         self.inbox_search.setMaximumWidth(420)
         self.inbox_search.textChanged.connect(self._filter_inbox)
-        open_button = self._button("打开今日接收文件夹", self.open_today_folder, icon_kind="file")
+        open_button = self._button("打开今日邮件归档", self.open_today_folder, icon_kind="file")
         file_header.addWidget(file_title)
         file_header.addStretch(1)
         file_header.addWidget(self.inbox_search)
         file_header.addWidget(open_button)
         layout.addLayout(file_header)
-        self.files_table = DataTable(["文件名", "大小", "收取时间", "操作"])
+        self.files_table = DataTable(
+            ["主题", "发件人", "内容", "收取时间", "状态", "操作"]
+        )
         self.files_table.setMinimumHeight(220)
-        self.files_table.setMaximumHeight(300)
-        self.files_table.cellDoubleClicked.connect(self._preview_table_file)
-        self._configure_file_table(self.files_table)
+        self.files_table.cellDoubleClicked.connect(self._open_inbox_mail)
+        self._configure_inbox_table(self.files_table)
         self.inbox_table = self.files_table
         layout.addWidget(self.files_table, 2)
 
@@ -930,7 +948,6 @@ class BridgeWindow(QMainWindow):
         layout.addLayout(log_header)
         self.logs_table = DataTable(["时间", "级别", "消息"])
         self.logs_table.setMinimumHeight(180)
-        self.logs_table.setMaximumHeight(220)
         self._configure_log_table(self.logs_table)
         self.logs_refresh_label = self.home_refresh_label
         self.dashboard_refresh_label = self.home_refresh_label
@@ -947,58 +964,118 @@ class BridgeWindow(QMainWindow):
         return scroll
 
     def _build_send_page(self) -> QWidget:
-        page, layout = self._standard_page("发邮件", "用户可手动选择任意位置的普通文件；MCP 和 CLI 仍受目录限制。")
-        card = QFrame()
-        card.setObjectName("card")
-        form = QVBoxLayout(card)
-        form.setContentsMargins(20, 17, 20, 18)
-        form.setSpacing(10)
-        source_label = QLabel("待发送文件")
-        source_label.setObjectName("fieldLabel")
-        source_row = QHBoxLayout()
-        self.send_path_edit = QLineEdit()
+        page, layout = self._standard_page(
+            "发邮件",
+            "主题、正文、多个附件和多个链接会组成一封邮件；收件人固定为绑定的 Gmail。",
+            header_action_label="Agent 发件 / MCP",
+            header_action_icon="terminal",
+        )
+        page.header_action_button.clicked.connect(lambda: self.select_page("agent"))
+
+        # 旧版单文件控件继续作为程序兼容接口存在，但不再占用正式界面。
+        self.send_path_edit = QLineEdit(page)
         self.send_path_edit.setReadOnly(True)
-        self.send_path_edit.setPlaceholderText("请选择电脑任意位置的普通文件")
-        choose = self._button("选择文件", self.choose_send_file)
-        source_row.addWidget(self.send_path_edit, 1)
-        source_row.addWidget(choose)
-        file_actions = QHBoxLayout()
-        self.copy_send_path_button = self._button("复制路径", self.copy_selected_send_path, text_only=True)
-        self.reveal_send_file_button = self._button("打开所在文件夹", self.reveal_selected_send_file, text_only=True)
-        self.preview_send_file_button = self._button("安全预览", self.preview_selected_send_file, text_only=True)
-        for button in (
+        self.send_file_name_value = QLabel("未选择", page)
+        self.send_file_size_value = QLabel("—", page)
+        self.send_file_type_value = QLabel("—", page)
+        self.send_file_modified_value = QLabel("—", page)
+        self.copy_send_path_button = self._button("复制路径", self.copy_selected_send_path)
+        self.reveal_send_file_button = self._button("打开所在文件夹", self.reveal_selected_send_file)
+        self.preview_send_file_button = self._button("安全预览", self.preview_selected_send_file)
+        for widget in (
+            self.send_path_edit,
+            self.send_file_name_value,
+            self.send_file_size_value,
+            self.send_file_type_value,
+            self.send_file_modified_value,
             self.copy_send_path_button,
             self.reveal_send_file_button,
             self.preview_send_file_button,
         ):
-            button.setEnabled(False)
-            file_actions.addWidget(button)
-        file_actions.addStretch(1)
+            widget.hide()
 
-        details = QGridLayout()
-        details.setHorizontalSpacing(14)
-        details.setVerticalSpacing(6)
-        self.send_file_name_value = QLabel("未选择")
-        self.send_file_size_value = QLabel("—")
-        self.send_file_type_value = QLabel("—")
-        self.send_file_modified_value = QLabel("—")
-        detail_values = (
-            ("文件名", self.send_file_name_value),
-            ("大小", self.send_file_size_value),
-            ("类型", self.send_file_type_value),
-            ("最后修改", self.send_file_modified_value),
-        )
-        for index, (label, value) in enumerate(detail_values):
-            title = QLabel(label)
-            title.setObjectName("fieldLabel")
-            value.setObjectName("sendFileValue")
-            details.addWidget(title, index // 2 * 2, index % 2)
-            details.addWidget(value, index // 2 * 2 + 1, index % 2)
-        self.subject_edit = QLineEdit()
-        self.subject_edit.setPlaceholderText("可选；留空时使用默认主题")
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.setChildrenCollapsible(False)
+        card = QFrame()
+        card.setObjectName("card")
+        form = QVBoxLayout(card)
+        form.setContentsMargins(18, 14, 18, 14)
+        form.setSpacing(8)
+
+        recipient_row = QHBoxLayout()
+        recipient_row.addWidget(QLabel("固定收件人"))
         self.recipient_edit = QLineEdit(self.service.cfg.owner_gmail)
         self.recipient_edit.setReadOnly(True)
-        self.send_action_button = self._button("发送到绑定 Gmail", self.send_selected_file, primary=True)
+        recipient_row.addWidget(self.recipient_edit, 1)
+        form.addLayout(recipient_row)
+
+        self.subject_edit = QLineEdit()
+        self.subject_edit.setPlaceholderText("邮件主题（可单独发送）")
+        self.subject_edit.textChanged.connect(self._update_send_action_state)
+        form.addWidget(self.subject_edit)
+
+        self.send_body_edit = QTextEdit()
+        self.send_body_edit.setPlaceholderText("邮件正文（纯文本；可单独发送）")
+        self.send_body_edit.setMinimumHeight(82)
+        self.send_body_edit.setMaximumHeight(130)
+        self.send_body_edit.textChanged.connect(self._update_send_action_state)
+        form.addWidget(self.send_body_edit)
+
+        resource_row = QHBoxLayout()
+        resource_row.setSpacing(10)
+        attachment_box = QFrame()
+        attachment_box.setObjectName("accountPanel")
+        attachment_layout = QVBoxLayout(attachment_box)
+        attachment_layout.setContentsMargins(10, 8, 10, 8)
+        attachment_header = QHBoxLayout()
+        attachment_title = QLabel("附件 0 个")
+        attachment_title.setObjectName("fieldLabel")
+        self.send_attachment_title = attachment_title
+        attachment_header.addWidget(attachment_title)
+        attachment_header.addStretch(1)
+        attachment_header.addWidget(
+            self._button("添加附件", self.choose_send_attachments, outline=True, icon_kind="file")
+        )
+        attachment_layout.addLayout(attachment_header)
+        self.send_attachment_table = DataTable(["文件名", "大小", "操作"])
+        self.send_attachment_table.setMinimumHeight(102)
+        self.send_attachment_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.send_attachment_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.send_attachment_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self.send_attachment_table.setColumnWidth(2, 72)
+        self.send_attachment_table.setTextElideMode(Qt.TextElideMode.ElideNone)
+        attachment_layout.addWidget(self.send_attachment_table)
+        resource_row.addWidget(attachment_box, 1)
+
+        link_box = QFrame()
+        link_box.setObjectName("accountPanel")
+        link_layout = QVBoxLayout(link_box)
+        link_layout.setContentsMargins(10, 8, 10, 8)
+        link_title = QLabel("相关链接 0 个")
+        link_title.setObjectName("fieldLabel")
+        self.send_link_title = link_title
+        link_layout.addWidget(link_title)
+        link_add_row = QHBoxLayout()
+        self.send_link_edit = QLineEdit()
+        self.send_link_edit.setPlaceholderText("https://example.com")
+        self.send_link_edit.returnPressed.connect(self.add_send_link)
+        link_add_row.addWidget(self.send_link_edit, 1)
+        link_add_row.addWidget(self._button("添加", self.add_send_link, outline=True))
+        link_layout.addLayout(link_add_row)
+        self.send_link_table = DataTable(["链接", "操作"])
+        self.send_link_table.setMinimumHeight(72)
+        self.send_link_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.send_link_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.send_link_table.setColumnWidth(1, 72)
+        self.send_link_table.setTextElideMode(Qt.TextElideMode.ElideNone)
+        link_layout.addWidget(self.send_link_table)
+        resource_row.addWidget(link_box, 1)
+        form.addLayout(resource_row)
+
+        action_row = QHBoxLayout()
+        self.send_action_button = self._button(
+            "发送这一封邮件", self.send_composed_mail, primary=True, icon_kind="send"
+        )
         self.send_action_button.setEnabled(False)
         self.task_buttons.append(self.send_action_button)
         self.send_progress = QProgressBar()
@@ -1006,45 +1083,43 @@ class BridgeWindow(QMainWindow):
         self.send_progress.setTextVisible(False)
         self.send_progress.setFixedHeight(4)
         self.send_progress.hide()
-        self.send_status_label = QLabel("请选择本次要发送的文件")
+        self.send_status_label = QLabel("填写主题、正文，或添加附件、链接后即可发送")
         self.send_status_label.setObjectName("hint")
-        form.addWidget(source_label)
-        form.addLayout(source_row)
-        form.addLayout(file_actions)
-        form.addLayout(details)
-        form.addWidget(QLabel("邮件主题"))
-        form.addWidget(self.subject_edit)
-        form.addWidget(QLabel("固定收件人"))
-        form.addWidget(self.recipient_edit)
-        form.addWidget(self.send_action_button, 0, Qt.AlignmentFlag.AlignLeft)
+        action_row.addWidget(self.send_action_button)
+        action_row.addWidget(self.send_status_label, 1)
+        form.addLayout(action_row)
         form.addWidget(self.send_progress)
-        form.addWidget(self.send_status_label)
-        layout.addWidget(card)
-        related = QFrame()
-        related.setObjectName("card")
-        related_layout = QHBoxLayout(related)
-        related_layout.setContentsMargins(16, 11, 16, 11)
-        related_title = QLabel("Agent 发件 / MCP")
-        related_title.setObjectName("minorTitle")
-        related_hint = QLabel("按需启动 · stdio · 固定收件人 · 路径白名单")
-        related_hint.setObjectName("hint")
-        related_layout.addWidget(related_title)
-        related_layout.addWidget(related_hint)
-        related_layout.addStretch(1)
-        related_layout.addWidget(self._button("打开 MCP 面板", lambda: self.select_page("agent"), outline=True))
-        layout.addWidget(related)
+        splitter.addWidget(card)
 
+        history_panel = QWidget()
+        history_layout = QVBoxLayout(history_panel)
+        history_layout.setContentsMargins(0, 0, 0, 0)
+        history_layout.setSpacing(8)
         history_header = QHBoxLayout()
         history_title = QLabel("最近发送记录")
         history_title.setObjectName("sectionTitle")
         history_header.addWidget(history_title)
         history_header.addStretch(1)
         history_header.addWidget(self._button("管理记录", self.open_send_history, text_only=True))
-        layout.addLayout(history_header)
+        history_layout.addLayout(history_header)
         self.sent_table = DataTable(
-            ["文件", "大小", "来源", "request_id", "发送时间", "状态"]
+            ["主题", "内容", "来源", "发送时间", "状态", "操作"]
         )
-        layout.addWidget(self.sent_table, 1)
+        sent_header = self.sent_table.horizontalHeader()
+        sent_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        sent_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        sent_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        sent_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        sent_header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        sent_header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        self.sent_table.setColumnWidth(5, 92)
+        self.sent_table.setWordWrap(True)
+        self.sent_table.setTextElideMode(Qt.TextElideMode.ElideNone)
+        history_layout.addWidget(self.sent_table, 1)
+        splitter.addWidget(history_panel)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        layout.addWidget(splitter, 1)
         return page
 
     def _build_files_data_page(self) -> QWidget:
@@ -1559,12 +1634,45 @@ class BridgeWindow(QMainWindow):
     def _build_agent_page(self) -> QWidget:
         page, layout = self._standard_page(
             "发件 > Agent 发件 / MCP",
-            "本机 stdio MCP 只允许提交白名单目录内的结果文件，收件人固定。",
+            "本机 stdio MCP 按需启动；Agent 只能交付已授权工作区内的结果文件，收件人固定。",
         )
         back = QHBoxLayout()
         back.addStretch(1)
         back.addWidget(self._button("← 返回发件", lambda: self.select_page("send"), text_only=True))
         layout.addLayout(back)
+
+        delivery_card = QFrame()
+        delivery_card.setObjectName("card")
+        delivery_layout = QVBoxLayout(delivery_card)
+        delivery_layout.setContentsMargins(16, 12, 16, 12)
+        delivery_header = QHBoxLayout()
+        delivery_title = QLabel("Agent 交付指令")
+        delivery_title.setObjectName("sectionTitle")
+        delivery_header.addWidget(delivery_title)
+        delivery_header.addStretch(1)
+        delivery_header.addWidget(
+            self._button("复制交付指令", self.copy_agent_delivery_instruction, primary=True)
+        )
+        delivery_layout.addLayout(delivery_header)
+        self.agent_delivery_title_edit = QLineEdit()
+        self.agent_delivery_title_edit.setPlaceholderText("邮件主题（可选）")
+        self.agent_delivery_title_edit.textChanged.connect(
+            self._update_agent_delivery_instruction
+        )
+        delivery_layout.addWidget(self.agent_delivery_title_edit)
+        self.agent_delivery_instruction = QTextEdit()
+        self.agent_delivery_instruction.setReadOnly(True)
+        self.agent_delivery_instruction.setMinimumHeight(260)
+        delivery_layout.addWidget(self.agent_delivery_instruction)
+        delivery_note = QLabel(
+            "指令不会包含本机用户名或工作区绝对路径；产物由 Agent 在当前已授权工作区内直接交付。"
+        )
+        delivery_note.setObjectName("hint")
+        delivery_note.setWordWrap(True)
+        delivery_layout.addWidget(delivery_note)
+        layout.addWidget(delivery_card)
+        self._update_agent_delivery_instruction()
+
         status_card = QFrame()
         status_card.setObjectName("card")
         status_grid = QGridLayout(status_card)
@@ -1589,6 +1697,35 @@ class BridgeWindow(QMainWindow):
         self.mcp_roots_label.setWordWrap(True)
         status_grid.addWidget(self.mcp_roots_label, 2, 1)
         layout.addWidget(status_card)
+
+        workspace_card = QFrame()
+        workspace_card.setObjectName("card")
+        workspace_layout = QVBoxLayout(workspace_card)
+        workspace_layout.setContentsMargins(16, 12, 16, 12)
+        workspace_header = QHBoxLayout()
+        workspace_title = QLabel("Agent 工作区授权")
+        workspace_title.setObjectName("sectionTitle")
+        workspace_header.addWidget(workspace_title)
+        workspace_header.addStretch(1)
+        workspace_header.addWidget(
+            self._button("添加工作区", self.add_agent_workspace_from_dialog, outline=True)
+        )
+        workspace_layout.addLayout(workspace_header)
+        workspace_hint = QLabel(
+            "只授权明确的项目目录；驱动器根目录、用户目录、AppData 和产品数据目录会被拒绝。变更从下一次 MCP 会话生效。"
+        )
+        workspace_hint.setObjectName("hint")
+        workspace_hint.setWordWrap(True)
+        workspace_layout.addWidget(workspace_hint)
+        self.agent_workspace_table = DataTable(["已授权工作区", "操作"])
+        self.agent_workspace_table.setMinimumHeight(116)
+        workspace_table_header = self.agent_workspace_table.horizontalHeader()
+        workspace_table_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        workspace_table_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.agent_workspace_table.setColumnWidth(1, 82)
+        self.agent_workspace_table.setTextElideMode(Qt.TextElideMode.ElideNone)
+        workspace_layout.addWidget(self.agent_workspace_table)
+        layout.addWidget(workspace_card)
 
         command_title = QLabel("本地启动与 Agent 配置")
         command_title.setObjectName("sectionTitle")
@@ -1627,6 +1764,7 @@ class BridgeWindow(QMainWindow):
         self.mcp_table = DataTable(
             ["调用时间", "request_id", "文件路径", "发送状态", "错误代码"]
         )
+        self.mcp_table.setMinimumHeight(170)
         header = self.mcp_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -1640,7 +1778,147 @@ class BridgeWindow(QMainWindow):
         security.setObjectName("hint")
         security.setWordWrap(True)
         layout.addWidget(security)
-        return page
+        scroll = QScrollArea()
+        scroll.setObjectName("pageScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(page)
+        return scroll
+
+    def _build_mail_detail_page(self) -> QWidget:
+        page, layout = self._standard_page(
+            "邮件详情", "查看一封邮件的正文、图片、附件、链接与归档状态。"
+        )
+        navigation = QHBoxLayout()
+        navigation.addWidget(
+            self._button("← 返回", self._return_from_mail_detail, text_only=True)
+        )
+        navigation.addStretch(1)
+        self.mail_detail_thread_button = self._button(
+            "查看邮件会话", self.open_current_mail_thread, outline=True
+        )
+        self.mail_detail_archive_button = self._button(
+            "打开邮件归档", self.open_current_mail_archive, outline=True, icon_kind="file"
+        )
+        navigation.addWidget(self.mail_detail_thread_button)
+        navigation.addWidget(self.mail_detail_archive_button)
+        layout.addLayout(navigation)
+
+        header_card = QFrame()
+        header_card.setObjectName("card")
+        header_layout = QVBoxLayout(header_card)
+        header_layout.setContentsMargins(18, 14, 18, 14)
+        self.mail_detail_subject = QLabel("无主题邮件")
+        self.mail_detail_subject.setObjectName("sectionTitle")
+        self.mail_detail_subject.setWordWrap(True)
+        self.mail_detail_meta = QLabel("—")
+        self.mail_detail_meta.setObjectName("hint")
+        self.mail_detail_meta.setWordWrap(True)
+        self.mail_detail_counts = QLabel("—")
+        self.mail_detail_counts.setObjectName("minorTitle")
+        header_layout.addWidget(self.mail_detail_subject)
+        header_layout.addWidget(self.mail_detail_meta)
+        header_layout.addWidget(self.mail_detail_counts)
+        layout.addWidget(header_card)
+
+        body_title = QLabel("邮件正文")
+        body_title.setObjectName("sectionTitle")
+        layout.addWidget(body_title)
+        self.mail_detail_body = QTextEdit()
+        self.mail_detail_body.setReadOnly(True)
+        self.mail_detail_body.setMinimumHeight(190)
+        layout.addWidget(self.mail_detail_body)
+
+        resource_title = QLabel("邮件内容与附件")
+        resource_title.setObjectName("sectionTitle")
+        layout.addWidget(resource_title)
+        self.mail_detail_resource_widget = QWidget()
+        self.mail_detail_resource_layout = QVBoxLayout(self.mail_detail_resource_widget)
+        self.mail_detail_resource_layout.setContentsMargins(0, 0, 0, 0)
+        self.mail_detail_resource_layout.setSpacing(8)
+        layout.addWidget(self.mail_detail_resource_widget)
+        layout.addStretch(1)
+        scroll = QScrollArea()
+        scroll.setObjectName("pageScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(page)
+        return scroll
+
+    def _build_mail_thread_page(self) -> QWidget:
+        page, layout = self._standard_page(
+            "邮件会话", "按时间顺序查看属于同一会话的邮件。"
+        )
+        back = QHBoxLayout()
+        back.addWidget(
+            self._button("← 返回邮件", self._return_from_mail_thread, text_only=True)
+        )
+        back.addStretch(1)
+        layout.addLayout(back)
+        self.mail_thread_summary = QLabel("—")
+        self.mail_thread_summary.setObjectName("sectionTitle")
+        self.mail_thread_summary.setWordWrap(True)
+        layout.addWidget(self.mail_thread_summary)
+        self.mail_thread_cards_widget = QWidget()
+        self.mail_thread_cards_layout = QVBoxLayout(self.mail_thread_cards_widget)
+        self.mail_thread_cards_layout.setContentsMargins(0, 0, 0, 0)
+        self.mail_thread_cards_layout.setSpacing(10)
+        layout.addWidget(self.mail_thread_cards_widget)
+        layout.addStretch(1)
+        scroll = QScrollArea()
+        scroll.setObjectName("pageScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(page)
+        return scroll
+
+    def _build_outbound_detail_page(self) -> QWidget:
+        page, layout = self._standard_page(
+            "发送邮件详情", "查看一次完整发送的正文、附件、链接和审计状态。"
+        )
+        back = QHBoxLayout()
+        back.addWidget(
+            self._button("← 返回", self._return_from_outbound_detail, text_only=True)
+        )
+        back.addStretch(1)
+        layout.addLayout(back)
+        header_card = QFrame()
+        header_card.setObjectName("card")
+        header_layout = QVBoxLayout(header_card)
+        header_layout.setContentsMargins(18, 14, 18, 14)
+        self.outbound_detail_subject = QLabel("无主题邮件")
+        self.outbound_detail_subject.setObjectName("sectionTitle")
+        self.outbound_detail_subject.setWordWrap(True)
+        self.outbound_detail_meta = QLabel("—")
+        self.outbound_detail_meta.setObjectName("hint")
+        self.outbound_detail_meta.setWordWrap(True)
+        header_layout.addWidget(self.outbound_detail_subject)
+        header_layout.addWidget(self.outbound_detail_meta)
+        layout.addWidget(header_card)
+        body_title = QLabel("邮件正文")
+        body_title.setObjectName("sectionTitle")
+        layout.addWidget(body_title)
+        self.outbound_detail_body = QTextEdit()
+        self.outbound_detail_body.setReadOnly(True)
+        self.outbound_detail_body.setMinimumHeight(150)
+        layout.addWidget(self.outbound_detail_body)
+        resource_title = QLabel("附件与链接")
+        resource_title.setObjectName("sectionTitle")
+        layout.addWidget(resource_title)
+        self.outbound_detail_resource_widget = QWidget()
+        self.outbound_detail_resource_layout = QVBoxLayout(
+            self.outbound_detail_resource_widget
+        )
+        self.outbound_detail_resource_layout.setContentsMargins(0, 0, 0, 0)
+        self.outbound_detail_resource_layout.setSpacing(8)
+        layout.addWidget(self.outbound_detail_resource_widget)
+        layout.addStretch(1)
+        scroll = QScrollArea()
+        scroll.setObjectName("pageScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(page)
+        return scroll
 
     def _build_about_page(self) -> QWidget:
         page, layout = self._standard_page("关于", "AgentMailBridge v1.0.0 产品与构建信息。")
@@ -1735,7 +2013,7 @@ class BridgeWindow(QMainWindow):
         stats.setSpacing(9)
         self.stat_cards = {
             "received": StatCard("statPurple", line_icon_pixmap("mail", 28, PURPLE), "收取邮件", PURPLE),
-            "saved": StatCard("statGreen", line_icon_pixmap("calendar", 28, SUCCESS), "保存文件", SUCCESS),
+            "saved": StatCard("statGreen", line_icon_pixmap("calendar", 28, SUCCESS), "保存内容", SUCCESS),
             "sent": StatCard("statBlue", line_icon_pixmap("send", 28, "#2394C8"), "发送邮件", "#2394C8"),
             "errors": StatCard("statRed", line_icon_pixmap("warning", 28, WARNING), "失败 / 错误", DANGER),
         }
@@ -1794,6 +2072,7 @@ class BridgeWindow(QMainWindow):
         description: str,
         *,
         header_action_label: str | None = None,
+        header_action_icon: str = "refresh",
     ) -> tuple[QWidget, QVBoxLayout]:
         page = QWidget()
         page.setObjectName("pageSurface")
@@ -1811,7 +2090,7 @@ class BridgeWindow(QMainWindow):
             page.header_action_button = self._button(
                 header_action_label,
                 outline=True,
-                icon_kind="refresh",
+                icon_kind=header_action_icon,
             )
             heading_row.addWidget(page.header_action_button)
         hint = QLabel(description)
@@ -1927,6 +2206,43 @@ class BridgeWindow(QMainWindow):
         table.verticalHeader().setDefaultSectionSize(48)
         table.setTextElideMode(Qt.TextElideMode.ElideNone)
         table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+    def _configure_inbox_table(self, table: DataTable) -> None:
+        table.setColumnCount(6)
+        table.setHorizontalHeaderLabels(
+            ["主题", "发件人", "内容", "收取时间", "状态", "操作"]
+        )
+        header = table.horizontalHeader()
+        header.setMinimumSectionSize(58)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        table.setColumnWidth(5, 92)
+        table.setWordWrap(True)
+        table.setTextElideMode(Qt.TextElideMode.ElideNone)
+        table.verticalHeader().setDefaultSectionSize(58)
+        table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+    @staticmethod
+    def _wrapped_row_height(
+        table: DataTable,
+        values: tuple[tuple[int, str], ...],
+        *,
+        minimum: int = 48,
+    ) -> int:
+        metrics = table.fontMetrics()
+        max_lines = 1
+        for column, text in values:
+            width = max(48, table.columnWidth(column) - 16)
+            lines = 0
+            for segment in str(text or "").splitlines() or [""]:
+                pixel_width = max(1, metrics.horizontalAdvance(segment))
+                lines += max(1, (pixel_width + width - 1) // width)
+            max_lines = max(max_lines, lines)
+        return max(minimum, min(260, max_lines * metrics.lineSpacing() + 18))
 
     def _configure_log_table(self, table: DataTable, *, full: bool = False) -> None:
         header = table.horizontalHeader()
@@ -2203,6 +2519,7 @@ class BridgeWindow(QMainWindow):
             self.show_message(f"无法选择该文件：{exc}", "error")
             return False
         self.send_selection = selection
+        self._append_send_selection(selection)
         self.selected_send_path = str(selection.path)
         self.send_path_edit.setText(str(selection.path))
         self.send_path_edit.setToolTip(str(selection.path))
@@ -2223,6 +2540,182 @@ class BridgeWindow(QMainWindow):
         self.send_status_label.setText("文件已锁定为本次选择；发送前还会检查是否被修改")
         self.show_message("文件已选择，请核对文件名、大小、路径和主题", "success")
         return True
+
+    def choose_send_attachments(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择邮件附件", str(Path.home()), "所有文件 (*.*)"
+        )
+        if not paths:
+            self.show_message("已取消添加附件", "normal")
+            return
+        added = 0
+        for raw_path in paths:
+            try:
+                selection = SendFileSelection.capture(Path(raw_path))
+            except (OSError, SecurityError) as exc:
+                self.show_message(f"无法添加附件：{exc}", "error")
+                continue
+            if self._append_send_selection(selection):
+                added += 1
+        self.show_message(f"已添加 {added} 个附件", "success" if added else "normal")
+
+    def _append_send_selection(self, selection: SendFileSelection) -> bool:
+        key = str(selection.path).casefold()
+        if any(str(item.path).casefold() == key for item in self.send_selections):
+            return False
+        self.send_selections.append(selection)
+        if self.send_selection is None:
+            self.send_selection = selection
+        self._populate_send_attachments()
+        self._update_send_action_state()
+        return True
+
+    def _populate_send_attachments(self) -> None:
+        if not hasattr(self, "send_attachment_table"):
+            return
+        self.send_attachment_table.setRowCount(0)
+        for index, selection in enumerate(self.send_selections):
+            self.send_attachment_table.insertRow(index)
+            name_item = QTableWidgetItem(selection.path.name)
+            name_item.setToolTip(str(selection.path))
+            name_item.setData(Qt.ItemDataRole.UserRole, str(selection.path))
+            self.send_attachment_table.setItem(index, 0, name_item)
+            self.send_attachment_table.setItem(
+                index, 1, QTableWidgetItem(format_size(selection.size))
+            )
+            remove = self._button(
+                "移除",
+                lambda checked=False, value=str(selection.path): self.remove_send_attachment(value),
+                text_only=True,
+            )
+            remove.setObjectName("compactButton")
+            self.send_attachment_table.setCellWidget(index, 2, remove)
+            self.send_attachment_table.setRowHeight(index, 42)
+        self.send_attachment_title.setText(f"附件 {len(self.send_selections)} 个")
+
+    def remove_send_attachment(self, raw_path: str) -> None:
+        key = str(Path(raw_path)).casefold()
+        self.send_selections = [
+            item for item in self.send_selections if str(item.path).casefold() != key
+        ]
+        if self.send_selection and str(self.send_selection.path).casefold() == key:
+            self.send_selection = self.send_selections[0] if self.send_selections else None
+        self._sync_compatibility_send_selection()
+        self._populate_send_attachments()
+        self._update_send_action_state()
+
+    def add_send_link(self) -> None:
+        raw = self.send_link_edit.text().strip()
+        parsed = QUrl(raw)
+        if not raw or parsed.scheme().lower() not in {"http", "https"} or not parsed.host():
+            self.show_message("链接必须是完整的 HTTP 或 HTTPS 地址", "error")
+            return
+        normalized = parsed.toString()
+        if any(item["url"].casefold() == normalized.casefold() for item in self.send_links):
+            self.show_message("该链接已在当前邮件中", "normal")
+            return
+        self.send_links.append({"url": normalized, "display_text": ""})
+        self.send_link_edit.clear()
+        self._populate_send_links()
+        self._update_send_action_state()
+
+    def _populate_send_links(self) -> None:
+        self.send_link_table.setRowCount(0)
+        for index, link in enumerate(self.send_links):
+            self.send_link_table.insertRow(index)
+            item = QTableWidgetItem(link["url"])
+            item.setToolTip(link["url"])
+            self.send_link_table.setItem(index, 0, item)
+            remove = self._button(
+                "移除",
+                lambda checked=False, value=link["url"]: self.remove_send_link(value),
+                text_only=True,
+            )
+            remove.setObjectName("compactButton")
+            self.send_link_table.setCellWidget(index, 1, remove)
+            self.send_link_table.setRowHeight(index, 42)
+        self.send_link_title.setText(f"相关链接 {len(self.send_links)} 个")
+
+    def remove_send_link(self, url: str) -> None:
+        self.send_links = [item for item in self.send_links if item["url"] != url]
+        self._populate_send_links()
+        self._update_send_action_state()
+
+    def _update_send_action_state(self, *_args) -> None:
+        if not hasattr(self, "send_action_button"):
+            return
+        has_content = bool(
+            self.subject_edit.text().strip()
+            or self.send_body_edit.toPlainText().strip()
+            or self.send_selections
+            or self.send_links
+        )
+        self.send_action_button.setEnabled(has_content and not self.task_active)
+
+    def send_composed_mail(self) -> None:
+        if self.task_active:
+            self.show_message("已有后台任务正在运行，请等待完成后再发送", "working")
+            return
+        subject = self.subject_edit.text().strip()
+        body = self.send_body_edit.toPlainText()
+        if not (subject or body.strip() or self.send_selections or self.send_links):
+            self.show_message("邮件主题、正文、附件和链接不能同时为空", "error")
+            return
+        changed = [item.path.name for item in self.send_selections if not item.is_unchanged()]
+        if changed:
+            self.show_message(
+                f"附件已被删除、移动或修改，请重新添加：{changed[0]}", "error"
+            )
+            return
+        total_size = sum(item.size for item in self.send_selections)
+        confirmation = QMessageBox.question(
+            self,
+            "确认发送邮件",
+            "请确认本次真实发送内容：\n\n"
+            f"主题：{subject or '自动生成'}\n"
+            f"正文：{'有' if body.strip() else '无'}\n"
+            f"附件：{len(self.send_selections)} 个，共 {format_size(total_size)}\n"
+            f"链接：{len(self.send_links)} 个\n"
+            f"固定收件人：{self.recipient_edit.text().strip() or '未配置'}\n\n"
+            "确认后才会连接 QQ SMTP。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            self.send_status_label.setText("已取消发送，当前邮件内容仍保留")
+            self.show_message("已取消发送，没有连接邮件服务器", "normal")
+            return
+        snapshots = list(self.send_selections)
+        links = [dict(item) for item in self.send_links]
+        self.send_status_label.setText("正在校验整封邮件并连接 QQ SMTP")
+        self.send_progress.show()
+        self._run_task(
+            "正在校验并发送这一封邮件，请勿重复点击",
+            lambda: self._send_composition_if_unchanged(subject, body, snapshots, links),
+            self._show_send_result,
+            button=self.send_action_button,
+            working_text="正在发送…",
+        )
+
+    def _send_composition_if_unchanged(
+        self,
+        subject: str,
+        body: str,
+        snapshots: list[SendFileSelection],
+        links: list[dict[str, str]],
+    ) -> ServiceResult:
+        if any(not item.is_unchanged() for item in snapshots):
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="file_changed",
+                message="确认后附件发生变化，已阻止发送",
+            )
+        return self.service.send_user_selected_mail(
+            subject=subject or None,
+            body_text=body,
+            attachment_paths=[item.path for item in snapshots],
+            links=links,
+        )
 
     def send_selected_file(self) -> None:
         if self.task_active:
@@ -2282,6 +2775,7 @@ class BridgeWindow(QMainWindow):
 
     def _clear_send_selection(self) -> None:
         self.send_selection = None
+        self.send_selections = []
         self.selected_send_path = ""
         self.send_path_edit.clear()
         self.send_path_edit.setToolTip("")
@@ -2293,10 +2787,56 @@ class BridgeWindow(QMainWindow):
             self.copy_send_path_button,
             self.reveal_send_file_button,
             self.preview_send_file_button,
-            self.send_action_button,
         ):
             button.setEnabled(False)
-        self.send_status_label.setText("请选择本次要发送的文件")
+        self._populate_send_attachments()
+        self._update_send_action_state()
+        self.send_status_label.setText("填写主题、正文，或添加附件、链接后即可发送")
+
+    def _sync_compatibility_send_selection(self) -> None:
+        selection = self.send_selection
+        if selection is None:
+            self.selected_send_path = ""
+            self.send_path_edit.clear()
+            self.send_path_edit.setToolTip("")
+            self.send_file_name_value.setText("未选择")
+            self.send_file_size_value.setText("—")
+            self.send_file_type_value.setText("—")
+            self.send_file_modified_value.setText("—")
+            for button in (
+                self.copy_send_path_button,
+                self.reveal_send_file_button,
+                self.preview_send_file_button,
+            ):
+                button.setEnabled(False)
+            return
+        self.selected_send_path = str(selection.path)
+        self.send_path_edit.setText(str(selection.path))
+        self.send_path_edit.setToolTip(str(selection.path))
+        self.send_file_name_value.setText(selection.path.name)
+        self.send_file_size_value.setText(format_size(selection.size))
+        self.send_file_type_value.setText(selection.path.suffix.lower() or "无扩展名")
+        self.send_file_modified_value.setText(
+            datetime.fromtimestamp(selection.modified_ns / 1_000_000_000).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        )
+        for button in (
+            self.copy_send_path_button,
+            self.reveal_send_file_button,
+            self.preview_send_file_button,
+        ):
+            button.setEnabled(True)
+
+    def _clear_send_composition(self) -> None:
+        self.send_links = []
+        if hasattr(self, "send_link_edit"):
+            self.send_link_edit.clear()
+        if hasattr(self, "send_body_edit"):
+            self.send_body_edit.clear()
+        self.subject_edit.clear()
+        self._populate_send_links()
+        self._clear_send_selection()
 
     def copy_selected_send_path(self) -> None:
         if self.send_selection is None:
@@ -2658,7 +3198,12 @@ class BridgeWindow(QMainWindow):
     def _collect_refresh_result(self) -> ServiceResult:
         try:
             status = self.service.get_config_and_connection_status().details
-            files = self.service.get_today_files().details.get("files", [])
+            today = datetime.now().strftime("%Y-%m-%d")
+            messages = self.service.list_mail_messages(
+                date_from=today,
+                date_to=f"{today}\uffff",
+                limit=500,
+            ).details.get("messages", [])
             logs = self.service.get_recent_logs(100).details.get("events", [])
             logs.sort(key=lambda row: str(row.get("created_at", "")), reverse=True)
             history = self.service.get_history(100).details
@@ -2668,6 +3213,9 @@ class BridgeWindow(QMainWindow):
                 raise RuntimeError(managed_result.message)
             maintenance = self.service.get_maintenance_status()
             auto_receive = self.service.get_auto_receive_state().details
+            workspaces = self.service.list_agent_workspaces().details.get(
+                "workspaces", []
+            )
         except Exception as exc:  # noqa: BLE001
             return ServiceResult(
                 OperationStatus.FAILED,
@@ -2678,13 +3226,14 @@ class BridgeWindow(QMainWindow):
             OperationStatus.SUCCESS,
             details={
                 "status": status,
-                "files": files,
+                "messages": messages,
                 "logs": logs,
                 "history": history,
                 "mcp": mcp,
                 "managed_files": managed_result.details.get("files", []),
                 "maintenance": maintenance.to_dict(),
                 "auto_receive": auto_receive,
+                "workspaces": workspaces,
             },
         )
 
@@ -2695,14 +3244,16 @@ class BridgeWindow(QMainWindow):
             self.show_message(self._friendly_result_message(result), "error")
             return
         status = result.details.get("status", {})
-        self.file_rows = result.details.get("files", [])
+        self.mail_rows = result.details.get("messages", [])
+        # 兼容旧界面测试和扩展读取名称；正式收件表的数据粒度已是邮件。
+        self.file_rows = self.mail_rows
         self.log_rows = result.details.get("logs", [])
         self.history_rows = result.details.get("history", {"received": [], "sent": []})
         self.mcp_rows = result.details.get("mcp", [])
         self.managed_file_rows = result.details.get("managed_files", [])
         self._update_auto_receive_status(result.details.get("auto_receive", {}))
         self._apply_config_to_controls(status)
-        self._populate_files(self.files_table, self.file_rows, actions=True)
+        self._populate_inbox_messages(self.mail_rows)
         self._populate_logs(self.logs_table, self.log_rows[:30])
         self._populate_sent_history()
         if hasattr(self, "history_table"):
@@ -2713,6 +3264,8 @@ class BridgeWindow(QMainWindow):
             self._populate_full_logs()
         if hasattr(self, "mcp_table"):
             self._populate_mcp_history()
+        if hasattr(self, "agent_workspace_table"):
+            self._populate_agent_workspaces(result.details.get("workspaces", []))
         maintenance = result.details.get("maintenance", {})
         maintenance_details = maintenance.get("details", {})
         if hasattr(self, "data_overview_values"):
@@ -2825,7 +3378,12 @@ class BridgeWindow(QMainWindow):
             self.dashboard_health_detail.setToolTip(health_detail)
 
         today = datetime.now().strftime("%Y-%m-%d")
-        sent_today = sum(1 for row in self.history_rows.get("sent", []) if str(row.get("sent_at", "")).startswith(today) and row.get("status") in {"sent", "success"})
+        sent_today = sum(
+            1
+            for row in self.history_rows.get("sent", [])
+            if str(row.get("sent_at") or row.get("created_at") or "").startswith(today)
+            and row.get("status") in {"sent", "success", "sent_archive_failed"}
+        )
         error_today = sum(
             1
             for row in self.log_rows
@@ -2839,15 +3397,84 @@ class BridgeWindow(QMainWindow):
                 )
             )
         )
-        received_message_ids = {
-            str(row.get("message_id")) for row in self.file_rows if row.get("message_id")
-        }
-        self.stat_cards["received"].set_count(len(received_message_ids))
-        self.stat_cards["saved"].set_count(sum(1 for row in self.file_rows if row.get("status") in {"saved", "ok", "normal"}))
+        self.stat_cards["received"].set_count(len(self.mail_rows))
+        self.stat_cards["saved"].set_count(
+            sum(int(row.get("counts", {}).get("resources") or 0) for row in self.mail_rows)
+        )
         self.stat_cards["sent"].set_count(sent_today)
         self.stat_cards["errors"].set_count(error_today)
 
+    def _populate_inbox_messages(self, rows: list[dict]) -> None:
+        table = self.inbox_table
+        self._configure_inbox_table(table)
+        table.setRowCount(0)
+        for index, row in enumerate(rows):
+            table.insertRow(index)
+            package_id = str(row.get("package_id") or "")
+            subject = str(row.get("subject") or "无主题邮件")
+            sender = str(row.get("from") or "发件人未知")
+            summary = " ".join(str(row.get("body_summary") or "").split())
+            counts = row.get("counts") or {}
+            if not summary:
+                summary = (
+                    f"附件 {int(counts.get('attachments') or 0)} 个 · "
+                    f"图片 {int(counts.get('inline_images') or 0)} 张 · "
+                    f"链接 {int(counts.get('links') or 0)} 个"
+                )
+            status = self._mail_archive_status_text(row)
+            values = [
+                subject,
+                sender,
+                summary[:260],
+                self._short_time(row.get("received_at") or row.get("saved_at")),
+                status,
+                "",
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setData(Qt.ItemDataRole.UserRole, package_id)
+                item.setData(Qt.ItemDataRole.UserRole + 1, row)
+                item.setToolTip(value)
+                table.setItem(index, column, item)
+            action = self._button(
+                "查看邮件",
+                lambda checked=False, value=package_id: self.show_mail_detail(value, "inbox"),
+                outline=True,
+            )
+            action.setObjectName("compactButton")
+            action.setFixedHeight(30)
+            table.setCellWidget(index, 5, action)
+            table.resizeRowToContents(index)
+            table.setRowHeight(
+                index,
+                max(
+                    table.rowHeight(index),
+                    self._wrapped_row_height(
+                        table, ((0, subject), (1, sender), (2, summary)), minimum=58
+                    ),
+                ),
+            )
+
+    @staticmethod
+    def _mail_archive_status_text(row: dict) -> str:
+        status = str(row.get("archive_status") or "").strip().lower()
+        if row.get("legacy"):
+            return "旧记录（内容有限）"
+        return {
+            "ready": "已归档",
+            "saved": "已归档",
+            "normal": "已归档",
+            "partial": "部分完成",
+            "failed": "处理失败",
+            "needs_attention": "需要处理",
+            "staging": "处理中",
+        }.get(status, "已归档" if status else "状态未知")
+
     def _populate_files(self, table: DataTable, rows: list[dict], *, actions: bool) -> None:
+        # 旧版单文件渲染入口仍保持原有四列契约；正式收件页不再调用它。
+        table.setColumnCount(4)
+        table.setHorizontalHeaderLabels(["文件名", "大小", "收取时间", "操作"])
+        self._configure_file_table(table)
         table.setRowCount(0)
         for row_index, row in enumerate(rows):
             table.insertRow(row_index)
@@ -2949,28 +3576,94 @@ class BridgeWindow(QMainWindow):
         for index, row in enumerate(rows):
             self.sent_table.insertRow(index)
             path = str(row.get("sent_copy_path") or row.get("send_copy_path") or "")
-            filename = str(row.get("original_filename") or Path(path).name or "—")
-            origin = "用户手动选择" if row.get("source_origin") == "manual_gui" else "受控目录"
+            subject = str(
+                row.get("subject")
+                or row.get("original_filename")
+                or Path(path).name
+                or "无主题邮件"
+            )
+            body = " ".join(str(row.get("body_text") or "").split())
+            if not body:
+                body = (
+                    f"附件 {int(row.get('attachment_count') or 0)} 个 · "
+                    f"链接 {int(row.get('link_count') or 0)} 个"
+                )
+            origin = {
+                "manual_gui": "手动发件",
+                "agent_mcp": "Agent 发送",
+                "legacy_sent_file": "旧发送记录",
+            }.get(str(row.get("source_origin") or ""), "受控发送")
+            outbound_id = str(row.get("outbound_id") or "")
             values = [
-                filename,
-                format_size(int(row.get("size_bytes") or 0)),
+                subject,
+                body[:180],
                 origin,
-                str(row.get("request_id") or "—"),
-                self._short_time(row.get("sent_at"), include_date=True),
-                str(row.get("status") or "—"),
+                self._short_time(
+                    row.get("sent_at") or row.get("created_at"), include_date=True
+                ),
+                localize_status(row.get("status")),
+                "",
             ]
             for column, value in enumerate(values):
-                self.sent_table.setItem(index, column, QTableWidgetItem(value))
+                item = QTableWidgetItem(value)
+                item.setData(Qt.ItemDataRole.UserRole, outbound_id)
+                item.setData(Qt.ItemDataRole.UserRole + 1, row)
+                item.setToolTip(value)
+                self.sent_table.setItem(index, column, item)
+            detail = self._button(
+                "查看详情",
+                lambda checked=False, value=outbound_id, data=dict(row): (
+                    self.show_outbound_detail(value, "send")
+                    if value else self._show_history_detail_data(data)
+                ),
+                outline=True,
+            )
+            detail.setObjectName("compactButton")
+            self.sent_table.setCellWidget(index, 5, detail)
+            self.sent_table.resizeRowToContents(index)
+            self.sent_table.setRowHeight(
+                index,
+                max(
+                    self.sent_table.rowHeight(index),
+                    self._wrapped_row_height(
+                        self.sent_table, ((0, subject), (1, body)), minimum=48
+                    ),
+                ),
+            )
 
     def _populate_history(self) -> None:
-        received = [("收件", row) for row in self.history_rows.get("received", [])]
-        sent = [("发件", row) for row in self.history_rows.get("sent", [])]
-        agent = [("Agent / MCP", row) for row in self.mcp_rows]
+        received = [
+            ("收到邮件" if row.get("package_id") else "收件", row)
+            for row in self.history_rows.get("received", [])
+        ]
+        sent = [
+            (
+                "Agent 发送"
+                if row.get("outbound_id") and row.get("source_origin") == "agent_mcp"
+                else "发送邮件" if row.get("outbound_id") else "发件",
+                row,
+            )
+            for row in self.history_rows.get("sent", [])
+        ]
+        outbound_request_ids = {
+            str(row.get("request_id") or "").casefold()
+            for row in self.history_rows.get("sent", [])
+            if row.get("request_id")
+        }
+        agent = [
+            ("Agent / MCP", row)
+            for row in self.mcp_rows
+            if not row.get("request_id")
+            or str(row.get("request_id")).casefold() not in outbound_request_ids
+        ]
         combined = received + sent + agent
         combined.sort(key=lambda pair: str(pair[1].get("created_at") or pair[1].get("sent_at") or pair[1].get("received_at") or ""), reverse=True)
         selected_type = self.history_type_filter.currentText()
         if selected_type != "全部类型":
-            combined = [pair for pair in combined if pair[0] == selected_type]
+            combined = [
+                pair for pair in combined
+                if self._history_type_matches_filter(pair[0], selected_type)
+            ]
         selected_status = self.history_status_filter.currentText()
         if selected_status != "全部状态":
             known_statuses = {
@@ -2980,9 +3673,9 @@ class BridgeWindow(QMainWindow):
             combined = [
                 pair for pair in combined
                 if (
-                    localize_status(pair[1].get("status")) == selected_status
+                    self._history_status_display(pair[0], pair[1]) == selected_status
                     or selected_status == "其他"
-                    and localize_status(pair[1].get("status")) not in known_statuses
+                    and self._history_status_display(pair[0], pair[1]) not in known_statuses
                 )
             ]
         selected_time = self.history_time_filter.currentText()
@@ -3000,6 +3693,8 @@ class BridgeWindow(QMainWindow):
                 if keyword in self._history_summary(pair[0], pair[1]).lower()
                 or keyword in str(pair[1].get("file_path") or "").lower()
                 or keyword in str(pair[1].get("request_id") or "").lower()
+                or keyword in str(pair[1].get("from") or "").lower()
+                or keyword in str(pair[1].get("body_summary") or pair[1].get("body_text") or "").lower()
             ]
         self.history_table.setRowCount(0)
         for index, (direction, row) in enumerate(combined):
@@ -3013,13 +3708,13 @@ class BridgeWindow(QMainWindow):
                 "_summary": summary,
                 "_path": path,
                 "_time": str(time_value or ""),
-                "_status_display": localize_status(row.get("status")),
+                "_status_display": self._history_status_display(direction, row),
             })
             values = [
                 direction,
                 summary,
                 self._short_time(time_value, include_date=True),
-                localize_status(row.get("status")),
+                self._history_status_display(direction, row),
                 "",
             ]
             for column, value in enumerate(values):
@@ -3027,15 +3722,14 @@ class BridgeWindow(QMainWindow):
                 item.setData(Qt.ItemDataRole.UserRole, path)
                 item.setData(Qt.ItemDataRole.UserRole + 1, detail)
                 self.history_table.setItem(index, column, item)
-            self.history_table.setRowHeight(index, 60 if len(summary) > 38 else 48)
             action_widget = QWidget()
             action_layout = QHBoxLayout(action_widget)
             action_layout.setContentsMargins(3, 0, 3, 0)
             action_layout.setSpacing(4)
             action_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
             detail_button = self._button(
-                "查看详情",
-                lambda checked=False, value=detail: self._show_history_detail_data(value),
+                "查看邮件" if row.get("package_id") else "查看详情",
+                lambda checked=False, value=detail: self._open_history_detail(value),
             )
             file_button = self._button(
                 "关联文件",
@@ -3047,6 +3741,39 @@ class BridgeWindow(QMainWindow):
                 action_layout.addWidget(button)
             file_button.setEnabled(bool(path))
             self.history_table.setCellWidget(index, 4, action_widget)
+            self.history_table.resizeRowToContents(index)
+            self.history_table.setRowHeight(
+                index,
+                max(
+                    self.history_table.rowHeight(index),
+                    self._wrapped_row_height(
+                        self.history_table, ((1, summary),), minimum=48
+                    ),
+                ),
+            )
+
+    @staticmethod
+    def _history_type_matches_filter(direction: str, selected: str) -> bool:
+        if selected == "收件":
+            return direction in {"收件", "收到邮件"}
+        if selected == "发件":
+            return direction in {"发件", "发送邮件"}
+        if selected == "Agent / MCP":
+            return direction in {"Agent / MCP", "Agent 发送"}
+        return direction == selected
+
+    def _history_status_display(self, direction: str, row: dict) -> str:
+        if direction in {"收件", "收到邮件"} and row.get("package_id"):
+            return self._mail_archive_status_text(row)
+        return localize_status(row.get("status"))
+
+    def _open_history_detail(self, details: dict) -> None:
+        if details.get("package_id"):
+            self.show_mail_detail(str(details["package_id"]), "history")
+        elif details.get("outbound_id"):
+            self.show_outbound_detail(str(details["outbound_id"]), "history")
+        else:
+            self._show_history_detail_data(details)
 
     @staticmethod
     def _history_summary(direction: str, row: dict) -> str:
@@ -3058,14 +3785,14 @@ class BridgeWindow(QMainWindow):
             or row.get("source_path")
             or ""
         )
-        if direction == "收件":
+        if direction in {"收件", "收到邮件"}:
             return str(row.get("subject") or "无主题邮件")
-        if direction == "发件":
+        if direction in {"发件", "发送邮件", "Agent 发送"}:
             return str(
-                row.get("original_filename")
-                or row.get("subject")
+                row.get("subject")
+                or row.get("original_filename")
                 or Path(path).name
-                or "发件记录"
+                or "发送邮件"
             )
         return str(
             row.get("title")
@@ -3097,15 +3824,15 @@ class BridgeWindow(QMainWindow):
     def _filter_inbox(self, text: str) -> None:
         keyword = text.strip().lower()
         if not keyword:
-            rows = self.file_rows
+            rows = self.mail_rows
         else:
             rows = [
-                row for row in self.file_rows
-                if keyword in str(row.get("saved_filename", "")).lower()
-                or keyword in str(row.get("saved_path", "")).lower()
+                row for row in self.mail_rows
+                if keyword in str(row.get("from", "")).lower()
                 or keyword in str(row.get("subject", "")).lower()
+                or keyword in str(row.get("body_summary", "")).lower()
             ]
-        self._populate_files(self.inbox_table, rows, actions=True)
+        self._populate_inbox_messages(rows)
 
     @staticmethod
     def _matches_time_filter(value, selected: str) -> bool:
@@ -3140,46 +3867,97 @@ class BridgeWindow(QMainWindow):
             )
             and self._matches_time_filter(row.get("time"), selected_time)
         ]
+        show_mail_owner = any("mail_subject" in row for row in rows)
+        headers = (
+            ["类型", "来源", "所属邮件", "文件名", "大小", "时间", "状态", "操作"]
+            if show_mail_owner
+            else ["类型", "来源", "文件名", "大小", "时间", "状态", "操作"]
+        )
+        self.managed_files_table.setColumnCount(len(headers))
+        self.managed_files_table.setHorizontalHeaderLabels(headers)
+        header = self.managed_files_table.horizontalHeader()
+        if show_mail_owner:
+            for column in (0, 1, 4, 5, 6, 7):
+                header.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
+            header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+            for column, width in ((0, 82), (1, 82), (4, 82), (5, 132), (6, 82), (7, 184)):
+                self.managed_files_table.setColumnWidth(column, width)
+            action_column = 7
+        else:
+            for column in (0, 1, 3, 4, 5, 6):
+                header.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
+            header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+            for column, width in ((0, 82), (1, 82), (3, 92), (4, 136), (5, 82), (6, 166)):
+                self.managed_files_table.setColumnWidth(column, width)
+            action_column = 6
         self.managed_files_table.setRowCount(0)
         for index, row in enumerate(rows):
             self.managed_files_table.insertRow(index)
             path = str(row.get("path") or "")
-            values = [
-                str(row.get("category")),
-                str(row.get("source")),
+            values = [str(row.get("display_type") or row.get("category")), str(row.get("source"))]
+            if show_mail_owner:
+                values.append(str(row.get("mail_subject") or row.get("subject") or "—"))
+            values.extend([
                 str(row.get("display_name")),
                 self._managed_size_text(row),
                 self._short_time(row.get("time"), include_date=True),
                 str(row.get("status_display") or localize_status(row.get("status"))),
                 "",
-            ]
+            ])
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setData(Qt.ItemDataRole.UserRole, path)
                 item.setData(Qt.ItemDataRole.UserRole + 1, row)
-                item.setToolTip(str(row.get("display_name")) if column == 2 else value)
+                item.setToolTip(value)
                 self.managed_files_table.setItem(index, column, item)
-            self.managed_files_table.setRowHeight(
-                index, 60 if len(str(row.get("display_name") or "")) > 34 else 48
-            )
             action_widget = QWidget()
             action_layout = QHBoxLayout(action_widget)
             action_layout.setContentsMargins(3, 0, 3, 0)
             action_layout.setSpacing(3)
             action_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            buttons = (
+            buttons = [
                 self._button("预览", lambda checked=False, value=path: self._preview_path(value)),
                 self._button("打开", lambda checked=False, value=path: self._open_managed_file(value)),
-                self._button("复制", lambda checked=False, value=path: self._copy_managed_path(value)),
-            )
+            ]
+            if show_mail_owner:
+                buttons.append(
+                    self._button(
+                        "邮件",
+                        lambda checked=False, value=str(row.get("package_id") or ""), data=dict(row): (
+                            self.show_mail_detail(value, "files_data")
+                            if value else self._show_managed_file_detail_data(data)
+                        ),
+                    )
+                )
+            else:
+                buttons.append(
+                    self._button("复制", lambda checked=False, value=path: self._copy_managed_path(value))
+                )
             for button in buttons:
                 button.setObjectName("compactButton")
                 button.setFixedHeight(28)
                 action_layout.addWidget(button)
             for button in buttons[:2]:
                 button.setEnabled(bool(path and row.get("exists")))
-            buttons[2].setEnabled(bool(path))
-            self.managed_files_table.setCellWidget(index, 6, action_widget)
+            buttons[2].setEnabled(bool(row.get("package_id")) if show_mail_owner else bool(path))
+            self.managed_files_table.setCellWidget(index, action_column, action_widget)
+            self.managed_files_table.resizeRowToContents(index)
+            self.managed_files_table.setRowHeight(
+                index,
+                max(
+                    self.managed_files_table.rowHeight(index),
+                    self._wrapped_row_height(
+                        self.managed_files_table,
+                        (
+                            ((2, str(row.get("mail_subject") or "")), (3, str(row.get("display_name") or "")))
+                            if show_mail_owner
+                            else ((2, str(row.get("display_name") or "")),)
+                        ),
+                        minimum=48,
+                    ),
+                ),
+            )
 
     @staticmethod
     def _managed_size_text(row: dict) -> str:
@@ -3204,10 +3982,19 @@ class BridgeWindow(QMainWindow):
         value = item.data(Qt.ItemDataRole.UserRole + 1) if item else {}
         return value if isinstance(value, dict) else {}
 
-    def _preview_managed_file(self, row: int, _column: int) -> None:
+    def _preview_managed_file(self, row: int, column: int) -> None:
         item = self.managed_files_table.item(row, 0)
         if item:
-            self._preview_path(str(item.data(Qt.ItemDataRole.UserRole) or ""))
+            details = item.data(Qt.ItemDataRole.UserRole + 1)
+            if (
+                self.managed_files_table.columnCount() == 8
+                and column == 2
+                and isinstance(details, dict)
+                and details.get("package_id")
+            ):
+                self.show_mail_detail(str(details["package_id"]), "files_data")
+            else:
+                self._preview_path(str(item.data(Qt.ItemDataRole.UserRole) or ""))
 
     def preview_selected_managed_file(self) -> None:
         path = self._selected_path(self.managed_files_table)
@@ -3290,7 +4077,7 @@ class BridgeWindow(QMainWindow):
         details = item.data(Qt.ItemDataRole.UserRole + 1) if item else {}
         if not isinstance(details, dict):
             details = {}
-        self._show_history_detail_data(details)
+        self._open_history_detail(details)
 
     def _show_history_detail_data(self, details: dict) -> None:
         path = str(details.get("_path") or "")
@@ -3308,6 +4095,427 @@ class BridgeWindow(QMainWindow):
             ("backend", details.get("backend") or "—"),
         )
         self._show_structured_detail("历史记录详情", fields)
+
+    def _show_secondary_page(self, page: QWidget, *, return_page: str) -> None:
+        self._detail_return_page = return_page if return_page in self.pages else "inbox"
+        self.page_stack.setCurrentWidget(page)
+        if hasattr(self, "right_panel"):
+            self.right_panel.setVisible(False)
+        tab_target = "send" if return_page in {"send", "agent"} else "inbox"
+        self._set_exclusive_checked(self.tab_buttons, tab_target)
+        nav_target = return_page if return_page in self.nav_buttons else ""
+        self._set_exclusive_checked(self.nav_buttons, nav_target)
+
+    @staticmethod
+    def _clear_dynamic_layout(layout: QVBoxLayout) -> None:
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+            child_layout = item.layout()
+            if child_layout is not None:
+                BridgeWindow._clear_dynamic_layout(child_layout)
+
+    def _open_inbox_mail(self, row: int, _column: int) -> None:
+        item = self.inbox_table.item(row, 0)
+        package_id = str(item.data(Qt.ItemDataRole.UserRole) or "") if item else ""
+        if package_id:
+            self.show_mail_detail(package_id, "inbox")
+
+    def show_mail_detail(self, package_id: str, return_page: str = "inbox") -> None:
+        result = self.service.get_mail_message(package_id)
+        if not result.ok:
+            self._show_service_result(result)
+            return
+        details = result.details.get("message", {})
+        self._current_mail_details = details
+        self._mail_detail_return_widget = (
+            self.mail_thread_page if return_page == "thread" else None
+        )
+        subject = str(details.get("subject") or "无主题邮件")
+        sender = str(details.get("from") or "发件人未知")
+        recipients = "；".join(details.get("to") or []) or "未记录"
+        received_at = self._short_time(
+            details.get("received_at") or details.get("saved_at"), include_date=True
+        )
+        backend = {
+            "gmail_api": "Gmail API",
+            "imap": "Gmail IMAP",
+        }.get(str(details.get("backend") or ""), "Gmail")
+        self.mail_detail_subject.setText(subject)
+        self.mail_detail_meta.setText(
+            f"发件人：{sender}\n收件人：{recipients}\n收取时间：{received_at} · {backend}"
+        )
+        counts = details.get("counts") or {}
+        self.mail_detail_counts.setText(
+            f"附件 {int(counts.get('attachments') or 0)} 个 · "
+            f"图片 {int(counts.get('inline_images') or 0)} 张 · "
+            f"链接 {int(counts.get('links') or 0)} 个 · "
+            f"下载文件 {int(counts.get('downloads') or 0)} 个"
+        )
+        self.mail_detail_body.setPlainText(self._mail_body_text(details))
+        self.mail_detail_thread_button.setEnabled(bool(details.get("thread_ref")))
+        self.mail_detail_archive_button.setEnabled(bool(details.get("package_root")))
+        self._populate_mail_detail_resources(details.get("resources") or [])
+        self._show_secondary_page(
+            self.mail_detail_page,
+            return_page=(self._detail_return_page if return_page == "thread" else return_page),
+        )
+
+    def _mail_body_text(self, details: dict) -> str:
+        body = details.get("body") or {}
+        for key in ("plain_absolute_path", "readable_absolute_path"):
+            raw_path = str(body.get(key) or "")
+            if not raw_path:
+                continue
+            path = Path(raw_path)
+            try:
+                assert_within_allowed_roots(path, [self.service.cfg.data_root_path])
+                if path.is_file():
+                    return path.read_bytes()[: PREVIEW_MAX_BYTES * 4].decode(
+                        "utf-8", errors="replace"
+                    )
+            except (OSError, SecurityError):
+                continue
+        summary = str(details.get("body_summary") or "").strip()
+        if summary:
+            return summary
+        return "此邮件没有可显示的纯文本正文。"
+
+    def _populate_mail_detail_resources(self, resources: list[dict]) -> None:
+        self._clear_dynamic_layout(self.mail_detail_resource_layout)
+        visible = [
+            resource
+            for resource in resources
+            if not str(resource.get("internal_type") or "").startswith("body_")
+        ]
+        if not visible:
+            empty = QLabel("此邮件没有图片、附件或链接。")
+            empty.setObjectName("hint")
+            self.mail_detail_resource_layout.addWidget(empty)
+            return
+        for resource in visible:
+            self.mail_detail_resource_layout.addWidget(
+                self._mail_resource_card(resource)
+            )
+
+    def _mail_resource_card(self, resource: dict) -> QWidget:
+        card = QFrame()
+        card.setObjectName("card")
+        layout = QHBoxLayout(card)
+        layout.setContentsMargins(14, 10, 14, 10)
+        internal_type = str(resource.get("internal_type") or "")
+        path = str(resource.get("absolute_path") or "")
+        url = str(resource.get("url") or "")
+        if internal_type == "inline_image" and path:
+            preview = QLabel()
+            pixmap = QPixmap(path)
+            if not pixmap.isNull():
+                preview.setPixmap(
+                    pixmap.scaled(
+                        132,
+                        86,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                )
+                preview.setFixedSize(142, 94)
+                preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                layout.addWidget(preview)
+        text = QVBoxLayout()
+        title = QLabel(
+            str(resource.get("display_name") or resource.get("kind_display") or "邮件内容")
+        )
+        title.setObjectName("minorTitle")
+        title.setWordWrap(True)
+        detail = QLabel(
+            f"{resource.get('kind_display') or '邮件内容'} · "
+            f"{resource.get('status_display') or '已识别'}"
+        )
+        detail.setObjectName("hint")
+        detail.setWordWrap(True)
+        text.addWidget(title)
+        text.addWidget(detail)
+        if resource.get("error"):
+            error = QLabel(str(resource["error"]))
+            error.setObjectName("errorText")
+            error.setWordWrap(True)
+            text.addWidget(error)
+        layout.addLayout(text, 1)
+        if path:
+            layout.addWidget(
+                self._button(
+                    "安全预览",
+                    lambda checked=False, value=path: self._preview_path(value),
+                    outline=True,
+                )
+            )
+            layout.addWidget(
+                self._button(
+                    "打开",
+                    lambda checked=False, value=path: self._open_received_file(value),
+                )
+            )
+        elif url:
+            layout.addWidget(
+                self._button(
+                    "打开链接",
+                    lambda checked=False, value=url: self._open_external_link(value),
+                    outline=True,
+                )
+            )
+        return card
+
+    def _open_external_link(self, url: str) -> None:
+        parsed = QUrl(url)
+        if parsed.scheme().lower() != "https" or not parsed.host():
+            self.show_message("仅允许显式打开有效的 HTTPS 链接", "error")
+            return
+        if not QDesktopServices.openUrl(parsed):
+            self.show_message("无法使用默认浏览器打开链接", "error")
+
+    def open_current_mail_archive(self) -> None:
+        details = getattr(self, "_current_mail_details", {})
+        raw_path = str(details.get("package_root") or "")
+        if not raw_path:
+            self.show_message("当前邮件没有可打开的归档目录", "normal")
+            return
+        path = Path(raw_path)
+        try:
+            assert_within_allowed_roots(path, [self.service.cfg.data_root_path])
+            if not path.is_dir():
+                raise OSError("归档目录已不存在")
+            os.startfile(str(path))
+        except (OSError, SecurityError) as exc:
+            self.show_message(f"打开邮件归档失败：{exc}", "error")
+
+    def _return_from_mail_detail(self) -> None:
+        if self._mail_detail_return_widget is self.mail_thread_page:
+            self.page_stack.setCurrentWidget(self.mail_thread_page)
+            self._mail_detail_return_widget = None
+            return
+        self.select_page(self._detail_return_page)
+
+    def open_current_mail_thread(self) -> None:
+        details = getattr(self, "_current_mail_details", {})
+        thread_ref = str(details.get("thread_ref") or "")
+        if not thread_ref:
+            self.show_message("当前邮件没有可用的会话信息", "normal")
+            return
+        result = self.service.get_mail_thread(
+            thread_ref,
+            account_ref=str(details.get("account_ref") or "") or None,
+        )
+        if not result.ok:
+            self._show_service_result(result)
+            return
+        thread = result.details.get("thread", {})
+        messages = thread.get("messages") or []
+        self._current_thread = thread
+        self.mail_thread_summary.setText(f"本会话共 {len(messages)} 封邮件")
+        self._clear_dynamic_layout(self.mail_thread_cards_layout)
+        for index, message in enumerate(messages, 1):
+            card = QFrame()
+            card.setObjectName("card")
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(16, 12, 16, 12)
+            header = QHBoxLayout()
+            title = QLabel(f"{index}. {message.get('subject') or '无主题邮件'}")
+            title.setObjectName("minorTitle")
+            title.setWordWrap(True)
+            header.addWidget(title, 1)
+            header.addWidget(
+                self._button(
+                    "查看此邮件",
+                    lambda checked=False, value=str(message.get("package_id") or ""): self.show_mail_detail(value, "thread"),
+                    outline=True,
+                )
+            )
+            card_layout.addLayout(header)
+            meta = QLabel(
+                f"{message.get('from') or '发件人未知'} · "
+                f"{self._short_time(message.get('received_at') or message.get('saved_at'), include_date=True)}"
+            )
+            meta.setObjectName("hint")
+            card_layout.addWidget(meta)
+            summary = QLabel(" ".join(str(message.get("body_summary") or "无正文").split())[:500])
+            summary.setWordWrap(True)
+            card_layout.addWidget(summary)
+            self.mail_thread_cards_layout.addWidget(card)
+        self._show_secondary_page(self.mail_thread_page, return_page=self._detail_return_page)
+
+    def _return_from_mail_thread(self) -> None:
+        self.page_stack.setCurrentWidget(self.mail_detail_page)
+
+    def show_outbound_detail(self, outbound_id: str, return_page: str = "send") -> None:
+        result = self.service.get_outbound_message(outbound_id)
+        if not result.ok:
+            self._show_service_result(result)
+            return
+        details = result.details.get("message", {})
+        self._current_outbound_details = details
+        subject = str(details.get("subject") or "无主题邮件")
+        source = {
+            "manual_gui": "手动发件",
+            "agent_mcp": "Agent 发送",
+            "legacy_sent_file": "旧发送记录",
+        }.get(str(details.get("source_origin") or ""), "受控发送")
+        recipients = "；".join(details.get("to") or []) or "固定收件人"
+        status = localize_status(details.get("status"))
+        sent_at = self._short_time(
+            details.get("sent_at") or details.get("created_at"), include_date=True
+        )
+        limited = " · 旧记录内容有限" if details.get("legacy_limited") else ""
+        self.outbound_detail_subject.setText(subject)
+        self.outbound_detail_meta.setText(
+            f"来源：{source} · 收件人：{recipients}\n发送时间：{sent_at} · 状态：{status}{limited}"
+        )
+        body = str(details.get("body_text") or "")
+        self.outbound_detail_body.setPlainText(
+            body if body else "此发送记录没有可显示的正文。"
+        )
+        self._clear_dynamic_layout(self.outbound_detail_resource_layout)
+        resources = details.get("resources") or []
+        links = details.get("links") or []
+        if not resources and not links:
+            empty = QLabel("此发送记录没有附件或链接。")
+            empty.setObjectName("hint")
+            self.outbound_detail_resource_layout.addWidget(empty)
+        for resource in resources:
+            self.outbound_detail_resource_layout.addWidget(
+                self._outbound_resource_card(resource)
+            )
+        for link in links:
+            card = QFrame()
+            card.setObjectName("card")
+            row = QHBoxLayout(card)
+            label = QLabel(str(link.get("display_text") or link.get("url") or "链接"))
+            label.setWordWrap(True)
+            row.addWidget(label, 1)
+            row.addWidget(
+                self._button(
+                    "打开链接",
+                    lambda checked=False, value=str(link.get("url") or ""): self._open_external_link(value),
+                    outline=True,
+                )
+            )
+            self.outbound_detail_resource_layout.addWidget(card)
+        self._show_secondary_page(self.outbound_detail_page, return_page=return_page)
+
+    def _outbound_resource_card(self, resource: dict) -> QWidget:
+        card = QFrame()
+        card.setObjectName("card")
+        layout = QHBoxLayout(card)
+        layout.setContentsMargins(14, 10, 14, 10)
+        path = str(
+            resource.get("sent_archive_path")
+            or resource.get("staged_path")
+            or resource.get("source_path")
+            or ""
+        )
+        title = QLabel(str(resource.get("display_name") or "附件"))
+        title.setObjectName("minorTitle")
+        title.setWordWrap(True)
+        layout.addWidget(title, 1)
+        size = resource.get("size_bytes")
+        layout.addWidget(QLabel(format_size(size) if size is not None else "—"))
+        if path:
+            layout.addWidget(
+                self._button(
+                    "安全预览",
+                    lambda checked=False, value=path: self._preview_path(value),
+                    outline=True,
+                )
+            )
+            layout.addWidget(
+                self._button(
+                    "打开",
+                    lambda checked=False, value=path: self._open_managed_file(value),
+                )
+            )
+        return card
+
+    def _return_from_outbound_detail(self) -> None:
+        self.select_page(self._detail_return_page)
+
+    def _update_agent_delivery_instruction(self, *_args) -> None:
+        if not hasattr(self, "agent_delivery_instruction"):
+            return
+        title = " ".join(self.agent_delivery_title_edit.text().split())
+        subject_instruction = (
+            f"邮件主题使用：{title}。"
+            if title
+            else "邮件主题由你根据最终交付内容生成简洁、准确的标题。"
+        )
+        self.agent_delivery_instruction.setPlainText(
+            "请使用已配置的 agent-mail-bridge MCP，将本轮任务的最终交付文件发送给我。\n\n"
+            "你需要根据当前任务上下文自行识别最终交付文件，不要要求我再次提供文件路径。\n"
+            f"{subject_instruction}\n\n"
+            "要求：\n"
+            "1. 使用 agent-mail-bridge 的 submit_result。\n"
+            "2. 不修改、重写或重新编码最终文件，也不为发送重新生成内容相同的副本。\n"
+            "3. 使用稳定 request_id；同一次交付重试复用同一 request_id。\n"
+            "4. 直接提交最终文件原路径，不自行使用 PowerShell、Copy-Item、cp 或临时脚本把文件复制到 AgentMailBridge Data 目录。\n"
+            "5. 如果返回 path_not_allowed，停止发送并说明需要授权哪个工作区，不擅自扩大路径权限。\n"
+            "6. 如果 MCP transport closed，不循环重复提交，明确报告连接状态。\n"
+            "7. 成功后报告 filename、size_bytes、send_status、SHA-256 和 request_id。\n"
+            "8. duplicate 表示该 request_id 已交付，不得再次重复发送。"
+        )
+
+    def copy_agent_delivery_instruction(self) -> None:
+        QApplication.clipboard().setText(self.agent_delivery_instruction.toPlainText())
+        self.show_message("交付指令已复制", "success")
+
+    def _populate_agent_workspaces(self, workspaces: list[str] | None = None) -> None:
+        values = workspaces
+        if values is None:
+            values = self.service.list_agent_workspaces().details.get("workspaces", [])
+        self.agent_workspace_table.setRowCount(0)
+        for index, raw_path in enumerate(values):
+            self.agent_workspace_table.insertRow(index)
+            item = QTableWidgetItem(str(raw_path))
+            item.setToolTip(str(raw_path))
+            item.setData(Qt.ItemDataRole.UserRole, str(raw_path))
+            self.agent_workspace_table.setItem(index, 0, item)
+            remove = self._button(
+                "移除",
+                lambda checked=False, value=str(raw_path): self.remove_agent_workspace(value),
+                text_only=True,
+            )
+            remove.setObjectName("compactButton")
+            self.agent_workspace_table.setCellWidget(index, 1, remove)
+            self.agent_workspace_table.setRowHeight(index, 46)
+        self.mcp_roots_label.setText(
+            "；".join(str(path) for path in self.service.cfg.effective_allowed_send_roots)
+        )
+
+    def add_agent_workspace_from_dialog(self) -> None:
+        path = QFileDialog.getExistingDirectory(
+            self, "选择要授权给 Agent 的项目工作区", str(Path.home())
+        )
+        if not path:
+            self.show_message("已取消添加工作区", "normal")
+            return
+        result = self.service.add_agent_workspace(path)
+        self._show_service_result(result)
+        if result.ok:
+            self._populate_agent_workspaces()
+
+    def remove_agent_workspace(self, raw_path: str) -> None:
+        confirmation = QMessageBox.question(
+            self,
+            "移除 Agent 工作区授权",
+            f"移除后，下一次 MCP 会话将不能交付该目录中的文件。\n\n{raw_path}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            return
+        result = self.service.remove_agent_workspace(raw_path)
+        self._show_service_result(result)
+        if result.ok:
+            self._populate_agent_workspaces()
 
     def _show_structured_detail(
         self, title: str, fields: tuple[tuple[str, object], ...]
@@ -3529,8 +4737,7 @@ class BridgeWindow(QMainWindow):
         if isinstance(result, SendResult) and result.send_status in {
             "sent", "sent_archive_failed", "duplicate"
         }:
-            self._clear_send_selection()
-            self.subject_edit.clear()
+            self._clear_send_composition()
             self.send_status_label.setText(message + "；已清空本次选择")
 
     def _show_service_result(self, result: ServiceResult) -> None:
@@ -3846,8 +5053,16 @@ class BridgeWindow(QMainWindow):
         self.auto_state_values["retries"].setText(retries)
 
     def open_today_folder(self) -> None:
-        today_folder = self.service.cfg.received_dir / datetime.now().strftime("%Y-%m-%d")
-        target = today_folder if today_folder.exists() else self.service.cfg.received_dir
+        now = datetime.now()
+        today_folder = (
+            self.service.cfg.received_dir
+            / "mail"
+            / f"{now.year:04d}"
+            / f"{now.month:02d}"
+            / f"{now.day:02d}"
+        )
+        mail_root = self.service.cfg.received_dir / "mail"
+        target = today_folder if today_folder.exists() else mail_root if mail_root.exists() else self.service.cfg.received_dir
         try:
             assert_within_allowed_roots(target, [self.service.cfg.data_root_path])
             os.startfile(str(target))
@@ -3855,11 +5070,13 @@ class BridgeWindow(QMainWindow):
             self.show_message(f"打开目录失败：{exc}", "error")
 
     def select_latest_file(self) -> None:
-        if not self.file_rows:
-            self.show_message("今日暂未收到文件")
+        if not self.mail_rows:
+            self.show_message("今日暂未收到邮件")
             return
         self.files_table.selectRow(0)
-        self._preview_path(str(self.file_rows[0].get("saved_path", "")))
+        package_id = str(self.mail_rows[0].get("package_id") or "")
+        if package_id:
+            self.show_mail_detail(package_id, "inbox")
 
     def _preview_table_file(self, row: int, column: int) -> None:
         del column

@@ -175,7 +175,9 @@ def atomic_copy_file(src: Path | str, dst: Path | str) -> Path:
     source = Path(src)
     target = Path(dst)
     target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    # 临时名与用户文件名解耦，避免长 Unicode 文件名叠加 UUID 后触发
+    # 未启用 Win32 长路径策略的 MAX_PATH 限制。
+    temporary = target.parent / f".amb-{uuid.uuid4().hex}.tmp"
     try:
         shutil.copy2(source, temporary)
         os.replace(temporary, target)

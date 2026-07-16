@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from agent_mail_bridge.database import get_connection, get_mail_package, query_mail_resources
 from agent_mail_bridge.mail_common import parse_mailboxes
+from agent_mail_bridge.mail_links import classify_mail_link
 
 
 def list_mail_messages(
@@ -59,13 +61,19 @@ def get_mail_message(db_path, package_id: str) -> dict[str, Any] | None:
         return None
     dto = _package_dto(package)
     dto["resources"] = [
-        _resource_dto(resource) for resource in query_mail_resources(db_path, package_id)
+        _resource_dto(resource, package_root=dto["package_root"])
+        for resource in query_mail_resources(db_path, package_id)
     ]
     return dto
 
 
 def list_mail_resources(db_path, package_id: str) -> list[dict[str, Any]]:
-    return [_resource_dto(row) for row in query_mail_resources(db_path, package_id)]
+    package = get_mail_package(db_path, package_id)
+    root = str((package or {}).get("package_root") or "")
+    return [
+        _resource_dto(row, package_root=root)
+        for row in query_mail_resources(db_path, package_id)
+    ]
 
 
 def list_mail_threads(
@@ -125,6 +133,8 @@ def search_mail_facts(
     *,
     account_ref: str | None = None,
     mailbox_ref: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
     limit: int = 100,
     offset: int = 0,
 ) -> list[dict[str, Any]]:
@@ -147,6 +157,12 @@ def search_mail_facts(
     if mailbox_ref:
         where.append("p.mailbox_ref = ?")
         params.append(mailbox_ref)
+    if date_from:
+        where.append("p.received_at >= ?")
+        params.append(date_from)
+    if date_to:
+        where.append("p.received_at <= ?")
+        params.append(date_to)
     connection = get_connection(db_path)
     rows = connection.execute(
         f"SELECT p.* FROM mail_packages p WHERE {' AND '.join(where)} "
@@ -158,6 +174,7 @@ def search_mail_facts(
 
 def _package_dto(row: dict[str, Any]) -> dict[str, Any]:
     body = str(row.get("search_text") or "")
+    package_root = str(row.get("package_root") or "")
     return {
         "package_id": str(row.get("package_id") or ""),
         "account_ref": str(row.get("account_ref") or ""),
@@ -179,6 +196,9 @@ def _package_dto(row: dict[str, Any]) -> dict[str, Any]:
             "plain_path": row.get("body_plain_path"),
             "html_path": row.get("body_html_path"),
             "readable_path": row.get("body_readable_path"),
+            "plain_absolute_path": _absolute_package_path(package_root, row.get("body_plain_path")),
+            "html_absolute_path": _absolute_package_path(package_root, row.get("body_html_path")),
+            "readable_absolute_path": _absolute_package_path(package_root, row.get("body_readable_path")),
             "text_sha256": row.get("body_text_sha256"),
         },
         "counts": {
@@ -196,28 +216,44 @@ def _package_dto(row: dict[str, Any]) -> dict[str, Any]:
         "archive_status": str(row.get("archive_status") or ""),
         "parse_status": str(row.get("parse_status") or ""),
         "last_error": str(row.get("last_error") or ""),
-        "package_root": str(row.get("package_root") or ""),
+        "package_root": package_root,
         "legacy": bool(row.get("legacy")),
     }
 
 
-def _resource_dto(row: dict[str, Any]) -> dict[str, Any]:
+def _resource_dto(
+    row: dict[str, Any], *, package_root: str = ""
+) -> dict[str, Any]:
     internal_type = str(row.get("resource_type") or "")
+    source_type = str(row.get("source_type") or "")
+    url = str(row.get("original_url") or "")
+    link_kind = ""
+    if internal_type == "link" and url:
+        classified = classify_mail_link(
+            url,
+            source_type=source_type or "plain_text",
+            anchor_text=str(row.get("display_name") or ""),
+        )
+        link_kind = str((classified or {}).get("link_type") or "webpage")
     return {
         "resource_id": str(row.get("resource_id") or ""),
         "package_id": str(row.get("package_id") or ""),
         "category": _user_category(internal_type),
         "internal_type": internal_type,
-        "source": str(row.get("source_type") or ""),
+        "source": source_type,
         "display_name": str(row.get("display_name") or ""),
         "original_name": str(row.get("original_name") or ""),
         "mime_type": str(row.get("mime_type") or ""),
         "path": row.get("local_path"),
+        "absolute_path": _absolute_package_path(package_root, row.get("local_path")),
         "url": row.get("original_url"),
+        "link_kind": link_kind,
+        "kind_display": _resource_kind_display(internal_type, link_kind),
         "content_id": row.get("content_id"),
         "size_bytes": row.get("size_bytes"),
         "sha256": row.get("sha256"),
         "status": str(row.get("status") or ""),
+        "status_display": _resource_status_display(str(row.get("status") or "")),
         "error": str(row.get("error") or ""),
     }
 
@@ -229,7 +265,52 @@ def _user_category(internal_type: str) -> str:
         return "邮件中的图片"
     if internal_type == "attachment":
         return "附件"
+    if internal_type == "downloaded_file":
+        return "下载文件"
     return "链接与下载"
+
+
+def _resource_kind_display(internal_type: str, link_kind: str) -> str:
+    if internal_type.startswith("body_"):
+        return "邮件内容"
+    if internal_type == "inline_image":
+        return "邮件中的图片"
+    if internal_type == "attachment":
+        return "附件"
+    if internal_type == "downloaded_file":
+        return "已下载文件"
+    return {
+        "downloadable_file": "可下载文件",
+        "cloud_document": "云端文档",
+        "image_link": "图片链接",
+        "webpage": "网页链接",
+    }.get(link_kind, "网页链接")
+
+
+def _resource_status_display(status: str) -> str:
+    return {
+        "recognized": "已识别",
+        "login_may_be_required": "可能需要登录",
+        "downloaded": "已下载",
+        "download_failed": "下载失败",
+        "saved": "已保存",
+        "normal": "已保存",
+        "failed": "处理失败",
+        "partial": "部分完成",
+    }.get(status.strip().lower(), "已保存" if status else "状态未知")
+
+
+def _absolute_package_path(package_root: str, value: Any) -> str:
+    if not package_root or not value:
+        return ""
+    try:
+        root = Path(package_root).resolve()
+        raw = Path(str(value))
+        candidate = raw.resolve() if raw.is_absolute() else (root / raw).resolve()
+        candidate.relative_to(root)
+        return str(candidate)
+    except (OSError, ValueError):
+        return ""
 
 
 def _equal_filter(

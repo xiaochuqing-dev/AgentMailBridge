@@ -67,6 +67,7 @@ class SendResult(ServiceResult):
     """发件操作结果。"""
 
     request_id: str = ""
+    outbound_id: str = ""
     send_status: str = "not_sent"
     source_path: str = ""
     send_copy_path: str = ""
@@ -80,3 +81,5 @@ class SendResult(ServiceResult):
     staged_sha256: str = ""
     attachment_pre_smtp_sha256: str = ""
     sent_archive_sha256: str = ""
+    attachment_count: int = 0
+    link_count: int = 0

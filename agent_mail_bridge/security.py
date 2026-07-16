@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import re
 
@@ -16,6 +17,10 @@ import re
 DANGEROUS_EXTENSIONS = {
     ".exe", ".bat", ".cmd", ".ps1", ".sh", ".msi",
     ".com", ".scr", ".vbs", ".js", ".jar", ".wsf", ".cpl",
+}
+
+SENSITIVE_DELIVERY_FILENAMES = {
+    ".env", "credentials.json", "token.json",
 }
 
 WINDOWS_RESERVED_NAMES = {
@@ -99,6 +104,60 @@ def assert_within_allowed_roots(path: Path, roots: list[Path]) -> Path:
             continue
     allowed = "、".join(str(Path(root).resolve()) for root in roots)
     raise SecurityError(f"路径越权：{resolved} 不在允许目录 {allowed} 内")
+
+
+def validate_agent_workspace_root(
+    path: Path | str,
+    *,
+    sensitive_roots: tuple[Path, ...] = (),
+) -> Path:
+    """规范化并拒绝过宽、系统级或产品敏感的 Agent 工作区授权。"""
+    try:
+        resolved = Path(path).expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise SecurityError("工作区不存在或无法访问") from exc
+    if not resolved.is_dir():
+        raise SecurityError("工作区必须是目录")
+    if resolved == Path(resolved.anchor):
+        raise SecurityError("不能授权整个驱动器")
+
+    home = Path.home().resolve()
+    if resolved == home:
+        raise SecurityError("不能授权整个用户目录")
+
+    protected: list[Path] = []
+    appdata_root = home / "AppData"
+    if appdata_root.exists():
+        protected.append(appdata_root.resolve())
+    for name in (
+        "WINDIR", "ProgramFiles", "ProgramFiles(x86)", "ProgramData",
+        "APPDATA", "LOCALAPPDATA",
+    ):
+        value = os.environ.get(name, "").strip()
+        if value:
+            try:
+                protected.append(Path(value).resolve())
+            except OSError:
+                continue
+    for item in sensitive_roots:
+        try:
+            protected.append(Path(item).resolve())
+        except OSError:
+            continue
+    for root in protected:
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            continue
+        raise SecurityError("不能授权系统目录、AppData 或 AgentMailBridge 敏感目录")
+    return resolved
+
+
+def assert_not_sensitive_delivery_file(path: Path | str) -> None:
+    """即使工作区已授权，也不允许 Agent 交付常见配置与 OAuth 文件。"""
+    candidate = Path(path)
+    if candidate.name.casefold() in SENSITIVE_DELIVERY_FILENAMES:
+        raise SecurityError("配置或 OAuth 敏感文件禁止通过 Agent 交付")
 
 
 def check_size_ok(size_bytes: int, max_bytes: int) -> bool:

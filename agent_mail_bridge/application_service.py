@@ -33,8 +33,11 @@ from agent_mail_bridge.database import (
     init_db,
     insert_mcp_call,
     legacy_archive_backfill_needed,
+    outbound_mail_migration_needed,
     log_event,
+    get_outbound_message as query_outbound_message,
     query_recent_mcp_calls,
+    query_recent_outbound_messages,
     query_recent_events,
     query_recent_received_messages,
     query_recent_sent_files,
@@ -59,7 +62,7 @@ from agent_mail_bridge.mail_facts import (
     list_mail_threads as query_mail_threads,
     search_mail_facts as query_mail_facts,
 )
-from agent_mail_bridge.mail_send import send_file_with_request
+from agent_mail_bridge.mail_send import send_file_with_request, send_outbound_mail
 from agent_mail_bridge.maintenance import (
     create_database_backup,
     data_statistics,
@@ -74,8 +77,10 @@ from agent_mail_bridge.managed_files import get_managed_files as query_managed_f
 from agent_mail_bridge.security import (
     SecurityError,
     assert_within_allowed_roots,
+    assert_not_sensitive_delivery_file,
     check_size_ok,
     is_dangerous,
+    validate_agent_workspace_root,
 )
 from agent_mail_bridge.storage import atomic_copy_file, ensure_data_dirs
 from agent_mail_bridge.trusted_downloads import normalize_trusted_domain
@@ -116,11 +121,16 @@ class ApplicationService:
         with self._setup_lock:
             if not self._ready:
                 ensure_data_dirs(self.cfg)
-                migration_needed = legacy_archive_backfill_needed(self.cfg.db_path)
-                if migration_needed:
-                    create_database_backup(self.cfg, label="before_mail_archive")
+                archive_migration_needed = legacy_archive_backfill_needed(
+                    self.cfg.db_path
+                )
+                outbound_migration_needed = outbound_mail_migration_needed(
+                    self.cfg.db_path
+                )
+                if archive_migration_needed or outbound_migration_needed:
+                    create_database_backup(self.cfg, label="before_mail_models")
                 init_db(self.cfg.db_path)
-                if migration_needed:
+                if archive_migration_needed:
                     migration = backfill_legacy_mail_packages(self.cfg)
                     if migration.get("failed"):
                         log_event(
@@ -342,6 +352,7 @@ class ApplicationService:
         source_origin: str = "controlled",
         source_sha256: str | None = None,
         staged_sha256: str | None = None,
+        original_source_path: str | Path | None = None,
     ) -> SendResult:
         """发送白名单目录内文件，request_id 用于安全重试。"""
         self.initialize()
@@ -353,6 +364,7 @@ class ApplicationService:
             source_origin=source_origin,
             source_sha256=source_sha256,
             staged_sha256=staged_sha256,
+            original_source_path=original_source_path,
         )
         status_map = {
             "success": OperationStatus.SUCCESS,
@@ -364,6 +376,7 @@ class ApplicationService:
         return SendResult(
             status,
             request_id=stable_request_id,
+            outbound_id=raw.get("outbound_id", ""),
             send_status=raw.get("send_status", "not_sent"),
             source_path=raw.get("source_path", ""),
             send_copy_path=raw.get("send_copy_path", ""),
@@ -377,6 +390,7 @@ class ApplicationService:
             staged_sha256=raw.get("staged_sha256", ""),
             attachment_pre_smtp_sha256=raw.get("attachment_pre_smtp_sha256", ""),
             sent_archive_sha256=raw.get("sent_archive_sha256", ""),
+            attachment_count=1 if raw.get("filename") else 0,
             error_code=raw.get("error_code"),
             message=raw.get("error", "发送完成"),
             details={"previous_status": raw.get("previous_status")},
@@ -436,6 +450,7 @@ class ApplicationService:
             cfg=self.cfg,
             attachment_name=source.name,
             source_origin="manual_gui",
+            original_source_path=source,
         )
         status_map = {
             "success": OperationStatus.SUCCESS,
@@ -446,6 +461,7 @@ class ApplicationService:
         return SendResult(
             status_map.get(raw.get("status", "failed"), OperationStatus.FAILED),
             request_id=stable_request_id,
+            outbound_id=raw.get("outbound_id", ""),
             send_status=raw.get("send_status", "not_sent"),
             source_path="",
             send_copy_path=raw.get("send_copy_path", ""),
@@ -461,6 +477,43 @@ class ApplicationService:
                 "size_bytes": size_bytes,
                 "sha256": source_sha,
             },
+        )
+
+    def send_user_selected_mail(
+        self,
+        *,
+        subject: str | None,
+        body_text: str,
+        attachment_paths: list[str | Path],
+        links: list[dict[str, Any] | str],
+    ) -> SendResult:
+        """发送一封用户编写的邮件；全局文件信任仅限本次 GUI 操作。"""
+        self.initialize()
+        raw = send_outbound_mail(
+            subject=subject,
+            body_text=body_text,
+            attachment_paths=attachment_paths,
+            links=links,
+            cfg=self.cfg,
+            source_origin="manual_gui",
+        )
+        status_map = {
+            "success": OperationStatus.SUCCESS,
+            "partial": OperationStatus.PARTIAL,
+            "failed": OperationStatus.FAILED,
+        }
+        return SendResult(
+            status_map.get(raw.get("status", "failed"), OperationStatus.FAILED),
+            outbound_id=str(raw.get("outbound_id") or ""),
+            send_status=str(raw.get("send_status") or "not_sent"),
+            subject=str(raw.get("subject") or subject or ""),
+            to_email=str(raw.get("to") or self.cfg.owner_gmail),
+            sent_at=str(raw.get("sent_at") or ""),
+            attachment_count=int(raw.get("attachment_count") or 0),
+            link_count=int(raw.get("link_count") or 0),
+            error_code=raw.get("error_code"),
+            message=str(raw.get("error") or "发送完成"),
+            details={"body_text": str(raw.get("body_text") or body_text or "")},
         )
 
     def submit_result(
@@ -484,6 +537,7 @@ class ApplicationService:
             source = assert_within_allowed_roots(
                 Path(file_path), self.cfg.effective_allowed_send_roots
             )
+            assert_not_sensitive_delivery_file(source)
             if not source.exists() or not source.is_file():
                 raise FileNotFoundError("待提交文件不存在")
             if is_dangerous(source.name):
@@ -538,6 +592,7 @@ class ApplicationService:
                 source_origin="mcp_staged",
                 source_sha256=source_sha,
                 staged_sha256=staged_sha,
+                original_source_path=source,
             )
             result.source_path = str(source)
             update_mcp_staging(
@@ -762,19 +817,178 @@ class ApplicationService:
                 OperationStatus.FAILED, error_code="invalid_limit",
                 message="历史记录数量必须大于 0",
             )
+        received = query_mail_messages(self.cfg.db_path, limit=limit)
+        compatibility = _sanitize_history_paths(
+            query_recent_received_messages(self.cfg.db_path, max(limit, 500)),
+            ("body_file_path",), [self.cfg.data_root_path],
+        )
+        by_package = {
+            str(row.get("package_id") or ""): row
+            for row in compatibility if row.get("package_id")
+        }
+        by_message = {
+            str(row.get("message_id") or "").casefold(): row
+            for row in compatibility if row.get("message_id")
+        }
+        for row in received:
+            legacy = by_package.get(str(row.get("package_id") or "")) or by_message.get(
+                str(row.get("message_id") or "").casefold()
+            ) or {}
+            row["status"] = row.get("archive_status")
+            row["created_at"] = row.get("received_at") or row.get("saved_at")
+            row["body_file_path"] = str(legacy.get("body_file_path") or "")
+            row["body_file_path_status"] = str(
+                legacy.get("body_file_path_status") or "missing"
+            )
+        sent = query_recent_outbound_messages(self.cfg.db_path, limit)
+        for row in sent:
+            row["created_at"] = row.get("sent_at") or row.get("created_at")
         return ServiceResult(
             OperationStatus.SUCCESS,
-            details={
-                "received": _sanitize_history_paths(
-                    query_recent_received_messages(self.cfg.db_path, limit),
-                    ("body_file_path",), [self.cfg.data_root_path],
+            details={"received": received, "sent": sent},
+        )
+
+    def list_outbound_messages(self, limit: int = 100) -> ServiceResult:
+        self.initialize()
+        if limit <= 0:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="invalid_limit",
+                message="发送记录数量必须大于 0",
+            )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            details={"messages": query_recent_outbound_messages(self.cfg.db_path, limit)},
+        )
+
+    def get_outbound_message(self, outbound_id: str) -> ServiceResult:
+        self.initialize()
+        row = query_outbound_message(self.cfg.db_path, outbound_id)
+        if row is None:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="outbound_not_found",
+                message="发送邮件不存在",
+            )
+        return ServiceResult(OperationStatus.SUCCESS, details={"message": row})
+
+    def list_agent_workspaces(self) -> ServiceResult:
+        """只列出用户显式授权工作区，DATA_ROOT 保持内部边界。"""
+        roots = [str(Path(item).resolve()) for item in self.cfg.allowed_send_roots]
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            details={"workspaces": roots, "takes_effect": "next_mcp_session"},
+        )
+
+    def add_agent_workspace(
+        self,
+        path: str | Path,
+        *,
+        env_path: Path | None = None,
+    ) -> ServiceResult:
+        from agent_mail_bridge.runtime_paths import get_runtime_paths
+        from agent_mail_bridge.ui.settings_store import save_env_values
+
+        runtime = get_runtime_paths()
+        try:
+            resolved = validate_agent_workspace_root(
+                path,
+                sensitive_roots=(
+                    runtime.user_config_root,
+                    runtime.oauth_root,
+                    runtime.data_root,
+                    self.cfg.data_root_path,
                 ),
-                "sent": _sanitize_history_paths(
-                    query_recent_sent_files(self.cfg.db_path, limit),
-                    ("source_path", "send_copy_path", "sent_copy_path"),
-                    self.cfg.effective_allowed_send_roots,
-                ),
-            },
+            )
+        except SecurityError as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="workspace_not_allowed",
+                message=str(exc),
+            )
+        current = [Path(item).resolve() for item in self.cfg.allowed_send_roots]
+        for item in current:
+            if resolved == item:
+                return ServiceResult(
+                    OperationStatus.NO_CHANGES,
+                    error_code="workspace_duplicate",
+                    message="该工作区已授权",
+                    details={"workspace": str(resolved)},
+                )
+            try:
+                resolved.relative_to(item)
+                return ServiceResult(
+                    OperationStatus.NO_CHANGES,
+                    error_code="workspace_nested",
+                    message="该目录已包含在现有授权工作区中",
+                    details={"workspace": str(resolved)},
+                )
+            except ValueError:
+                pass
+            try:
+                item.relative_to(resolved)
+                return ServiceResult(
+                    OperationStatus.FAILED,
+                    error_code="workspace_broader_than_existing",
+                    message="新目录会扩大现有授权范围，请先移除较小工作区后再明确授权",
+                )
+            except ValueError:
+                pass
+        updated = [*current, resolved]
+        try:
+            save_env_values(
+                {"ALLOWED_SEND_ROOTS": os.pathsep.join(str(item) for item in updated)},
+                env_path,
+            )
+        except OSError as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="workspace_save_failed",
+                message=f"保存工作区授权失败：{exc}",
+            )
+        self.cfg.allowed_send_roots = updated
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            message="工作区已授权；新授权将在下一次 MCP 会话生效",
+            details={"workspace": str(resolved), "takes_effect": "next_mcp_session"},
+        )
+
+    def remove_agent_workspace(
+        self,
+        path: str | Path,
+        *,
+        env_path: Path | None = None,
+    ) -> ServiceResult:
+        from agent_mail_bridge.ui.settings_store import save_env_values
+
+        try:
+            resolved = Path(path).expanduser().resolve(strict=True)
+        except OSError:
+            resolved = Path(path).expanduser().resolve()
+        current = [Path(item).resolve() for item in self.cfg.allowed_send_roots]
+        updated = [item for item in current if item != resolved]
+        if len(updated) == len(current):
+            return ServiceResult(
+                OperationStatus.NO_CHANGES,
+                error_code="workspace_not_found",
+                message="该工作区未授权",
+            )
+        try:
+            save_env_values(
+                {"ALLOWED_SEND_ROOTS": os.pathsep.join(str(item) for item in updated)},
+                env_path,
+            )
+        except OSError as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="workspace_save_failed",
+                message=f"保存工作区授权失败：{exc}",
+            )
+        self.cfg.allowed_send_roots = updated
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            message="工作区授权已移除；下一次 MCP 会话将使用新范围",
+            details={"workspace": str(resolved), "takes_effect": "next_mcp_session"},
         )
 
     def list_mail_messages(self, **filters: Any) -> ServiceResult:

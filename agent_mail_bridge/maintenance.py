@@ -150,6 +150,8 @@ def _database_references(cfg: AppConfig) -> list[dict[str, str]]:
             ("sent_files", "source_path", "sha256"),
             ("sent_files", "send_copy_path", "sha256"),
             ("sent_files", "sent_copy_path", "sha256"),
+            ("outbound_resources", "staged_path", "staged_sha256"),
+            ("outbound_resources", "sent_archive_path", "sent_archive_sha256"),
         )
         for table, path_column, hash_column in specs:
             rows = connection.execute(
@@ -315,7 +317,8 @@ def data_statistics(cfg: AppConfig) -> dict[str, Any]:
             table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             for table in (
                 "received_messages", "received_files", "mail_packages",
-                "mail_resources", "sent_files", "mcp_calls", "app_events",
+                "mail_resources", "outbound_messages", "outbound_resources",
+                "outbound_links", "sent_files", "mcp_calls", "app_events",
             )
         }
         archive_counts = connection.execute(
