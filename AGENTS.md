@@ -73,6 +73,17 @@ Use `runtime_paths.py`. Frozen program files are read-only under the install dir
 - `partial` must remain a warning with successful work preserved; it must not be reported as an overall failure.
 - File tables must not hide core filename, path, time or action information with generated ellipses.
 - New UI must pass Windows screenshot QA at 100%, 125% and 150% DPI, including the supported dark theme.
+- Mail lists are for concise summaries; full bodies belong in detail views, and body text must never grow a row beyond its strict bound.
+- Received and sent summaries must keep non-zero attachment, inline-image, link and download counts visible even when body text exists.
+- Received and sent summary tables must look like unified rows, not independently interactive cells; dark theme must not inherit light item-hover backgrounds or show vertical hover/selection boundaries.
+- Inbox search must use mail facts across recipients, readable body, attachment/image names and links; resource matches must never duplicate a mail row.
+
+## Technical log invariants
+
+- Normal automatic no-change checks must not create permanent `app_events` noise; scheduler health belongs in `auto_receive_state`.
+- `app_events` retention may delete only technical events. It must never delete business history, outbound records, MCP audit, retry state, mail packages, resources, raw mail or attachments.
+- File-log rotation and SQLite event retention are separate mechanisms and must both remain bounded.
+- AgentMailBridge v1.1.0 is the current product version. Route B multi-mailbox remains future scope.
 
 ## History and managed-file invariants
 

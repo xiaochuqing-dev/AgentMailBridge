@@ -269,15 +269,70 @@ def _decode_message_text(part: Message) -> str:
     if payload is None:
         value = part.get_payload()
         return value if isinstance(value, str) else ""
-    charsets = [part.get_content_charset(), "utf-8", "gbk", "gb2312", "big5", "latin-1"]
-    for charset in charsets:
-        if not charset:
-            continue
+    return decode_text_bytes(payload, declared_charset=part.get_content_charset())
+
+
+def decode_text_bytes(payload: bytes, *, declared_charset: str | None = None) -> str:
+    """在声明缺失或错误时，从常见中文编码中选择最可信的严格解码结果。"""
+    if not payload:
+        return ""
+    declared = str(declared_charset or "").strip().lower().replace("_", "-")
+    aliases = {
+        "utf8": "utf-8", "gb2312": "gb18030", "gbk": "gb18030",
+        "cp936": "gb18030", "big-5": "big5", "cp950": "big5",
+    }
+    declared = aliases.get(declared, declared)
+    trusted_declared = declared if declared in {
+        "utf-8", "utf-16", "utf-16le", "utf-16be", "gb18030", "big5"
+    } else ""
+    candidates: list[str] = []
+    for charset in (
+        trusted_declared,
+        "utf-8-sig" if payload.startswith(b"\xef\xbb\xbf") else "utf-8",
+        "gb18030",
+        "big5",
+        declared,
+        "latin-1",
+    ):
+        if charset and charset not in candidates:
+            candidates.append(charset)
+
+    decoded: list[tuple[float, int, str]] = []
+    for index, charset in enumerate(candidates):
         try:
-            return payload.decode(charset)
+            value = payload.decode(charset)
         except (LookupError, UnicodeDecodeError):
             continue
+        score = _decoded_text_score(value) - index * 0.01
+        if charset in {"utf-8", "utf-8-sig"}:
+            # 严格 UTF-8 成功是强信号，可覆盖错误的单字节 charset 声明。
+            score += 50.0
+        if trusted_declared and charset == trusted_declared:
+            score += 2.0
+        decoded.append((score, -index, value))
+    if decoded:
+        return max(decoded, key=lambda item: (item[0], item[1]))[2]
     return payload.decode("utf-8", errors="replace")
+
+
+def _decoded_text_score(value: str) -> float:
+    cjk = sum(
+        1 for char in value
+        if "\u3400" <= char <= "\u9fff" or "\uf900" <= char <= "\ufaff"
+    )
+    controls = sum(1 for char in value if ord(char) < 32 and char not in "\r\n\t")
+    c1_controls = sum(1 for char in value if 0x7F <= ord(char) <= 0x9F)
+    replacement = value.count("\ufffd")
+    mojibake = sum(value.count(marker) for marker in ("Ã", "Â", "ä", "å", "æ", "ç", "é"))
+    printable = sum(1 for char in value if char.isprintable() or char in "\r\n\t")
+    return (
+        cjk * 3.0
+        + printable / max(1, len(value))
+        - controls * 8.0
+        - c1_controls * 8.0
+        - replacement * 20.0
+        - mojibake * 1.5
+    )
 
 
 class _ReadableHTMLParser(HTMLParser):

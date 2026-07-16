@@ -73,6 +73,7 @@ def receive_gmail_api_messages(
     service: Any | None = None,
     *,
     limit: int | None = None,
+    automatic: bool = False,
 ) -> dict[str, Any]:
     """通过 Gmail API 收取符合条件的邮件。
 
@@ -119,10 +120,11 @@ def receive_gmail_api_messages(
 
     gmail_addr = cfg.gmail_address.lower().strip()
 
-    log_event(
-        cfg.db_path, "INFO", "receive",
-        f"开始通过 Gmail API 收取邮件（page_size={page_size}, lookback={cfg.receive_lookback_minutes}m）",
-    )
+    if not automatic:
+        log_event(
+            cfg.db_path, "INFO", "receive",
+            f"开始通过 Gmail API 收取邮件（page_size={page_size}, lookback={cfg.receive_lookback_minutes}m）",
+        )
 
     # ---- 获取 service ----
     if service is None:
@@ -208,14 +210,15 @@ def receive_gmail_api_messages(
     result["pending_retries"] = retry_counts["pending"]
     result["needs_attention"] = retry_counts["needs_attention"]
 
-    log_event(
-        cfg.db_path,
-        "WARNING" if result["failed"] else "SUCCESS",
-        "receive",
-        f"Gmail API 收取完成：扫描 {result['fetched']} 封，"
-        f"新存 {result['saved']} 封，跳过 {result['skipped']} 封，"
-        f"附件 {result['attachments']} 个",
-    )
+    if not automatic or result["saved"] or result["failed"]:
+        log_event(
+            cfg.db_path,
+            "WARNING" if result["failed"] else "SUCCESS",
+            "receive",
+            f"Gmail API 收取完成：扫描 {result['fetched']} 封，"
+            f"新存 {result['saved']} 封，跳过 {result['skipped']} 封，"
+            f"附件 {result['attachments']} 个",
+        )
     return result
 
 

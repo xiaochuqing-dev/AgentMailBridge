@@ -1,6 +1,6 @@
 # AgentMailBridge
 
-AgentMailBridge v1.0.0 是面向个人用户的本地优先 Windows 邮箱桥接工具。它通过 Gmail 收取完整邮件，通过 QQ SMTP 将正文、链接和多个附件作为一封邮件发送到固定 Gmail，并向 Codex、Claude Code 等本地 Agent 提供受控的 stdio MCP 交付能力。
+AgentMailBridge v1.1.0 是面向个人用户的本地优先 Windows 邮箱桥接工具。它通过 Gmail 收取完整邮件，通过 QQ SMTP 将正文、链接和多个附件作为一封邮件发送到固定 Gmail，并向 Codex、Claude Code 等本地 Agent 提供受控的 stdio MCP 交付能力。
 
 项目不提供多租户、任意收件人、通用 Gmail MCP、遥测或云同步。邮箱凭据、OAuth、数据库、邮件附件和归档由用户保留在本机。
 
@@ -22,15 +22,16 @@ AgentMailBridge v1.0.0 是面向个人用户的本地优先 Windows 邮箱桥接
 - 收件页不重复显示 Gmail 管理卡；正常窗口完整展示今日文件与最近日志，不出现页面级滚动，较矮窗口才启用滚动兜底。数据较多时表格内部滚动，不使用分页。
 - 收件页标题右侧提供唯一刷新入口；“当前收件偏好”支持“仅本人邮件”“当前扫描范围内全部邮件”和“自定义规则”。自定义规则可按发件人/域名、主题关键词和是否含附件过滤，分类之间为 AND、分类内部为 OR；手动与自动收件、Gmail API 与 IMAP 共用同一业务规则。
 - 收件结果明确区分成功、无新邮件、部分完成和失败；无新邮件不计入失败或错误。
-- “今日收到邮件”每封邮件只显示一行，列出主题、发件人、内容摘要、时间、状态和操作；双击或“查看”进入邮件详情，正文、内嵌图片、附件、链接和同会话邮件均按自然业务语言展示。
+- “今日收到邮件”每封邮件只显示一条紧凑记录；正文摘要最多一至两行，附件、邮件图片、链接和下载数量始终可见。双击整行或点击“查看邮件”进入详情查看完整正文和资源。
+- 收件搜索使用邮件事实层，可按主题、发件人、收件人、抄送人、完整可读正文、附件名、邮件图片名、链接文字、域名、URL 和状态查找；同一邮件多个资源命中仍只显示一条。
 - 发件页支持可选主题、正文、0 至多个附件和 0 至多个链接；一次确认只生成并发送一封 MIME 邮件，最近发送与历史记录也按邮件展示。
 - “文件与数据”以 `mail_resources` 作为新收件资源权威来源，并保留未映射旧数据兼容；表格显示所属邮件，可从文件进入邮件详情，也可从邮件详情定位附件。未知大小、真实 0 字节和文件不存在分别显示。
 - 右侧连接健康以五个独立状态项展示 Gmail、QQ SMTP、Agent/MCP、凭据/OAuth 和 SQLite/数据目录，并提供定向处理入口。
-- v1.0.0 界面统一使用 Windows 中文 UI 字体、线性图标、真实按钮及 100%/125%/150% DPI 适配。
+- v1.1.0 的收件和最近发送表格使用统一整行视觉，浅色/深色 Hover 不闪白、不出现竖向单元格分割，同时保持 Windows 中文 UI、线性图标和 100%/125%/150% DPI 适配。
 
 ## Windows 安装
 
-运行 `AgentMailBridge-1.0.0-Setup.exe`。默认安装到 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需 Python、Git 或管理员权限。桌面和开始菜单只指向 `AgentMailBridge.exe`；内部 `AgentMailBridgeMCP.exe` 不创建快捷方式、托盘或开机启动项。
+运行 `AgentMailBridge-1.1.0-Setup.exe`。默认安装到 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需 Python、Git 或管理员权限。桌面和开始菜单只指向 `AgentMailBridge.exe`；内部 `AgentMailBridgeMCP.exe` 不创建快捷方式、托盘或开机启动项。
 
 安装版数据位置：
 
@@ -73,6 +74,8 @@ Windows MCP stdin、stdout 和 stderr 明确使用 UTF-8，首条请求可兼容
 
 单邮件处理失败按 1 分钟、5 分钟、30 分钟、2 小时有限重试，继续失败后标记为“需要处理”；到期重试即使已经离开重叠回看窗口，也会按 Gmail 资源 ID 或 IMAP UID 单独发现，不会每分钟污染后续轮询。无新邮件始终是健康的 `no_changes`。收件页展示真实运行状态、上次检查、上次成功、下次检查、最近结果和待重试数量；“立即收取”与自动任务共用同一互斥服务。
 
+正常自动检查和无新邮件结果只更新调度状态，不再永久写入技术事件。SQLite 技术日志默认普通记录保留 30 天、WARNING/ERROR 保留 90 天，最多 10,000 条，超限后批量降到约 8,000 条；启动、每 24 小时和用户手动操作可触发清理。文件日志仍独立按约 2 MB、5 个备份轮转。日志管理支持概览、级别/事件类型/时间/关键词组合筛选、日常检查开关、分页加载、当前筛选脱敏导出、保留设置和安全清理；这些操作不会删除邮件、附件、收发历史或 MCP 审计。
+
 ## 开发与构建
 
 需要 Python 3.11 或更高版本：
@@ -94,8 +97,8 @@ powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
 
 流程会清理旧构建、运行 pytest、构建 GUI 与内部 MCP、执行 packaged smoke 和秘密排除扫描，并生成：
 
-- `release\AgentMailBridge-1.0.0-Setup.exe`
-- `release\AgentMailBridge-1.0.0-Windows-x64.zip`
+- `release\AgentMailBridge-1.1.0-Setup.exe`
+- `release\AgentMailBridge-1.1.0-Windows-x64.zip`
 - `release\checksums.sha256`
 
 详细说明见 `docs/GUI使用说明.md`、`docs/MCP使用说明.md`、`docs/安全与诊断说明.md`、`docs/Windows安装与升级说明.md`、`docs/统一邮件归档设计.md`、`docs/邮件事实查询说明.md` 和最终专项报告。

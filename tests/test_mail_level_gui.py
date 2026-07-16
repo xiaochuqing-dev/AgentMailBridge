@@ -72,6 +72,11 @@ def test_inbox_is_one_row_per_mail_even_with_seven_attachments(mail_gui_window):
     assert mail_gui_window.inbox_table.textElideMode() == Qt.TextElideMode.ElideNone
     assert mail_gui_window.inbox_table.item(0, 0).text() == long_subject
     assert mail_gui_window.inbox_table.rowHeight(0) > 58
+    assert mail_gui_window.inbox_table.rowHeight(0) == 74
+    assert "7 个附件" in mail_gui_window.inbox_table.item(0, 2).text()
+    assert "1 张邮件图片" in mail_gui_window.inbox_table.item(0, 2).text()
+    assert mail_gui_window.inbox_table.objectName() == "mailRecordTable"
+    assert mail_gui_window.inbox_table.selectionMode() == mail_gui_window.inbox_table.SelectionMode.NoSelection
     assert mail_gui_window.inbox_table.cellWidget(0, 5).text() == "查看邮件"
 
 
@@ -258,3 +263,91 @@ def test_recent_sent_table_uses_stretch_columns_and_no_small_fixed_height(mail_g
     assert header.sectionResizeMode(1).name == "Stretch"
     assert mail_gui_window.sent_table.maximumHeight() >= 16_777_215
     assert "Agent 发件 / MCP" in _page_text(mail_gui_window.pages["send"])
+
+
+def test_received_and_sent_tables_use_compact_unified_rows(mail_gui_window):
+    long_body = "这是需要在详情中完整查看的长正文🙂" * 80
+    mail_gui_window._populate_inbox_messages([{
+        "package_id": "compact-inbox",
+        "subject": "紧凑收件主题",
+        "from": "sender@example.com",
+        "body_summary": long_body,
+        "received_at": "2026-07-16 10:00:00",
+        "archive_status": "ready",
+        "counts": {"attachments": 3, "inline_images": 2, "links": 4, "downloads": 1},
+    }])
+    mail_gui_window.history_rows["sent"] = [{
+        "outbound_id": "compact-outbound",
+        "subject": "紧凑发件主题",
+        "body_text": long_body,
+        "attachment_count": 3,
+        "link_count": 2,
+        "source_origin": "manual_gui",
+        "status": "sent",
+        "sent_at": "2026-07-16 11:00:00",
+    }]
+    mail_gui_window._populate_sent_history()
+
+    assert mail_gui_window.inbox_table.rowHeight(0) == 74
+    assert mail_gui_window.sent_table.rowHeight(0) == 74
+    assert len(mail_gui_window.inbox_table.item(0, 2).text()) < len(long_body)
+    assert "3 个附件" in mail_gui_window.inbox_table.item(0, 2).text()
+    assert "2 个链接" in mail_gui_window.sent_table.item(0, 1).text()
+    assert mail_gui_window.sent_table.objectName() == "mailRecordTable"
+    assert "双击查看完整邮件" in mail_gui_window.inbox_table.item(0, 0).toolTip()
+
+
+def test_mail_fact_search_is_debounced_and_sent_row_double_click_still_opens(
+    mail_gui_window, monkeypatch
+):
+    captured: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        mail_gui_window.service,
+        "search_mail_facts",
+        lambda query, **filters: (
+            captured.append((query, filters))
+            or ServiceResult(OperationStatus.SUCCESS, details={"messages": []})
+        ),
+    )
+    mail_gui_window.inbox_search.setText("中文附件名")
+    assert mail_gui_window.inbox_search_timer.interval() == 250
+    assert mail_gui_window.inbox_search_timer.isActive()
+    mail_gui_window._filter_inbox()
+    assert captured[0][0] == "中文附件名"
+    assert captured[0][1]["date_from"] == time.strftime("%Y-%m-%d")
+
+    mail_gui_window.history_rows["sent"] = [{
+        "outbound_id": "double-click-outbound",
+        "subject": "双击发送记录",
+        "body_text": "正文",
+        "source_origin": "manual_gui",
+        "status": "sent",
+    }]
+    mail_gui_window._populate_sent_history()
+    opened: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        mail_gui_window,
+        "show_outbound_detail",
+        lambda outbound_id, page: opened.append((outbound_id, page)),
+    )
+    mail_gui_window._open_sent_record(0, 1)
+    assert opened == [("double-click-outbound", "send")]
+
+
+def test_log_management_exposes_overview_filters_retention_and_safe_cleanup(mail_gui_window):
+    page = mail_gui_window.pages["logs"]
+    buttons = {button.text() for button in page.findChildren(QPushButton)}
+    assert {
+        "导出当前筛选日志",
+        "导出脱敏诊断信息（完整）",
+        "立即清理过期日志",
+        "清除日常检查",
+        "清空全部技术日志",
+    } <= buttons
+    assert mail_gui_window.log_type_filter.count() == 7
+    assert not mail_gui_window.log_daily_check.isChecked()
+    assert mail_gui_window.log_page_size == 150
+    assert mail_gui_window.log_normal_retention.currentData() == 30
+    assert mail_gui_window.log_error_retention.currentData() == 90
+    assert mail_gui_window.log_max_count.currentData() == 10_000
+    assert "当前技术事件" in mail_gui_window.log_overview_label.text()

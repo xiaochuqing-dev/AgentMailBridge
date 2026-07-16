@@ -86,6 +86,7 @@ def receive_mails(
     limit: int | None = None,
     unseen_only: bool | None = None,
     mark_seen: bool | None = None,
+    automatic: bool = False,
 ) -> dict[str, Any]:
     """收取 Gmail 中符合条件的邮件（根据后端配置分发）。
 
@@ -111,24 +112,28 @@ def receive_mails(
     """
     from agent_mail_bridge.config import _effective_receive_backend
     backend = _effective_receive_backend(cfg)
-    logger.info("收件后端：%s（配置=%s）", backend, cfg.gmail_receive_backend)
+    log_backend = logger.debug if automatic else logger.info
+    log_backend("收件后端：%s（配置=%s）", backend, cfg.gmail_receive_backend)
 
     if backend == "gmail_api":
-        result = receive_gmail_api(cfg, limit=limit)
+        result = receive_gmail_api(cfg, limit=limit, automatic=automatic)
     else:
         result = _receive_via_imap(
             cfg, limit=limit, unseen_only=unseen_only, mark_seen=mark_seen,
+            automatic=automatic,
         )
     result["backend"] = backend
     return result
 
 
 def receive_gmail_api(
-    cfg: AppConfig, *, limit: int | None = None
+    cfg: AppConfig, *, limit: int | None = None, automatic: bool = False
 ) -> dict[str, Any]:
     """Gmail API 后端收件（委托 gmail_api_receive 模块）。"""
     from agent_mail_bridge.gmail_api_receive import receive_gmail_api_messages
-    return receive_gmail_api_messages(cfg, service=None, limit=limit)
+    return receive_gmail_api_messages(
+        cfg, service=None, limit=limit, automatic=automatic
+    )
 
 
 # ============================================================
@@ -141,6 +146,7 @@ def _receive_via_imap(
     limit: int | None = None,
     unseen_only: bool | None = None,
     mark_seen: bool | None = None,
+    automatic: bool = False,
 ) -> dict[str, Any]:
     """收取 Gmail Inbox 中符合条件的邮件（IMAP 后端）。
 
@@ -189,7 +195,8 @@ def _receive_via_imap(
 
     gmail_addr = cfg.gmail_address.lower().strip()
 
-    log_event(cfg.db_path, "INFO", "receive", f"开始收取邮件（limit={limit}）")
+    if not automatic:
+        log_event(cfg.db_path, "INFO", "receive", f"开始收取邮件（limit={limit}）")
 
     try:
         conn = _connect_imap(cfg)
@@ -279,13 +286,14 @@ def _receive_via_imap(
         result["pending_retries"] = retry_counts["pending"]
         result["needs_attention"] = retry_counts["needs_attention"]
 
-        log_event(
-            cfg.db_path,
-            "WARNING" if result["failed"] else "SUCCESS",
-            "receive",
-            f"收取完成：扫描 {result['fetched']} 封，新存 {result['saved']} 封，"
-            f"跳过 {result['skipped']} 封，附件 {result['attachments']} 个",
-        )
+        if not automatic or result["saved"] or result["failed"]:
+            log_event(
+                cfg.db_path,
+                "WARNING" if result["failed"] else "SUCCESS",
+                "receive",
+                f"收取完成：扫描 {result['fetched']} 封，新存 {result['saved']} 封，"
+                f"跳过 {result['skipped']} 封，附件 {result['attachments']} 个",
+            )
         return result
     finally:
         try:

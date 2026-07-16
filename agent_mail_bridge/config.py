@@ -198,6 +198,9 @@ class AppConfig:
 
     # --- 日志 ---
     log_level: str = "INFO"
+    normal_log_retention_days: int = 30
+    warning_error_log_retention_days: int = 90
+    app_event_max_count: int = 10_000
 
     def __post_init__(self) -> None:
         """旧布尔配置无损映射到新模式，并归一化非敏感规则。"""
@@ -213,6 +216,18 @@ class AppConfig:
         self.receive_rule_senders = normalize_sender_rules(self.receive_rule_senders)
         self.receive_rule_subject_keywords = normalize_subject_keywords(
             self.receive_rule_subject_keywords
+        )
+        normal_days = int(self.normal_log_retention_days)
+        error_days = int(self.warning_error_log_retention_days)
+        event_max = int(self.app_event_max_count)
+        self.normal_log_retention_days = (
+            normal_days if normal_days in {7, 30, 90} else 30
+        )
+        self.warning_error_log_retention_days = (
+            error_days if error_days in {30, 90, 180} else 90
+        )
+        self.app_event_max_count = (
+            event_max if event_max in {5_000, 10_000, 20_000} else 10_000
         )
 
     @property
@@ -316,6 +331,9 @@ class AppConfig:
             "trusted_download_timeout_seconds": self.trusted_download_timeout_seconds,
             "trusted_download_max_redirects": self.trusted_download_max_redirects,
             "log_level": self.log_level,
+            "normal_log_retention_days": self.normal_log_retention_days,
+            "warning_error_log_retention_days": self.warning_error_log_retention_days,
+            "app_event_max_count": self.app_event_max_count,
         }
 
 
@@ -486,6 +504,17 @@ def load_config(env_path: Path | str | None = None) -> AppConfig:
             "TRUSTED_DOWNLOAD_MAX_REDIRECTS", 3,
         ),
         log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
+        normal_log_retention_days=_as_positive_int(
+            os.getenv("NORMAL_LOG_RETENTION_DAYS"),
+            "NORMAL_LOG_RETENTION_DAYS", 30,
+        ),
+        warning_error_log_retention_days=_as_positive_int(
+            os.getenv("WARNING_ERROR_LOG_RETENTION_DAYS"),
+            "WARNING_ERROR_LOG_RETENTION_DAYS", 90,
+        ),
+        app_event_max_count=_as_positive_int(
+            os.getenv("APP_EVENT_MAX_COUNT"), "APP_EVENT_MAX_COUNT", 10_000,
+        ),
     )
     return cfg
 

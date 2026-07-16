@@ -48,7 +48,7 @@ from PySide6.QtWidgets import (
 )
 
 from agent_mail_bridge.application_service import ApplicationService
-from agent_mail_bridge.database import close_connection
+from agent_mail_bridge.database import close_connection, log_event
 from agent_mail_bridge.credentials import GMAIL_IMAP_SECRET, QQ_SMTP_SECRET
 from agent_mail_bridge.desktop_runtime import StartupManager
 from agent_mail_bridge.version import __version__
@@ -60,6 +60,12 @@ from agent_mail_bridge.mcp_client_config import (
 from agent_mail_bridge.runtime_paths import get_runtime_paths
 from agent_mail_bridge.models import OperationStatus, ReceiveResult, SendResult, ServiceResult
 from agent_mail_bridge.managed_files import localize_status
+from agent_mail_bridge.mail_summaries import (
+    MAIL_LIST_ROW_HEIGHT,
+    build_mail_list_summary,
+    build_mail_list_tooltip,
+    build_outbound_list_summary,
+)
 from agent_mail_bridge.receive_rules import (
     ALL_SCANNED,
     CUSTOM,
@@ -909,7 +915,7 @@ class BridgeWindow(QMainWindow):
         file_title.setObjectName("sectionTitle")
         self.inbox_search = QLineEdit()
         self.inbox_search.setObjectName("inboxSearch")
-        self.inbox_search.setPlaceholderText("搜索主题、发件人或邮件内容")
+        self.inbox_search.setPlaceholderText("搜索主题、联系人、正文、附件或链接")
         self.inbox_search.setClearButtonEnabled(True)
         self.inbox_search.addAction(
             QIcon(line_icon_pixmap("search", 17, TEXT_MUTED)),
@@ -917,7 +923,11 @@ class BridgeWindow(QMainWindow):
         )
         self.inbox_search.setMinimumWidth(260)
         self.inbox_search.setMaximumWidth(420)
-        self.inbox_search.textChanged.connect(self._filter_inbox)
+        self.inbox_search_timer = QTimer(self)
+        self.inbox_search_timer.setSingleShot(True)
+        self.inbox_search_timer.setInterval(250)
+        self.inbox_search_timer.timeout.connect(self._filter_inbox)
+        self.inbox_search.textChanged.connect(self._schedule_inbox_filter)
         open_button = self._button("打开今日邮件归档", self.open_today_folder, icon_kind="file")
         file_header.addWidget(file_title)
         file_header.addStretch(1)
@@ -1105,6 +1115,11 @@ class BridgeWindow(QMainWindow):
         self.sent_table = DataTable(
             ["主题", "内容", "来源", "发送时间", "状态", "操作"]
         )
+        self.sent_table.setObjectName("mailRecordTable")
+        self.sent_table.setAlternatingRowColors(False)
+        self.sent_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.sent_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.sent_table.cellDoubleClicked.connect(self._open_sent_record)
         sent_header = self.sent_table.horizontalHeader()
         sent_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         sent_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
@@ -1115,6 +1130,7 @@ class BridgeWindow(QMainWindow):
         self.sent_table.setColumnWidth(5, 92)
         self.sent_table.setWordWrap(True)
         self.sent_table.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self.sent_table.verticalHeader().setDefaultSectionSize(MAIL_LIST_ROW_HEIGHT)
         history_layout.addWidget(self.sent_table, 1)
         splitter.addWidget(history_panel)
         splitter.setStretchFactor(0, 0)
@@ -1433,16 +1449,33 @@ class BridgeWindow(QMainWindow):
 
     def _build_logs_page(self) -> QWidget:
         page, layout = self._standard_page("日志管理", "筛选和查看脱敏技术事件；不会显示密码或 OAuth token。")
+        self.log_overview_label = QLabel("正在读取技术日志概览…")
+        self.log_overview_label.setObjectName("hint")
+        self.log_overview_label.setWordWrap(True)
+        layout.addWidget(self.log_overview_label)
+
         tools = QHBoxLayout()
         self.log_search = QLineEdit()
         self.log_search.setPlaceholderText("搜索事件或消息")
-        self.log_search.textChanged.connect(self._populate_full_logs)
+        self.log_search_timer = QTimer(self)
+        self.log_search_timer.setSingleShot(True)
+        self.log_search_timer.setInterval(250)
+        self.log_search_timer.timeout.connect(self._populate_full_logs)
+        self.log_search.textChanged.connect(lambda _text: self.log_search_timer.start())
         self.log_filter = QComboBox()
         self.log_filter.addItems(["全部级别", "INFO", "SUCCESS", "WARNING", "ERROR"])
         self.log_filter.currentTextChanged.connect(self._populate_full_logs)
+        self.log_type_filter = QComboBox()
+        self.log_type_filter.addItems([
+            "全部事件", "收件", "发件", "Agent / MCP", "配置", "数据库与文件", "系统与诊断",
+        ])
+        self.log_type_filter.currentTextChanged.connect(self._populate_full_logs)
         self.log_time_filter = QComboBox()
         self.log_time_filter.addItems(["全部时间", "今天", "最近 7 天", "最近 30 天"])
         self.log_time_filter.currentTextChanged.connect(self._populate_full_logs)
+        self.log_daily_check = QCheckBox("显示日常自动检查")
+        self.log_daily_check.setChecked(False)
+        self.log_daily_check.toggled.connect(self._populate_full_logs)
         self.logs_refresh_button = self._button("刷新")
         self.logs_refresh_button.clicked.connect(
             lambda: self.request_refresh(self.logs_refresh_button)
@@ -1451,24 +1484,73 @@ class BridgeWindow(QMainWindow):
         self.logs_refresh_label.setObjectName("hint")
         tools.addWidget(self.log_search, 1)
         tools.addWidget(self.log_filter)
+        tools.addWidget(self.log_type_filter)
         tools.addWidget(self.log_time_filter)
-        tools.addStretch(1)
+        tools.addWidget(self.log_daily_check)
         tools.addWidget(self.logs_refresh_label)
         tools.addWidget(self.logs_refresh_button)
         layout.addLayout(tools)
+
+        retention = QHBoxLayout()
+        retention.addWidget(QLabel("普通日志保留"))
+        self.log_normal_retention = QComboBox()
+        for days in (7, 30, 90):
+            self.log_normal_retention.addItem(f"{days} 天", days)
+        self._set_combo_data(
+            self.log_normal_retention, self.service.cfg.normal_log_retention_days
+        )
+        retention.addWidget(self.log_normal_retention)
+        retention.addWidget(QLabel("错误日志保留"))
+        self.log_error_retention = QComboBox()
+        for days in (30, 90, 180):
+            self.log_error_retention.addItem(f"{days} 天", days)
+        self._set_combo_data(
+            self.log_error_retention,
+            self.service.cfg.warning_error_log_retention_days,
+        )
+        retention.addWidget(self.log_error_retention)
+        retention.addWidget(QLabel("最多记录"))
+        self.log_max_count = QComboBox()
+        for count in (5_000, 10_000, 20_000):
+            self.log_max_count.addItem(f"{count:,} 条", count)
+        self._set_combo_data(self.log_max_count, self.service.cfg.app_event_max_count)
+        retention.addWidget(self.log_max_count)
+        retention.addWidget(self._button("保存保留设置", self.save_log_retention_settings, outline=True))
+        retention.addStretch(1)
+        layout.addLayout(retention)
+
         self.full_logs_table = DataTable(["时间", "级别", "事件", "消息"])
         self._configure_log_table(self.full_logs_table, full=True)
         self.full_logs_table.cellDoubleClicked.connect(self._show_log_detail)
         layout.addWidget(self.full_logs_table, 1)
+        self.full_log_rows: list[dict] = []
+        self.log_page_size = 150
+        self.log_query_total = 0
+        self.log_load_more_button = self._button("加载更多", self._load_more_logs, outline=True)
+
         log_actions = QHBoxLayout()
         log_actions.addWidget(self._button("查看详情", self.show_selected_log_detail))
-        self.log_export_button = self._button("导出脱敏诊断信息")
-        self.log_export_button.clicked.connect(lambda: self.export_diagnostic_report(self.log_export_button))
+        self.log_export_filtered_button = self._button("导出当前筛选日志")
+        self.log_export_filtered_button.clicked.connect(self.export_current_log_filter)
+        log_actions.addWidget(self.log_export_filtered_button)
+        self.log_export_button = self._button("导出脱敏诊断信息（完整）")
+        self.log_export_button.clicked.connect(
+            lambda: self.export_diagnostic_report(self.log_export_button)
+        )
         log_actions.addWidget(self.log_export_button)
+        log_actions.addWidget(self.log_load_more_button)
         log_actions.addWidget(self._button("打开日志目录", self.open_log_folder))
         log_actions.addStretch(1)
-        log_actions.addWidget(self._button("← 返回收件", lambda: self.select_page("inbox"), text_only=True))
         layout.addLayout(log_actions)
+        maintenance_actions = QHBoxLayout()
+        maintenance_actions.addWidget(self._button("立即清理过期日志", self.prune_technical_logs))
+        maintenance_actions.addWidget(self._button("清除日常检查", self.clear_daily_check_logs))
+        maintenance_actions.addWidget(self._button("清空全部技术日志", self.clear_all_technical_logs, text_only=True))
+        maintenance_actions.addStretch(1)
+        maintenance_actions.addWidget(
+            self._button("← 返回收件", lambda: self.select_page("inbox"), text_only=True)
+        )
+        layout.addLayout(maintenance_actions)
         return page
 
     def _build_maintenance_page(self) -> QWidget:
@@ -1921,7 +2003,7 @@ class BridgeWindow(QMainWindow):
         return scroll
 
     def _build_about_page(self) -> QWidget:
-        page, layout = self._standard_page("关于", "AgentMailBridge v1.0.0 产品与构建信息。")
+        page, layout = self._standard_page("关于", f"AgentMailBridge v{__version__} 产品与构建信息。")
         card = QFrame()
         card.setObjectName("card")
         card_layout = QHBoxLayout(card)
@@ -2208,6 +2290,10 @@ class BridgeWindow(QMainWindow):
         table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
     def _configure_inbox_table(self, table: DataTable) -> None:
+        table.setObjectName("mailRecordTable")
+        table.setAlternatingRowColors(False)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         table.setColumnCount(6)
         table.setHorizontalHeaderLabels(
             ["主题", "发件人", "内容", "收取时间", "状态", "操作"]
@@ -2223,7 +2309,7 @@ class BridgeWindow(QMainWindow):
         table.setColumnWidth(5, 92)
         table.setWordWrap(True)
         table.setTextElideMode(Qt.TextElideMode.ElideNone)
-        table.verticalHeader().setDefaultSectionSize(58)
+        table.verticalHeader().setDefaultSectionSize(MAIL_LIST_ROW_HEIGHT)
         table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
     @staticmethod
@@ -3253,7 +3339,10 @@ class BridgeWindow(QMainWindow):
         self.managed_file_rows = result.details.get("managed_files", [])
         self._update_auto_receive_status(result.details.get("auto_receive", {}))
         self._apply_config_to_controls(status)
-        self._populate_inbox_messages(self.mail_rows)
+        if self.inbox_search.text().strip():
+            self._filter_inbox()
+        else:
+            self._populate_inbox_messages(self.mail_rows)
         self._populate_logs(self.logs_table, self.log_rows[:30])
         self._populate_sent_history()
         if hasattr(self, "history_table"):
@@ -3413,19 +3502,31 @@ class BridgeWindow(QMainWindow):
             package_id = str(row.get("package_id") or "")
             subject = str(row.get("subject") or "无主题邮件")
             sender = str(row.get("from") or "发件人未知")
-            summary = " ".join(str(row.get("body_summary") or "").split())
             counts = row.get("counts") or {}
-            if not summary:
-                summary = (
-                    f"附件 {int(counts.get('attachments') or 0)} 个 · "
-                    f"图片 {int(counts.get('inline_images') or 0)} 张 · "
-                    f"链接 {int(counts.get('links') or 0)} 个"
-                )
+            body = str(row.get("body_summary") or "")
+            summary = build_mail_list_summary(
+                body,
+                attachment_count=int(counts.get("attachments") or 0),
+                inline_image_count=int(counts.get("inline_images") or 0),
+                link_count=int(counts.get("links") or 0),
+                downloaded_count=int(counts.get("downloads") or 0),
+                archive_status=str(row.get("archive_status") or ""),
+                parse_status=str(row.get("parse_status") or ""),
+            )
             status = self._mail_archive_status_text(row)
+            tooltip = build_mail_list_tooltip(
+                subject=subject,
+                sender=sender,
+                body=body,
+                attachment_count=int(counts.get("attachments") or 0),
+                inline_image_count=int(counts.get("inline_images") or 0),
+                link_count=int(counts.get("links") or 0),
+                downloaded_count=int(counts.get("downloads") or 0),
+            )
             values = [
                 subject,
                 sender,
-                summary[:260],
+                summary,
                 self._short_time(row.get("received_at") or row.get("saved_at")),
                 status,
                 "",
@@ -3434,7 +3535,7 @@ class BridgeWindow(QMainWindow):
                 item = QTableWidgetItem(value)
                 item.setData(Qt.ItemDataRole.UserRole, package_id)
                 item.setData(Qt.ItemDataRole.UserRole + 1, row)
-                item.setToolTip(value)
+                item.setToolTip(tooltip)
                 table.setItem(index, column, item)
             action = self._button(
                 "查看邮件",
@@ -3444,16 +3545,7 @@ class BridgeWindow(QMainWindow):
             action.setObjectName("compactButton")
             action.setFixedHeight(30)
             table.setCellWidget(index, 5, action)
-            table.resizeRowToContents(index)
-            table.setRowHeight(
-                index,
-                max(
-                    table.rowHeight(index),
-                    self._wrapped_row_height(
-                        table, ((0, subject), (1, sender), (2, summary)), minimum=58
-                    ),
-                ),
-            )
+            table.setRowHeight(index, MAIL_LIST_ROW_HEIGHT)
 
     @staticmethod
     def _mail_archive_status_text(row: dict) -> str:
@@ -3539,36 +3631,83 @@ class BridgeWindow(QMainWindow):
                     item.setForeground(QColor(self._level_color(level)))
                 table.setItem(row_index, column, item)
 
-    def _populate_full_logs(self) -> None:
+    def _populate_full_logs(self, *_args, append: bool = False) -> None:
         if not hasattr(self, "full_logs_table"):
             return
-        selected = self.log_filter.currentText()
-        rows = self.log_rows
-        if selected != "全部级别":
-            rows = [row for row in rows if str(row.get("level", "")).upper() == selected]
-        keyword = self.log_search.text().strip().lower()
-        if keyword:
-            rows = [
-                row for row in rows
-                if keyword in str(row.get("event_type", "")).lower()
-                or keyword in str(row.get("message", "")).lower()
-            ]
-        rows = [row for row in rows if self._matches_time_filter(row.get("created_at"), self.log_time_filter.currentText())]
+        offset = len(self.full_log_rows) if append else 0
+        result = self.service.query_logs(
+            level=self.log_filter.currentText(),
+            category=(
+                "" if self.log_type_filter.currentText() == "全部事件"
+                else self.log_type_filter.currentText()
+            ),
+            date_from=self._log_filter_date_from(),
+            search=self.log_search.text().strip(),
+            include_daily_checks=self.log_daily_check.isChecked(),
+            limit=self.log_page_size,
+            offset=offset,
+        )
+        if not result.ok:
+            self.show_message(result.message or "读取技术日志失败", "error")
+            return
+        page_rows = result.details.get("events", [])
+        self.log_query_total = int(result.details.get("total") or 0)
+        self.full_log_rows = (
+            self.full_log_rows + page_rows if append else list(page_rows)
+        )
         self.full_logs_table.setRowCount(0)
-        for index, row in enumerate(rows):
+        for index, row in enumerate(self.full_log_rows):
             self.full_logs_table.insertRow(index)
             level = str(row.get("level", "INFO")).upper()
             values = [
                 self._short_time(row.get("created_at"), include_date=True),
                 level,
-                str(row.get("event_type", "")),
+                str(row.get("category") or "系统与诊断"),
                 str(row.get("message", "")),
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
+                item.setData(Qt.ItemDataRole.UserRole + 1, row)
                 if column == 1:
                     item.setForeground(QColor(self._level_color(level)))
                 self.full_logs_table.setItem(index, column, item)
+        displayed = len(self.full_log_rows)
+        self.log_load_more_button.setText(
+            f"加载更多（已显示 {displayed} / {self.log_query_total}）"
+        )
+        self.log_load_more_button.setEnabled(displayed < self.log_query_total)
+        self._update_log_overview()
+
+    def _load_more_logs(self) -> None:
+        self._populate_full_logs(append=True)
+
+    def _log_filter_date_from(self) -> str | None:
+        selected = self.log_time_filter.currentText()
+        now = datetime.now()
+        if selected == "今天":
+            return now.strftime("%Y-%m-%d")
+        if selected == "最近 7 天":
+            return (now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+        if selected == "最近 30 天":
+            return (now - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+        return None
+
+    def _update_log_overview(self) -> None:
+        overview = self.service.get_log_overview()
+        if not overview.ok:
+            self.log_overview_label.setText("技术日志概览暂不可用")
+            return
+        details = overview.details
+        last_cleanup = self._short_time(
+            details.get("last_cleanup_at"), include_date=True
+        )
+        self.log_overview_label.setText(
+            f"当前技术事件 {int(details.get('total') or 0)} 条 · "
+            f"今日警告/错误 {int(details.get('today_errors') or 0)} 条 · "
+            f"自动保留：普通 {details.get('normal_days')} 天 / "
+            f"错误 {details.get('error_days')} 天 / 最多 {int(details.get('max_count') or 0):,} 条 · "
+            f"当前过期 {int(details.get('expired') or 0)} 条 · 上次清理 {last_cleanup}"
+        )
 
     def _populate_sent_history(self) -> None:
         rows = self.history_rows.get("sent", [])
@@ -3582,21 +3721,26 @@ class BridgeWindow(QMainWindow):
                 or Path(path).name
                 or "无主题邮件"
             )
-            body = " ".join(str(row.get("body_text") or "").split())
-            if not body:
-                body = (
-                    f"附件 {int(row.get('attachment_count') or 0)} 个 · "
-                    f"链接 {int(row.get('link_count') or 0)} 个"
-                )
+            body = str(row.get("body_text") or "")
             origin = {
                 "manual_gui": "手动发件",
                 "agent_mcp": "Agent 发送",
                 "legacy_sent_file": "旧发送记录",
             }.get(str(row.get("source_origin") or ""), "受控发送")
             outbound_id = str(row.get("outbound_id") or "")
+            summary = build_outbound_list_summary(
+                body,
+                attachment_count=int(row.get("attachment_count") or 0),
+                link_count=int(row.get("link_count") or 0),
+                source_origin=str(row.get("source_origin") or ""),
+            )
+            tooltip = (
+                f"主题：{subject}\n来源：{origin}\n内容：{summary}\n"
+                "双击查看完整发送详情。"
+            )
             values = [
                 subject,
-                body[:180],
+                summary,
                 origin,
                 self._short_time(
                     row.get("sent_at") or row.get("created_at"), include_date=True
@@ -3608,7 +3752,7 @@ class BridgeWindow(QMainWindow):
                 item = QTableWidgetItem(value)
                 item.setData(Qt.ItemDataRole.UserRole, outbound_id)
                 item.setData(Qt.ItemDataRole.UserRole + 1, row)
-                item.setToolTip(value)
+                item.setToolTip(tooltip)
                 self.sent_table.setItem(index, column, item)
             detail = self._button(
                 "查看详情",
@@ -3620,16 +3764,7 @@ class BridgeWindow(QMainWindow):
             )
             detail.setObjectName("compactButton")
             self.sent_table.setCellWidget(index, 5, detail)
-            self.sent_table.resizeRowToContents(index)
-            self.sent_table.setRowHeight(
-                index,
-                max(
-                    self.sent_table.rowHeight(index),
-                    self._wrapped_row_height(
-                        self.sent_table, ((0, subject), (1, body)), minimum=48
-                    ),
-                ),
-            )
+            self.sent_table.setRowHeight(index, MAIL_LIST_ROW_HEIGHT)
 
     def _populate_history(self) -> None:
         received = [
@@ -3821,18 +3956,42 @@ class BridgeWindow(QMainWindow):
             for column, value in enumerate(values):
                 self.mcp_table.setItem(index, column, QTableWidgetItem(value))
 
-    def _filter_inbox(self, text: str) -> None:
-        keyword = text.strip().lower()
+    def _schedule_inbox_filter(self, _text: str = "") -> None:
+        self.inbox_search_timer.start()
+
+    def _filter_inbox(self, text: str | None = None) -> None:
+        keyword = (
+            str(text) if text is not None else self.inbox_search.text()
+        ).strip()
         if not keyword:
             rows = self.mail_rows
         else:
-            rows = [
-                row for row in self.mail_rows
-                if keyword in str(row.get("from", "")).lower()
-                or keyword in str(row.get("subject", "")).lower()
-                or keyword in str(row.get("body_summary", "")).lower()
-            ]
+            today = datetime.now().strftime("%Y-%m-%d")
+            result = self.service.search_mail_facts(
+                keyword,
+                date_from=today,
+                date_to=f"{today}\uffff",
+                limit=500,
+            )
+            if not result.ok:
+                self.show_message(result.message or "邮件搜索失败", "error")
+                rows = []
+            else:
+                rows = result.details.get("messages", [])
         self._populate_inbox_messages(rows)
+
+    def _open_sent_record(self, row: int, column: int) -> None:
+        if column == 5:
+            return
+        item = self.sent_table.item(row, 0)
+        if item is None:
+            return
+        outbound_id = str(item.data(Qt.ItemDataRole.UserRole) or "")
+        details = item.data(Qt.ItemDataRole.UserRole + 1) or {}
+        if outbound_id:
+            self.show_outbound_detail(outbound_id, "send")
+        elif details:
+            self._show_history_detail_data(dict(details))
 
     @staticmethod
     def _matches_time_filter(value, selected: str) -> bool:
@@ -4560,8 +4719,28 @@ class BridgeWindow(QMainWindow):
         self._reveal_file(Path(path)) if path else self.show_message("当前记录没有可定位文件", "warning")
 
     def _show_log_detail(self, row: int, _column: int) -> None:
-        values = [self.full_logs_table.item(row, column).text() for column in range(self.full_logs_table.columnCount())]
-        QMessageBox.information(self, "日志详情", "\n".join(values))
+        item = self.full_logs_table.item(row, 0)
+        details = item.data(Qt.ItemDataRole.UserRole + 1) if item else None
+        if not isinstance(details, dict):
+            return
+        level = str(details.get("level") or "INFO").upper()
+        advice = (
+            "建议检查对应账号、网络或数据目录，并按需导出脱敏诊断信息。"
+            if level in {"WARNING", "ERROR", "FAILED"}
+            else "无需处理。"
+        )
+        message = self._redact_error_details(str(details.get("message") or ""))
+        QMessageBox.information(
+            self,
+            "日志详情",
+            "\n".join((
+                f"时间：{details.get('created_at') or '—'}",
+                f"级别：{level}",
+                f"事件类型：{details.get('category') or '系统与诊断'}",
+                f"消息：{message}",
+                f"处理建议：{advice}",
+            )),
+        )
 
     def show_selected_log_detail(self) -> None:
         row = self.full_logs_table.currentRow()
@@ -4573,6 +4752,104 @@ class BridgeWindow(QMainWindow):
     def open_log_folder(self) -> None:
         folder = self.service.cfg.data_root_path / "logs"
         self.open_managed_directory(folder)
+
+    def save_log_retention_settings(self) -> None:
+        normal_days = int(self.log_normal_retention.currentData())
+        error_days = int(self.log_error_retention.currentData())
+        max_count = int(self.log_max_count.currentData())
+        result = self.service.set_log_retention(
+            normal_days=normal_days,
+            error_days=error_days,
+            max_count=max_count,
+        )
+        if not result.ok:
+            self._show_service_result(result)
+            return
+        try:
+            save_env_values({
+                "NORMAL_LOG_RETENTION_DAYS": str(normal_days),
+                "WARNING_ERROR_LOG_RETENTION_DAYS": str(error_days),
+                "APP_EVENT_MAX_COUNT": str(max_count),
+            })
+        except OSError as exc:
+            self.show_message(f"日志保留设置未能持久化：{exc}", "error")
+            return
+        log_event(
+            self.service.cfg.db_path,
+            "SUCCESS",
+            "config",
+            f"日志保留设置已更新：普通 {normal_days} 天，错误 {error_days} 天，上限 {max_count} 条",
+        )
+        self._update_log_overview()
+        self.show_message("日志保留设置已保存，重启后仍会生效", "success")
+
+    def prune_technical_logs(self) -> None:
+        self._run_task(
+            "正在清理过期技术日志",
+            self.service.prune_logs,
+            self._after_log_maintenance,
+            operation_name="技术日志清理",
+            working_text="正在清理…",
+        )
+
+    def clear_daily_check_logs(self) -> None:
+        self._run_task(
+            "正在清除日常自动检查记录",
+            self.service.clear_daily_check_logs,
+            self._after_log_maintenance,
+            operation_name="清除日常检查",
+            working_text="正在清除…",
+        )
+
+    def clear_all_technical_logs(self) -> None:
+        choice = QMessageBox.question(
+            self,
+            "清空全部技术日志",
+            "只删除技术日志，不会删除邮件、附件、收发历史、Agent 交付记录或 MCP 审计。确定继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if choice != QMessageBox.StandardButton.Yes:
+            return
+        self._run_task(
+            "正在清空技术日志",
+            self.service.clear_all_technical_logs,
+            self._after_log_maintenance,
+            operation_name="清空技术日志",
+            working_text="正在清空…",
+        )
+
+    def _after_log_maintenance(self, result: ServiceResult) -> None:
+        self._show_service_result(result)
+        self._populate_full_logs()
+
+    def export_current_log_filter(self) -> None:
+        destination, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出当前筛选日志",
+            str(self.service.cfg.data_root_path / "filtered-technical-logs.csv"),
+            "CSV 文件 (*.csv)",
+        )
+        if not destination:
+            return
+        filters = {
+            "level": self.log_filter.currentText(),
+            "category": (
+                "" if self.log_type_filter.currentText() == "全部事件"
+                else self.log_type_filter.currentText()
+            ),
+            "date_from": self._log_filter_date_from(),
+            "search": self.log_search.text().strip(),
+            "include_daily_checks": self.log_daily_check.isChecked(),
+        }
+        self._run_task(
+            "正在导出当前筛选日志",
+            lambda: self.service.export_filtered_logs(destination, **filters),
+            self._show_service_result,
+            button=self.log_export_filtered_button,
+            operation_name="筛选日志导出",
+            working_text="正在导出…",
+        )
 
     def _open_project_file(self, filename: str) -> None:
         root = get_runtime_paths().resource_root.parent if get_runtime_paths().frozen else Path(__file__).resolve().parents[2]
@@ -4947,10 +5224,15 @@ class BridgeWindow(QMainWindow):
         self._update_auto_receive_status(
             self.service.get_auto_receive_state().details
         )
-        self._run_task("自动收件正在运行", self.service.receive, self._finish_auto_receive)
+        self._run_task(
+            "自动收件正在运行",
+            lambda: self.service.receive(automatic=True),
+            self._finish_auto_receive,
+        )
 
     def _watchdog_auto_receive(self) -> None:
         """睡眠、长暂停或事件循环阻塞恢复后尽快补偿检查。"""
+        self.service.schedule_event_maintenance()
         if not self.auto_switch.isChecked() or self.task_active:
             return
         state = self.service.get_auto_receive_state().details
@@ -4995,6 +5277,15 @@ class BridgeWindow(QMainWindow):
         now_text = datetime.now().isoformat(sep=" ", timespec="seconds")
         if result.status in {OperationStatus.FAILED, OperationStatus.AUTH_REQUIRED}:
             self.auto_failures += 1
+            if self.auto_failures == 1:
+                log_event(
+                    self.service.cfg.db_path,
+                    "WARNING",
+                    "receive",
+                    "自动收件进入连接退避："
+                    f"{self._redact_error_details(result.message or result.error_code or '连接失败')}；"
+                    "调度器将按策略自动重试",
+                )
             delay = AUTO_RECEIVE_BACKOFF_SECONDS[
                 min(self.auto_failures - 1, len(AUTO_RECEIVE_BACKOFF_SECONDS) - 1)
             ]
@@ -5006,7 +5297,15 @@ class BridgeWindow(QMainWindow):
             )
             self._schedule_auto_receive(delay)
             return
+        recovered = self.auto_failures > 0
         self.auto_failures = 0
+        if recovered:
+            log_event(
+                self.service.cfg.db_path,
+                "SUCCESS",
+                "receive",
+                "自动收件连接已恢复并退出全局退避",
+            )
         result_text = {
             OperationStatus.NO_CHANGES: "暂无新邮件",
             OperationStatus.PARTIAL: "部分完成，失败项已隔离重试",

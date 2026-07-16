@@ -23,6 +23,26 @@ from agent_mail_bridge.utils import fmt_datetime, now_local
 # 每线程连接缓存
 _local = threading.local()
 
+DEFAULT_NORMAL_EVENT_RETENTION_DAYS = 30
+DEFAULT_ERROR_EVENT_RETENTION_DAYS = 90
+DEFAULT_APP_EVENT_MAX_COUNT = 10_000
+APP_EVENT_TARGET_RATIO = 0.8
+_event_retention_limits: dict[str, int] = {}
+_event_limit_lock = threading.Lock()
+
+_DAILY_CHECK_SQL = """
+(
+    lower(event_type) IN ('receive', 'receive_auto', 'auto_receive')
+    AND (
+        message LIKE '%开始收取邮件%'
+        OR message LIKE '%开始通过 Gmail API 收取邮件%'
+        OR message LIKE '%暂无新邮件%'
+        OR message LIKE '%暂时没有新邮件%'
+        OR message LIKE '%新存 0 封%'
+    )
+)
+"""
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS received_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -311,6 +331,10 @@ CREATE INDEX IF NOT EXISTS idx_sent_files_sent_date
     ON sent_files(sent_at);
 CREATE INDEX IF NOT EXISTS idx_app_events_created
     ON app_events(created_at);
+CREATE INDEX IF NOT EXISTS idx_app_events_level_created
+    ON app_events(level, created_at);
+CREATE INDEX IF NOT EXISTS idx_app_events_type_created
+    ON app_events(event_type, created_at);
 CREATE INDEX IF NOT EXISTS idx_mcp_calls_created
     ON mcp_calls(created_at);
 CREATE INDEX IF NOT EXISTS idx_mcp_calls_request_id
@@ -2151,7 +2175,7 @@ def log_event(
     """
     now = _now()
     with _get_conn(db_path) as conn:
-        conn.execute(
+        cursor = conn.execute(
             """
             INSERT INTO app_events (level, event_type, message, created_at)
             VALUES (?, ?, ?, ?)
@@ -2159,16 +2183,217 @@ def log_event(
             (level, event_type, message, now),
         )
         conn.commit()
+        event_id = int(cursor.lastrowid or 0)
+        if event_id:
+            _schedule_app_event_count_prune(conn, db_path)
 
 
 def query_recent_events(
-    db_path: Path | str, limit: int = 50
+    db_path: Path | str, limit: int = 50, *, include_daily_checks: bool = True
 ) -> list[dict[str, Any]]:
     """查询最近 N 条事件。"""
     with _get_conn(db_path) as conn:
+        where = "" if include_daily_checks else f" WHERE NOT {_DAILY_CHECK_SQL}"
         rows = conn.execute(
-            "SELECT * FROM app_events ORDER BY id DESC LIMIT ?",
-            (limit,),
+            f"SELECT * FROM app_events{where} ORDER BY id DESC LIMIT ?",
+            (max(1, int(limit)),),
         ).fetchall()
         # 保持最新事件在前，界面打开即可看到最新日志。
         return [dict(r) for r in rows]
+
+
+def configure_app_event_retention(db_path: Path | str, *, max_count: int) -> None:
+    """登记当前进程使用的硬上限，供事件插入边界检查使用。"""
+    _event_retention_limits[str(Path(db_path).resolve())] = max(100, int(max_count))
+
+
+def query_app_events(
+    db_path: Path | str,
+    *,
+    levels: tuple[str, ...] = (),
+    event_types: tuple[str, ...] = (),
+    date_from: str | None = None,
+    search: str = "",
+    include_daily_checks: bool = False,
+    limit: int = 150,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """组合筛选技术事件，查询始终分页且不加载全部 app_events。"""
+    where: list[str] = []
+    params: list[Any] = []
+    normalized_levels = tuple(str(item).upper() for item in levels if str(item).strip())
+    if normalized_levels:
+        placeholders = ",".join("?" for _ in normalized_levels)
+        where.append(f"upper(level) IN ({placeholders})")
+        params.extend(normalized_levels)
+    normalized_types = tuple(str(item).lower() for item in event_types if str(item).strip())
+    if normalized_types:
+        placeholders = ",".join("?" for _ in normalized_types)
+        where.append(f"lower(event_type) IN ({placeholders})")
+        params.extend(normalized_types)
+    if date_from:
+        where.append("created_at >= ?")
+        params.append(str(date_from))
+    keyword = " ".join(str(search or "").split())
+    if keyword:
+        for token in keyword.split(" "):
+            pattern = f"%{token}%"
+            where.append(
+                "(message LIKE ? COLLATE NOCASE OR event_type LIKE ? COLLATE NOCASE "
+                "OR level LIKE ? COLLATE NOCASE)"
+            )
+            params.extend((pattern, pattern, pattern))
+    if not include_daily_checks:
+        where.append(f"NOT {_DAILY_CHECK_SQL}")
+    clause = " WHERE " + " AND ".join(where) if where else ""
+    safe_limit = min(500, max(1, int(limit)))
+    safe_offset = max(0, int(offset))
+    with _get_conn(db_path) as conn:
+        total = int(conn.execute(
+            f"SELECT COUNT(*) FROM app_events{clause}", params
+        ).fetchone()[0])
+        rows = conn.execute(
+            f"SELECT * FROM app_events{clause} ORDER BY id DESC LIMIT ? OFFSET ?",
+            (*params, safe_limit, safe_offset),
+        ).fetchall()
+    return {"events": [dict(row) for row in rows], "total": total}
+
+
+def app_event_overview(
+    db_path: Path | str,
+    *,
+    normal_days: int = DEFAULT_NORMAL_EVENT_RETENTION_DAYS,
+    error_days: int = DEFAULT_ERROR_EVENT_RETENTION_DAYS,
+) -> dict[str, Any]:
+    now = now_local()
+    today = now.strftime("%Y-%m-%d")
+    normal_cutoff = fmt_datetime(now - timedelta(days=max(1, int(normal_days))))
+    error_cutoff = fmt_datetime(now - timedelta(days=max(1, int(error_days))))
+    with _get_conn(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN created_at >= ? AND upper(level) IN ('WARNING', 'ERROR', 'FAILED') THEN 1 ELSE 0 END) AS today_errors,
+                SUM(CASE WHEN """ + _DAILY_CHECK_SQL + """ THEN 1 ELSE 0 END) AS daily_checks,
+                SUM(CASE
+                    WHEN upper(level) IN ('WARNING', 'ERROR', 'FAILED') AND created_at < ? THEN 1
+                    WHEN upper(level) NOT IN ('WARNING', 'ERROR', 'FAILED') AND created_at < ? THEN 1
+                    ELSE 0 END) AS expired
+            FROM app_events
+            """,
+            (today, error_cutoff, normal_cutoff),
+        ).fetchone()
+        last_cleanup = conn.execute(
+            "SELECT created_at, message FROM app_events "
+            "WHERE event_type = 'log_maintenance' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    return {
+        "total": int(row["total"] or 0),
+        "today_errors": int(row["today_errors"] or 0),
+        "daily_checks": int(row["daily_checks"] or 0),
+        "expired": int(row["expired"] or 0),
+        "last_cleanup_at": last_cleanup["created_at"] if last_cleanup else None,
+    }
+
+
+def prune_app_events(
+    db_path: Path | str,
+    *,
+    normal_days: int = DEFAULT_NORMAL_EVENT_RETENTION_DAYS,
+    error_days: int = DEFAULT_ERROR_EVENT_RETENTION_DAYS,
+    max_count: int = DEFAULT_APP_EVENT_MAX_COUNT,
+    now: datetime | None = None,
+) -> dict[str, int]:
+    """仅清理 app_events：先按时间，再按硬上限批量降到 80%。"""
+    moment = now or now_local()
+    normal_cutoff = fmt_datetime(moment - timedelta(days=max(1, int(normal_days))))
+    error_cutoff = fmt_datetime(moment - timedelta(days=max(1, int(error_days))))
+    safe_max = max(100, int(max_count))
+    with _get_conn(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        before = int(conn.execute("SELECT COUNT(*) FROM app_events").fetchone()[0])
+        cursor = conn.execute(
+            """
+            DELETE FROM app_events
+            WHERE (
+                upper(level) IN ('WARNING', 'ERROR', 'FAILED') AND created_at < ?
+            ) OR (
+                upper(level) NOT IN ('WARNING', 'ERROR', 'FAILED') AND created_at < ?
+            )
+            """,
+            (error_cutoff, normal_cutoff),
+        )
+        deleted_by_age = max(0, int(cursor.rowcount or 0))
+        remaining = int(conn.execute("SELECT COUNT(*) FROM app_events").fetchone()[0])
+        deleted_by_count = 0
+        if remaining > safe_max:
+            target = max(1, int(safe_max * APP_EVENT_TARGET_RATIO))
+            deleted_by_count = remaining - target
+            conn.execute(
+                "DELETE FROM app_events WHERE id IN ("
+                "SELECT id FROM app_events ORDER BY id ASC LIMIT ?)",
+                (deleted_by_count,),
+            )
+        after = int(conn.execute("SELECT COUNT(*) FROM app_events").fetchone()[0])
+        conn.commit()
+    return {
+        "before": before,
+        "deleted_by_age": deleted_by_age,
+        "deleted_by_count": deleted_by_count,
+        "deleted": before - after,
+        "after": after,
+    }
+
+
+def clear_daily_check_events(db_path: Path | str) -> int:
+    with _get_conn(db_path) as conn:
+        cursor = conn.execute(f"DELETE FROM app_events WHERE {_DAILY_CHECK_SQL}")
+        conn.commit()
+        return max(0, int(cursor.rowcount or 0))
+
+
+def clear_all_app_events(db_path: Path | str) -> int:
+    with _get_conn(db_path) as conn:
+        cursor = conn.execute("DELETE FROM app_events")
+        conn.commit()
+        return max(0, int(cursor.rowcount or 0))
+
+
+def _schedule_app_event_count_prune(
+    conn: sqlite3.Connection, db_path: Path | str
+) -> None:
+    """超限时只调度后台批量删除，日志写入线程不承担大事务。"""
+    key = str(Path(db_path).resolve())
+    safe_max = _event_retention_limits.get(key, DEFAULT_APP_EVENT_MAX_COUNT)
+    count = int(conn.execute("SELECT COUNT(*) FROM app_events").fetchone()[0])
+    if count <= safe_max:
+        return
+    if not _event_limit_lock.acquire(blocking=False):
+        return
+
+    def run() -> None:
+        try:
+            target = max(1, int(safe_max * APP_EVENT_TARGET_RATIO))
+            with _get_conn(db_path) as background_conn:
+                background_conn.execute("BEGIN IMMEDIATE")
+                current = int(
+                    background_conn.execute(
+                        "SELECT COUNT(*) FROM app_events"
+                    ).fetchone()[0]
+                )
+                if current > safe_max:
+                    background_conn.execute(
+                        "DELETE FROM app_events WHERE id IN ("
+                        "SELECT id FROM app_events ORDER BY id ASC LIMIT ?)",
+                        (current - target,),
+                    )
+                background_conn.commit()
+        finally:
+            _event_limit_lock.release()
+
+    threading.Thread(
+        target=run,
+        name="AgentMailBridgeEventCap",
+        daemon=True,
+    ).start()

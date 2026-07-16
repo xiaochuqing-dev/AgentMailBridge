@@ -334,15 +334,25 @@ def test_rule_save_failure_keeps_previous_effective_config(
 def test_manual_and_automatic_receive_call_the_same_service_operation(
     specialty_window, monkeypatch
 ):
-    automatic = []
+    operations = []
+    calls = []
+    monkeypatch.setattr(
+        specialty_window.service,
+        "receive",
+        lambda **kwargs: calls.append(kwargs),
+    )
     monkeypatch.setattr(
         specialty_window,
         "_run_task",
-        lambda _title, operation, _callback, **_kwargs: automatic.append(operation),
+        lambda _title, operation, _callback, **_kwargs: operations.append(operation),
     )
+    specialty_window.receive()
     specialty_window.auto_switch.setChecked(True)
     specialty_window._automatic_receive()
-    assert automatic and automatic[0] == specialty_window.service.receive
+    assert len(operations) == 2
+    operations[0]()
+    operations[1]()
+    assert calls == [{}, {"automatic": True}]
 
 
 def test_history_main_table_is_productized_and_detail_is_structured(

@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 import re
 from datetime import datetime
-from email.header import decode_header, make_header
+from email.header import Header, decode_header
 from pathlib import Path
 
 # Windows / macOS / Linux 均不适合作文件名的字符
@@ -113,9 +113,17 @@ def decode_mime_header(value: str | None) -> str:
     if not value:
         return ""
     try:
-        return str(make_header(decode_header(value)))
+        from agent_mail_bridge.mail_common import decode_text_bytes
+
+        decoded = Header()
+        for fragment, charset in decode_header(value):
+            if isinstance(fragment, bytes):
+                text = decode_text_bytes(fragment, declared_charset=charset)
+            else:
+                text = fragment
+            decoded.append(text)
+        return str(decoded)
     except Exception:
-        # 解码失败时尽量保留原文
         return value
 
 

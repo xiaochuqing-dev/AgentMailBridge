@@ -138,19 +138,36 @@ def search_mail_facts(
     limit: int = 100,
     offset: int = 0,
 ) -> list[dict[str, Any]]:
-    keyword = (query or "").strip()
+    keyword = " ".join((query or "").split())
     if not keyword:
         return []
-    pattern = f"%{keyword}%"
-    where = [
-        "(p.subject LIKE ? COLLATE NOCASE OR p.from_email LIKE ? COLLATE NOCASE "
-        "OR p.to_emails LIKE ? COLLATE NOCASE OR p.cc_emails LIKE ? COLLATE NOCASE "
-        "OR p.search_text LIKE ? COLLATE NOCASE OR EXISTS ("
-        "SELECT 1 FROM mail_resources r WHERE r.package_id = p.package_id AND ("
-        "r.display_name LIKE ? COLLATE NOCASE OR r.original_name LIKE ? COLLATE NOCASE "
-        "OR r.original_url LIKE ? COLLATE NOCASE)))"
-    ]
-    params: list[Any] = [pattern] * 8
+    where: list[str] = []
+    params: list[Any] = []
+    for token in keyword.split(" "):
+        pattern = f"%{token}%"
+        status_values = _matching_status_values(token)
+        status_clause = ""
+        if status_values:
+            placeholders = ",".join("?" for _ in status_values)
+            status_clause = (
+                f" OR lower(p.archive_status) IN ({placeholders})"
+                f" OR lower(p.parse_status) IN ({placeholders})"
+            )
+        where.append(
+            "(p.subject LIKE ? COLLATE NOCASE OR p.from_email LIKE ? COLLATE NOCASE "
+            "OR p.to_emails LIKE ? COLLATE NOCASE OR p.cc_emails LIKE ? COLLATE NOCASE "
+            "OR p.bcc_emails LIKE ? COLLATE NOCASE "
+            "OR p.search_text LIKE ? COLLATE NOCASE "
+            "OR p.archive_status LIKE ? COLLATE NOCASE "
+            "OR p.parse_status LIKE ? COLLATE NOCASE OR EXISTS ("
+            "SELECT 1 FROM mail_resources r WHERE r.package_id = p.package_id AND ("
+            "r.display_name LIKE ? COLLATE NOCASE OR r.original_name LIKE ? COLLATE NOCASE "
+            "OR r.original_url LIKE ? COLLATE NOCASE OR r.status LIKE ? COLLATE NOCASE))"
+            f"{status_clause})"
+        )
+        params.extend([pattern] * 12)
+        params.extend(status_values)
+        params.extend(status_values)
     if account_ref:
         where.append("p.account_ref = ?")
         params.append(account_ref)
@@ -191,7 +208,7 @@ def _package_dto(row: dict[str, Any]) -> dict[str, Any]:
         "sent_at": row.get("sent_at"),
         "received_at": row.get("received_at"),
         "saved_at": row.get("saved_at"),
-        "body_summary": body[:500],
+        "body_summary": body[:800],
         "body": {
             "plain_path": row.get("body_plain_path"),
             "html_path": row.get("body_html_path"),
@@ -219,6 +236,25 @@ def _package_dto(row: dict[str, Any]) -> dict[str, Any]:
         "package_root": package_root,
         "legacy": bool(row.get("legacy")),
     }
+
+
+def _matching_status_values(token: str) -> list[str]:
+    normalized = str(token or "").strip().casefold()
+    if not normalized:
+        return []
+    labels = {
+        "ready": "已归档",
+        "saved": "已归档",
+        "normal": "已归档",
+        "partial": "部分完成",
+        "failed": "处理失败",
+        "needs_attention": "需要处理",
+        "staging": "处理中",
+    }
+    return [
+        value for value, label in labels.items()
+        if normalized in label.casefold() or label.casefold() in normalized
+    ]
 
 
 def _resource_dto(

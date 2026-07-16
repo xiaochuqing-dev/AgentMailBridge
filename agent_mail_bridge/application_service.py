@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import csv
 import smtplib
 import ssl
 import platform
 import os
+import re
 import sys
 import threading
 import uuid
 import shutil
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +30,10 @@ from agent_mail_bridge.credentials import (
     QQ_SMTP_SECRET,
 )
 from agent_mail_bridge.database import (
+    app_event_overview,
+    clear_all_app_events,
+    clear_daily_check_events,
+    configure_app_event_retention,
     count_receive_retries,
     get_auto_receive_state,
     init_db,
@@ -39,6 +45,7 @@ from agent_mail_bridge.database import (
     query_recent_mcp_calls,
     query_recent_outbound_messages,
     query_recent_events,
+    query_app_events,
     query_recent_received_messages,
     query_recent_sent_files,
     query_trusted_domains,
@@ -48,10 +55,11 @@ from agent_mail_bridge.database import (
     save_auto_receive_state,
     delete_trusted_domain,
     upsert_trusted_domain,
+    prune_app_events,
 )
 from agent_mail_bridge.file_index import list_received_files_for_date, scan_file_status
 from agent_mail_bridge.gmail_api_auth import get_oauth_state
-from agent_mail_bridge.logging_setup import setup_logging
+from agent_mail_bridge.logging_setup import get_logger, setup_logging
 from agent_mail_bridge.mail_receive import receive_mails
 from agent_mail_bridge.mail_archive import backfill_legacy_mail_packages
 from agent_mail_bridge.mail_facts import (
@@ -87,6 +95,18 @@ from agent_mail_bridge.trusted_downloads import normalize_trusted_domain
 from agent_mail_bridge.utils import fmt_date, sanitize_filename, sha256_of_file
 
 
+logger = get_logger("application_service")
+
+LOG_EVENT_CATEGORIES: dict[str, tuple[str, ...]] = {
+    "收件": ("receive", "receive_auto", "auto_receive"),
+    "发件": ("send", "sent", "outbound"),
+    "Agent / MCP": ("mcp", "agent"),
+    "配置": ("config", "oauth", "credential"),
+    "数据库与文件": ("db", "database", "file", "maintenance", "log_maintenance"),
+    "系统与诊断": ("system", "diagnostic", "network", "startup"),
+}
+
+
 class _McpStagingHandled(Exception):
     """携带已产品化的 staging 拒绝结果，避免落入内部错误。"""
 
@@ -103,6 +123,9 @@ class ApplicationService:
         self._receive_lock = threading.Lock()
         self._setup_lock = threading.Lock()
         self._maintenance_lock = threading.Lock()
+        self._event_maintenance_lock = threading.Lock()
+        self._last_event_maintenance_at: datetime | None = None
+        self._last_event_maintenance_result: dict[str, int] = {}
         self._ready = False
         if os.getenv("AGENT_MAIL_BRIDGE_DISABLE_CREDENTIAL_STORE") == "1":
             self._credentials = CredentialService(
@@ -118,6 +141,7 @@ class ApplicationService:
 
     def initialize(self) -> ServiceResult:
         """初始化安全目录、数据库和日志。"""
+        initialized_now = False
         with self._setup_lock:
             if not self._ready:
                 ensure_data_dirs(self.cfg)
@@ -138,7 +162,13 @@ class ApplicationService:
                             f"旧邮件归档迁移部分完成：成功 {migration.get('migrated', 0)}，失败 {migration.get('failed', 0)}",
                         )
                 setup_logging(self.cfg.logs_dir, self.cfg.log_level)
+                configure_app_event_retention(
+                    self.cfg.db_path, max_count=self.cfg.app_event_max_count
+                )
                 self._ready = True
+                initialized_now = True
+        if initialized_now:
+            self.schedule_event_maintenance(force=True)
         return ServiceResult(OperationStatus.SUCCESS, message="初始化完成")
 
     def get_credential_status(self) -> ServiceResult:
@@ -245,6 +275,7 @@ class ApplicationService:
         limit: int | None = None,
         unseen_only: bool | None = None,
         mark_seen: bool | None = None,
+        automatic: bool = False,
     ) -> ReceiveResult:
         """执行一次互斥收件，普通收件绝不启动浏览器授权。"""
         self.initialize()
@@ -275,6 +306,7 @@ class ApplicationService:
                 raw = receive_mails(
                     self.cfg, limit=limit,
                     unseen_only=unseen_only, mark_seen=mark_seen,
+                    automatic=automatic,
                 )
             except ConfigError as exc:
                 return ReceiveResult(
@@ -1121,11 +1153,229 @@ class ApplicationService:
             details={"files": rows},
         )
 
-    def get_recent_logs(self, limit: int = 50) -> ServiceResult:
+    def get_recent_logs(
+        self, limit: int = 50, *, include_daily_checks: bool = False
+    ) -> ServiceResult:
         self.initialize()
         return ServiceResult(
             OperationStatus.SUCCESS,
-            details={"events": query_recent_events(self.cfg.db_path, max(1, limit))},
+            details={
+                "events": query_recent_events(
+                    self.cfg.db_path,
+                    max(1, limit),
+                    include_daily_checks=include_daily_checks,
+                )
+            },
+        )
+
+    def query_logs(
+        self,
+        *,
+        level: str = "",
+        category: str = "",
+        date_from: str | None = None,
+        search: str = "",
+        include_daily_checks: bool = False,
+        limit: int = 150,
+        offset: int = 0,
+    ) -> ServiceResult:
+        self.initialize()
+        levels = (level,) if level and level != "全部级别" else ()
+        event_types = LOG_EVENT_CATEGORIES.get(category, ())
+        result = query_app_events(
+            self.cfg.db_path,
+            levels=levels,
+            event_types=event_types,
+            date_from=date_from,
+            search=search,
+            include_daily_checks=include_daily_checks,
+            limit=limit,
+            offset=offset,
+        )
+        for event in result["events"]:
+            event["category"] = _event_category(str(event.get("event_type") or ""))
+        return ServiceResult(OperationStatus.SUCCESS, details=result)
+
+    def get_log_overview(self) -> ServiceResult:
+        self.initialize()
+        details = app_event_overview(
+            self.cfg.db_path,
+            normal_days=self.cfg.normal_log_retention_days,
+            error_days=self.cfg.warning_error_log_retention_days,
+        )
+        details.update({
+            "normal_days": self.cfg.normal_log_retention_days,
+            "error_days": self.cfg.warning_error_log_retention_days,
+            "max_count": self.cfg.app_event_max_count,
+            "last_run_result": dict(self._last_event_maintenance_result),
+        })
+        return ServiceResult(OperationStatus.SUCCESS, details=details)
+
+    def set_log_retention(
+        self, *, normal_days: int, error_days: int, max_count: int
+    ) -> ServiceResult:
+        self.initialize()
+        if normal_days not in {7, 30, 90}:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="invalid_normal_retention",
+                message="普通日志保留天数不受支持",
+            )
+        if error_days not in {30, 90, 180}:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="invalid_error_retention",
+                message="错误日志保留天数不受支持",
+            )
+        if max_count not in {5_000, 10_000, 20_000}:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="invalid_event_max_count",
+                message="技术事件数量上限不受支持",
+            )
+        self.cfg.normal_log_retention_days = normal_days
+        self.cfg.warning_error_log_retention_days = error_days
+        self.cfg.app_event_max_count = max_count
+        configure_app_event_retention(self.cfg.db_path, max_count=max_count)
+        return ServiceResult(OperationStatus.SUCCESS, message="日志保留设置已更新")
+
+    def prune_logs(self, *, record_event: bool = True) -> ServiceResult:
+        self.initialize()
+        try:
+            details = prune_app_events(
+                self.cfg.db_path,
+                normal_days=self.cfg.normal_log_retention_days,
+                error_days=self.cfg.warning_error_log_retention_days,
+                max_count=self.cfg.app_event_max_count,
+            )
+            self._last_event_maintenance_result = dict(details)
+            self._last_event_maintenance_at = datetime.now()
+            if record_event:
+                log_event(
+                    self.cfg.db_path,
+                    "SUCCESS",
+                    "log_maintenance",
+                    f"技术日志清理完成：删除 {details['deleted']} 条，剩余 {details['after']} 条",
+                )
+            return ServiceResult(
+                OperationStatus.SUCCESS,
+                message=f"已清理 {details['deleted']} 条过期或超限技术日志",
+                details=details,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("技术日志清理失败")
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="log_prune_failed",
+                message=f"技术日志清理失败：{exc}",
+            )
+
+    def schedule_event_maintenance(self, *, force: bool = False) -> bool:
+        """启动后与每 24 小时异步清理一次，不占用 GUI 线程。"""
+        now = datetime.now()
+        if (
+            not force
+            and self._last_event_maintenance_at is not None
+            and now - self._last_event_maintenance_at < timedelta(hours=24)
+        ):
+            return False
+        if not self._event_maintenance_lock.acquire(blocking=False):
+            return False
+        self._last_event_maintenance_at = now
+
+        def run() -> None:
+            try:
+                result = self.prune_logs(record_event=False)
+                deleted = int(result.details.get("deleted") or 0) if result.ok else 0
+                if not result.ok:
+                    self._last_event_maintenance_at = None
+                if deleted:
+                    log_event(
+                        self.cfg.db_path,
+                        "SUCCESS",
+                        "log_maintenance",
+                        f"自动技术日志清理完成：删除 {deleted} 条",
+                    )
+            finally:
+                self._event_maintenance_lock.release()
+
+        threading.Thread(
+            target=run,
+            name="AgentMailBridgeLogMaintenance",
+            daemon=True,
+        ).start()
+        return True
+
+    def clear_daily_check_logs(self) -> ServiceResult:
+        self.initialize()
+        deleted = clear_daily_check_events(self.cfg.db_path)
+        log_event(
+            self.cfg.db_path, "SUCCESS", "log_maintenance",
+            f"已清除日常自动检查技术日志 {deleted} 条",
+        )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            message=f"已清除 {deleted} 条日常自动检查技术日志",
+            details={"deleted": deleted},
+        )
+
+    def clear_all_technical_logs(self) -> ServiceResult:
+        self.initialize()
+        deleted = clear_all_app_events(self.cfg.db_path)
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            message=f"已清空 {deleted} 条技术日志；邮件、附件、收发历史和 MCP 审计未改动",
+            details={"deleted": deleted},
+        )
+
+    def export_filtered_logs(
+        self,
+        destination: str | Path,
+        **filters: Any,
+    ) -> ServiceResult:
+        self.initialize()
+        path = Path(destination)
+        if path.suffix.lower() != ".csv":
+            path = path.with_suffix(".csv")
+        if path.exists():
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="export_exists",
+                message="目标文件已存在，请选择新的文件名",
+            )
+        rows: list[dict[str, Any]] = []
+        offset = 0
+        while len(rows) < self.cfg.app_event_max_count:
+            page = self.query_logs(limit=500, offset=offset, **filters)
+            if not page.ok:
+                return page
+            items = page.details.get("events", [])
+            rows.extend(items)
+            if len(items) < 500:
+                break
+            offset += len(items)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(("时间", "级别", "事件类型", "脱敏消息"))
+                for row in rows:
+                    writer.writerow((
+                        row.get("created_at", ""),
+                        row.get("level", ""),
+                        row.get("category", "系统与诊断"),
+                        _redact_event_message(str(row.get("message") or "")),
+                    ))
+        except OSError as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="filtered_log_export_failed",
+                message=f"筛选日志导出失败：{exc}",
+            )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            message=f"已导出 {len(rows)} 条脱敏筛选日志",
+            details={"path": str(path), "count": len(rows)},
         )
 
     def scan_file_status(self) -> ServiceResult:
@@ -1421,6 +1671,34 @@ def _mask_email(value: str) -> str:
     if not local or not separator or not domain:
         return "未配置"
     return f"{local[:1]}***@{domain}"
+
+
+def _event_category(event_type: str) -> str:
+    normalized = str(event_type or "").strip().lower()
+    for category, values in LOG_EVENT_CATEGORIES.items():
+        if normalized in values:
+            return category
+    return "系统与诊断"
+
+
+def _redact_event_message(value: str) -> str:
+    text = str(value or "")
+    text = re.sub(
+        r"(?i)([A-Z0-9._%+-])([A-Z0-9._%+-]*)(@[A-Z0-9.-]+\.[A-Z]{2,})",
+        lambda match: f"{match.group(1)}***{match.group(3)}",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b(?:[A-Z]:\\|\\\\)[^\r\n,，;；]+",
+        "[本地路径已隐藏]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b(token|password|auth(?:orization)?|secret)\s*[:=]\s*\S+",
+        r"\1=[已隐藏]",
+        text,
+    )
+    return text
 
 
 def _mcp_audit_status(result: SendResult) -> str:

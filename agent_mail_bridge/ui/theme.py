@@ -425,6 +425,25 @@ def build_stylesheet(theme: str = "light") -> str:
     }}
     QTableWidget::item {{ padding: 5px 6px; border-bottom: 1px solid #F0F1F4; }}
     QTableWidget::item:hover {{ background: #F7F5FF; }}
+    QTableWidget#mailRecordTable {{
+        alternate-background-color: #FFFFFF;
+        selection-background-color: transparent;
+        selection-color: {TEXT};
+    }}
+    QTableWidget#mailRecordTable::item {{
+        background: transparent;
+        border: none;
+        border-bottom: 1px solid #ECEEF3;
+        color: {TEXT};
+    }}
+    QTableWidget#mailRecordTable::item:hover,
+    QTableWidget#mailRecordTable::item:selected,
+    QTableWidget#mailRecordTable::item:focus {{
+        background: transparent;
+        border: none;
+        border-bottom: 1px solid #ECEEF3;
+        color: {TEXT};
+    }}
     QHeaderView::section {{
         color: #777C8B;
         background: #F4F5F8;
@@ -496,6 +515,21 @@ def build_stylesheet(theme: str = "light") -> str:
     }}
     QTableWidget::item {{ border-bottom-color: #343746; }}
     QTableWidget::item:selected {{ background: #30354B; color: #E8EAF2; }}
+    QTableWidget::item:hover {{ background: #2A2E3E; color: #E8EAF2; }}
+    QTableWidget#mailRecordTable {{
+        alternate-background-color: #222532;
+        selection-background-color: transparent;
+        selection-color: #E8EAF2;
+    }}
+    QTableWidget#mailRecordTable::item,
+    QTableWidget#mailRecordTable::item:hover,
+    QTableWidget#mailRecordTable::item:selected,
+    QTableWidget#mailRecordTable::item:focus {{
+        background: transparent;
+        border: none;
+        border-bottom: 1px solid #343746;
+        color: #E8EAF2;
+    }}
     QHeaderView::section {{ color: #BFC4D3; }}
     QPushButton {{ background: #292C3A; border-color: #42465A; }}
     QPushButton:hover, QPushButton#titleButton:hover {{ background: #35394B; }}
