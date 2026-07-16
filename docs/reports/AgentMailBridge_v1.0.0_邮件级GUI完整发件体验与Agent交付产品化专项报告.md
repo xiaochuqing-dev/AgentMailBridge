@@ -2,7 +2,7 @@
 
 ## 结论
 
-本专项已完成代码实现、自动化回归和真实收发第一轮闭环。发布构建、安装版验收、最终 Agent 报告交付与 Git 推送证据在本报告收口时补齐。
+本专项全部完成。邮件级收件、完整发件、Agent 工作区交付、自动化回归、真实收发、GUI 矩阵、clean build、覆盖安装、快捷方式和发布安全验收均通过，最终判定 PASS。
 
 ## 基线与根因
 
@@ -47,7 +47,7 @@
 27. 页面提供可复制的完整交付指令。
 28. 指令不要求用户填写路径，Agent 根据任务上下文识别最终文件。
 29. 工作区授权由 GUI / Service 管理并持久化到 `ALLOWED_SEND_ROOTS`，下一 MCP 会话生效。
-30. 未授权 repo 实测返回 `path_not_allowed`、`not_sent`，未产生 outbound；授权后闭环在最终收口补证。
+30. 未授权 repo 实测返回 `path_not_allowed`、`not_sent`，未产生 outbound；授权后正式安装版 MCP 从 repo 原路径发送成功。
 31. 授权拒绝盘符根、用户主目录、Windows、Program Files、ProgramData、AppData、产品数据和敏感文件；真实路径解析继续阻止目录逃逸。
 
 ## 响应式与视觉
@@ -55,28 +55,28 @@
 32. 最近发送改为一封 outbound 一行，主题和正文列伸展并吃满剩余宽高。
 33. 修复根因是移除固定单文件列思维，改用伸展表头、动态行高和垂直 splitter。
 34. 长主题、正文和文件名使用换行及动态行高，不生成省略号隐藏核心信息。
-35. normal、maximize、restore、手动 resize 与 100% / 125% / 150% DPI 截图证据在安装版最终 QA 后补齐。
+35. normal、maximize、restore、手动 resize 均通过；手动高度由 1019 缩至 763 后可用。100% 由正式安装版 Windows 控制实测，125% / 150% 由相同代码与真实数据在隔离 Qt 缩放进程生成 1650×1125、1980×1350 截图并人工检查。
 
 ## 自动化与真实 E2E
 
 36. 完整 pytest：378 passed、1 skipped，耗时 693.12 秒；跳过项仅为当前 Windows 账户无创建符号链接权限。
 37. 真实 Gmail API 收取：`success`，扫描 1、接收 1、保存 1、失败 0；形成 package `pkg_8d101800f85f774780eb86a6`，raw 可用且归档 ready。
 38. 真实人工发件：outbound `out_079baa69bcbb47c5bf0b32d92abb1a9d`，一次 SMTP 发送成功，3 附件、2 链接；自动收回后对应 package 为 1 封、3 附件、2 链接、7 个资源。
-39. 真实 Agent MCP E2E：待最终报告定稿、正式工作区授权和安装版 MCP 执行后补齐 success / duplicate / 收回 / Hash。
-40. GUI 截图：开始前证据已保存到 gitignored `qa-artifacts/mail-gui-phase2/before`；完成后矩阵待收口。
+39. 真实 Agent MCP E2E：正式安装版 `AgentMailBridgeMCP.exe` 从授权 repo 原路径交付本报告；request_id `packaged-real-5dffcf3cf6d54c53ad141168870fdf83` 首次 success、再次 duplicate，只生成 outbound `out_a380a7a7d12b5e4ab952037dd68b80b0`。源、staging、pre-SMTP、sent archive Hash 均为 `2dee86b7393243ae1b03f4f87a95d29c3b16429df4991507c4e414e3221cc84b`。Gmail API 收回 package `pkg_4e5dbdbb6330fae758282ab2`，附件大小 5667、Hash 相同、raw available、archive ready。
+40. GUI 截图：开始前位于 gitignored `qa-artifacts/mail-gui-phase2/before`；完成后位于 `qa-artifacts/mail-gui-phase2/after/{100,125,150}`，覆盖收件、详情、会话、历史、所属邮件、发件、Agent、深色、最大化、还原、resize 和快捷方式启动。
 
 ## 发布交付
 
-41. README、GUI、MCP、安全、Windows 安装、发布清单和 CHANGELOG 已同步，最终数值待收口。
-42. 秘密扫描待构建前和构建后执行。
-43. Git commit / push 待最终收口。
-44. clean build 待最终收口。
-45. installer / ZIP 待最终收口。
-46. Defender / Authenticode 待最终收口。
-47. 本机覆盖安装待最终收口。
-48. 桌面快捷方式待最终收口。
-49. installer / ZIP SHA-256 待最终收口。
-50. 当前剩余项均为发布验收步骤；最终判定待全部真实证据完成后给出。
+41. README、GUI、MCP、安全、Windows 安装、发布清单和 CHANGELOG 已同步。
+42. 构建前、构建内和构建后秘密扫描通过：864 个产物文件、0 个已配置秘密标记命中；Git 未跟踪 `.env`、OAuth、数据库、邮件、日志或 QA 图片。
+43. 实现提交 `87e7497676e5ed169acea576e5146165dbb9cad4` 已推送 `origin/master`；本报告最终证据随后单独提交并再次推送。
+44. clean build 通过；构建内 pytest 为 378 passed、1 skipped，用时 787.56 秒；总构建用时 938.7 秒。packaged GUI self-test、MCP UTF-8 smoke 和 build verification 均 PASS。
+45. 已生成 `AgentMailBridge.exe`、`AgentMailBridgeMCP.exe`、portable ZIP 和 Inno Setup 6.7.3 installer。
+46. Defender Antivirus 与实时保护开启；对 release、dist 自定义扫描前后历史检测均为 5，本项目新增检测 0。GUI、MCP、installer Authenticode 均为 NotSigned。
+47. 本机覆盖安装退出码 0；配置、credentials、token、SQLite 的安装前后长度和 SHA-256 完全一致。安装目录双 EXE 与 dist Hash 一致，安装版 GUI self-test、MCP smoke 和真实 E2E 通过。首次安装尝试因两个旧 MCP 会话占用 EXE 返回 5，关闭旧会话后正常覆盖，未触碰用户数据。
+48. 桌面快捷方式目标为当前安装目录 `AgentMailBridge.exe`；通过链接实际启动后只有 1 个主进程、1 个窗口，第二次启动仍为单实例，关闭窗口后主进程继续在托盘运行。
+49. installer SHA-256：`1684834b481709972d02a0eaca7a394fd8ded9705a888d90f9a6eb336e976471`；ZIP SHA-256：`c1853c8041f3382308a17930aaf0dc0f80aa693ecfcd9cd0f3566529716bd9dc`。
+50. P0：0，P1：0。P2：当前产物未做 Authenticode 代码签名；不影响本机验收，公开发布前仍建议使用正式证书。请求范围内最终判定 PASS，未创建 GitHub Release。
 
 ## 数据安全证据
 
