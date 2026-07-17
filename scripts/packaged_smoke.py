@@ -56,6 +56,15 @@ def main() -> int:
                     },
                 },
             },
+            {
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": {
+                    "name": "search_mails",
+                    "arguments": {"time_scope": "today"},
+                },
+            },
             {"jsonrpc": "2.0", "id": 5, "method": "unknown/method", "params": {}},
         ]
         encoded = [json.dumps(item, ensure_ascii=False) for item in requests]
@@ -76,16 +85,27 @@ def main() -> int:
             raise SystemExit(f"MCP 返回码异常：{completed.returncode}；stderr={completed.stderr[-500:]}")
         responses = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
         by_id = {item.get("id"): item for item in responses}
-        if set(by_id) != {None, 1, 2, 3, 4, 5}:
+        if set(by_id) != {None, 1, 2, 3, 4, 5, 6}:
             raise SystemExit("MCP stdout 含缺失或额外协议输出")
         if by_id[1]["result"]["serverInfo"]["version"] != __version__:
             raise SystemExit("MCP 版本不一致")
         tools = by_id[3]["result"]["tools"]
-        if [item["name"] for item in tools] != ["submit_result"]:
+        if [item["name"] for item in tools] != [
+            "submit_result",
+            "search_mails",
+            "get_mail",
+            "read_mail_resource",
+            "prepare_mail_resources",
+            "list_agent_workspaces",
+            "get_mail_sync_status",
+        ]:
             raise SystemExit("MCP 工具列表异常")
         result = by_id[4]["result"]["structuredContent"]
         if result["status"] != "path_not_allowed":
             raise SystemExit(f"MCP 路径边界异常：{result['status']}")
+        read_denied = by_id[6]["result"]["structuredContent"]
+        if read_denied.get("error_code") != "read_access_disabled":
+            raise SystemExit("MCP 读取默认关闭边界异常")
         if by_id[None].get("error", {}).get("code") != -32700:
             raise SystemExit("MCP malformed JSON 未返回 parse error")
         if by_id[5].get("error", {}).get("code") != -32601:
