@@ -12,6 +12,8 @@ import sys
 import threading
 import uuid
 import shutil
+import json
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -36,13 +38,16 @@ from agent_mail_bridge.database import (
     configure_app_event_retention,
     count_receive_retries,
     get_auto_receive_state,
+    get_mail_package as query_raw_mail_package,
     init_db,
     insert_mcp_call,
+    insert_mcp_audit_event,
     legacy_archive_backfill_needed,
     outbound_mail_migration_needed,
     log_event,
     get_outbound_message as query_outbound_message,
     query_recent_mcp_calls,
+    query_recent_mcp_audit_events,
     query_recent_outbound_messages,
     query_recent_events,
     query_app_events,
@@ -71,6 +76,15 @@ from agent_mail_bridge.mail_facts import (
     search_mail_facts as query_mail_facts,
 )
 from agent_mail_bridge.mail_send import send_file_with_request, send_outbound_mail
+from agent_mail_bridge.mail_resource_access import (
+    MAX_TEXT_CHARS,
+    MailAccessError,
+    enrich_resource_descriptor,
+    prepare_mail_resources as prepare_resources_to_workspace,
+    read_mail_resource as read_archived_mail_resource,
+    workspace_dtos,
+)
+from agent_mail_bridge.process_lock import ProcessLock, is_lock_available
 from agent_mail_bridge.maintenance import (
     create_database_backup,
     data_statistics,
@@ -85,6 +99,7 @@ from agent_mail_bridge.managed_files import get_managed_files as query_managed_f
 from agent_mail_bridge.security import (
     SecurityError,
     assert_within_allowed_roots,
+    assert_within_root,
     assert_not_sensitive_delivery_file,
     check_size_ok,
     is_dangerous,
@@ -92,7 +107,7 @@ from agent_mail_bridge.security import (
 )
 from agent_mail_bridge.storage import atomic_copy_file, ensure_data_dirs
 from agent_mail_bridge.trusted_downloads import normalize_trusted_domain
-from agent_mail_bridge.utils import fmt_date, sanitize_filename, sha256_of_file
+from agent_mail_bridge.utils import fmt_date, sanitize_filename, sha256_of_bytes, sha256_of_file
 
 
 logger = get_logger("application_service")
@@ -276,8 +291,9 @@ class ApplicationService:
         unseen_only: bool | None = None,
         mark_seen: bool | None = None,
         automatic: bool = False,
+        wait_for_process_lock: float = 0.0,
     ) -> ReceiveResult:
-        """执行一次互斥收件，普通收件绝不启动浏览器授权。"""
+        """执行一次线程/进程双重互斥收件，普通收件绝不启动浏览器授权。"""
         self.initialize()
         backend = _effective_receive_backend(self.cfg)
         if limit is not None and limit <= 0:
@@ -289,6 +305,13 @@ class ApplicationService:
             return ReceiveResult(
                 OperationStatus.CANCELLED, backend=backend,
                 error_code="receive_busy", message="已有收件任务正在运行",
+            )
+        process_lock = ProcessLock(self.cfg.data_root_path / ".locks" / "receive.lock")
+        if not process_lock.acquire(timeout=max(0.0, float(wait_for_process_lock))):
+            self._receive_lock.release()
+            return ReceiveResult(
+                OperationStatus.CANCELLED, backend=backend,
+                error_code="sync_in_progress", message="其他进程正在同步邮件",
             )
         try:
             if backend == "gmail_api":
@@ -356,6 +379,7 @@ class ApplicationService:
                 ),
             )
         finally:
+            process_lock.release()
             self._receive_lock.release()
 
     def get_auto_receive_state(self) -> ServiceResult:
@@ -713,14 +737,27 @@ class ApplicationService:
         """返回安全边界内的 MCP 调用审计记录。"""
         self.initialize()
         rows = _sanitize_history_paths(
-            query_recent_mcp_calls(self.cfg.db_path, max(1, limit)),
-            ("file_path", "staged_path"),
+            query_recent_mcp_audit_events(self.cfg.db_path, max(1, limit)),
+            ("file_path", "staged_path", "source_path", "prepared_path"),
             self.cfg.effective_allowed_send_roots,
         )
+        for row in rows:
+            try:
+                row["details"] = json.loads(str(row.get("details_json") or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                row["details"] = {}
         return ServiceResult(
             OperationStatus.SUCCESS,
             details={"calls": rows},
         )
+
+    def record_mcp_audit(self, **event: Any) -> int:
+        """写入统一 MCP 审计，不记录正文或附件内容。"""
+        self.initialize()
+        for key in ("query_summary", "target_summary"):
+            if event.get(key):
+                event[key] = _redact_text(str(event[key]), self.cfg)
+        return insert_mcp_audit_event(self.cfg.db_path, **event)
 
     def record_mcp_rejection(
         self,
@@ -906,10 +943,15 @@ class ApplicationService:
 
     def list_agent_workspaces(self) -> ServiceResult:
         """只列出用户显式授权工作区，DATA_ROOT 保持内部边界。"""
-        roots = [str(Path(item).resolve()) for item in self.cfg.allowed_send_roots]
+        details = workspace_dtos(self.cfg)
+        roots = [str(item["display_path"]) for item in details]
         return ServiceResult(
             OperationStatus.SUCCESS,
-            details={"workspaces": roots, "takes_effect": "next_mcp_session"},
+            details={
+                "workspaces": roots,
+                "workspace_details": details,
+                "takes_effect": "next_mcp_session",
+            },
         )
 
     def add_agent_workspace(
@@ -1086,6 +1128,334 @@ class ApplicationService:
                 OperationStatus.FAILED, error_code="invalid_mail_query", message=str(exc)
             )
         return ServiceResult(OperationStatus.SUCCESS, details={"messages": rows})
+
+    def get_mcp_mail_read_access(self) -> ServiceResult:
+        """返回本机 Agent 邮件读取总开关，不涉及任何凭据。"""
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            details={
+                "enabled": bool(self.cfg.mcp_mail_read_enabled),
+                "scope": "local_mail_archive",
+                "submit_result_available": True,
+            },
+        )
+
+    def set_mcp_mail_read_access(
+        self, enabled: bool, *, env_path: Path | None = None
+    ) -> ServiceResult:
+        """持久化一次性本机邮件读取授权；关闭不影响 submit_result。"""
+        from agent_mail_bridge.ui.settings_store import save_env_values
+
+        try:
+            save_env_values(
+                {"MCP_MAIL_READ_ENABLED": "true" if enabled else "false"},
+                env_path,
+            )
+        except OSError as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="read_access_save_failed",
+                message=f"保存邮件读取授权失败：{exc}",
+            )
+        self.cfg.mcp_mail_read_enabled = bool(enabled)
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            message="已允许本机 Agent 读取本地邮件归档" if enabled else "已关闭本机 Agent 邮件读取",
+            details={"enabled": bool(enabled), "submit_result_available": True},
+        )
+
+    def search_mails(
+        self,
+        *,
+        query: str = "",
+        time_scope: str = "all",
+        recent_days: int | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        subject: str | None = None,
+        sender: str | None = None,
+        recipient: str | None = None,
+        has_attachments: bool | None = None,
+        status: str | None = None,
+        sort: str = "newest",
+        limit: int | None = None,
+        offset: int = 0,
+        ensure_fresh: bool = False,
+        allow_cached: bool = True,
+        account_ref: str | None = None,
+        mailbox_ref: str | None = None,
+    ) -> ServiceResult:
+        """按明确结构搜索本地邮件；可先执行受控同步新鲜度检查。"""
+        disabled = self._mail_read_disabled()
+        if disabled:
+            return disabled
+        self.initialize()
+        try:
+            start, end = _mail_time_range(
+                time_scope, recent_days=recent_days, date_from=date_from, date_to=date_to
+            )
+            safe_limit = 1 if limit is None and time_scope == "latest" else int(limit or 20)
+            if safe_limit <= 0 or safe_limit > 100 or int(offset) < 0:
+                raise ValueError("limit 必须在 1 到 100 之间，offset 必须为非负整数")
+        except (TypeError, ValueError) as exc:
+            return ServiceResult(
+                OperationStatus.FAILED, error_code="invalid_range", message=str(exc)
+            )
+
+        sync_before = self.get_mail_sync_status().details
+        sync_triggered = False
+        sync_error: dict[str, str] | None = None
+        cache_is_stale = sync_before.get("freshness") != "fresh"
+        if ensure_fresh and cache_is_stale:
+            sync_triggered = True
+            received = self.receive(automatic=True, wait_for_process_lock=5.0)
+            if received.error_code in {"sync_in_progress", "receive_busy"}:
+                return ServiceResult(
+                    OperationStatus.CANCELLED,
+                    error_code="sync_in_progress",
+                    message="其他进程正在同步邮件，请稍后重试",
+                    details={"sync": sync_before, "sync_triggered": True},
+                )
+            now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            success_at = now_text if received.ok else sync_before.get("last_success_at")
+            save_auto_receive_state(
+                self.cfg.db_path,
+                last_check_at=now_text,
+                last_success_at=success_at,
+                last_result=received.message,
+                last_error=None if received.ok else received.message,
+                consecutive_global_failures=(
+                    0 if received.ok else int(sync_before.get("consecutive_global_failures") or 0) + 1
+                ),
+            )
+            if not received.ok:
+                sync_error = {
+                    "error_code": received.error_code or "sync_failed",
+                    "message": _redact_text(received.message, self.cfg),
+                }
+                if not allow_cached:
+                    return ServiceResult(
+                        OperationStatus.FAILED,
+                        error_code="sync_failed",
+                        message="邮件同步失败，未使用本地缓存",
+                        details={"sync_error": sync_error, "sync_triggered": True},
+                    )
+            else:
+                cache_is_stale = False
+
+        try:
+            rows = query_mail_facts(
+                self.cfg.db_path,
+                query,
+                account_ref=account_ref,
+                mailbox_ref=mailbox_ref,
+                date_from=start,
+                date_to=end,
+                subject=subject,
+                sender=sender,
+                recipient=recipient,
+                has_attachments=has_attachments,
+                status=status,
+                sort=sort,
+                limit=safe_limit,
+                offset=int(offset),
+            )
+        except (TypeError, ValueError) as exc:
+            return ServiceResult(
+                OperationStatus.FAILED, error_code="invalid_mail_query", message=str(exc)
+            )
+        messages = [_mail_search_summary(row) for row in rows]
+        sync_after = self.get_mail_sync_status().details
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            message="未找到匹配邮件" if not messages else f"找到 {len(messages)} 封邮件",
+            details={
+                "messages": messages,
+                "result_count": len(messages),
+                "limit": safe_limit,
+                "offset": int(offset),
+                "has_more": len(messages) == safe_limit,
+                "cached": bool(cache_is_stale or sync_error),
+                "sync_triggered": sync_triggered,
+                "sync_error": sync_error,
+                "sync": sync_after,
+            },
+        )
+
+    def get_mail(
+        self, package_id: str, *, offset: int = 0, max_chars: int = 20_000
+    ) -> ServiceResult:
+        """返回有界完整正文、资源清单和 raw 描述。"""
+        disabled = self._mail_read_disabled()
+        if disabled:
+            return disabled
+        self.initialize()
+        try:
+            safe_offset = int(offset)
+            safe_chars = int(max_chars)
+            if safe_offset < 0 or safe_chars <= 0 or safe_chars > MAX_TEXT_CHARS:
+                raise ValueError(f"offset 必须非负，max_chars 必须在 1 到 {MAX_TEXT_CHARS} 之间")
+        except (TypeError, ValueError) as exc:
+            return ServiceResult(OperationStatus.FAILED, error_code="invalid_range", message=str(exc))
+        message = query_mail_message(self.cfg.db_path, package_id)
+        if message is None:
+            return ServiceResult(OperationStatus.FAILED, error_code="mail_not_found", message="邮件不存在")
+        try:
+            _validate_agent_mail_paths(message, self.cfg)
+        except MailAccessError as exc:
+            return ServiceResult(OperationStatus.FAILED, error_code=exc.code, message=exc.message)
+        message = _safe_agent_mail_message(message, self.cfg)
+        resources = [enrich_resource_descriptor(row) for row in message.get("resources") or []]
+        message["resources"] = resources
+        raw_package = query_raw_mail_package(self.cfg.db_path, package_id) or {}
+        readable_text = str(raw_package.get("search_text") or "")
+        body_resource = next(
+            (row for row in resources if row.get("internal_type") == "body_plain"),
+            next((row for row in resources if row.get("internal_type") == "body_readable"), None),
+        )
+        if readable_text:
+            if safe_offset > len(readable_text):
+                return ServiceResult(
+                    OperationStatus.FAILED,
+                    error_code="invalid_range",
+                    message="offset 超出邮件正文字符范围",
+                    details={"character_count": len(readable_text)},
+                )
+            expected_body_sha = str(raw_package.get("body_text_sha256") or "")
+            actual_body_sha = sha256_of_bytes(readable_text.encode("utf-8"))
+            if expected_body_sha and expected_body_sha.casefold() != actual_body_sha.casefold():
+                body = {"content": "", "format": "unavailable", "status": "hash_mismatch", "has_more": False}
+            else:
+                body = _text_value_page(readable_text, safe_offset, safe_chars)
+                body.update({"format": "plain" if raw_package.get("body_plain_path") else "readable", "encoding": "utf-8"})
+        elif body_resource:
+            try:
+                page = read_archived_mail_resource(
+                    message,
+                    str(body_resource["resource_id"]),
+                    mode="text",
+                    offset=safe_offset,
+                    max_chars=safe_chars,
+                )
+                body = {
+                    "content": page["content"],
+                    "format": str(body_resource.get("internal_type") or "body_readable"),
+                    "encoding": page.get("encoding"),
+                    "character_count": page.get("character_count", 0),
+                    "offset": page.get("offset", 0),
+                    "next_offset": page.get("next_offset"),
+                    "has_more": page.get("has_more", False),
+                }
+            except MailAccessError as exc:
+                body = {"content": "", "format": "unavailable", "status": exc.code, "has_more": False}
+        else:
+            body = {"content": "", "format": "no_body", "character_count": 0, "offset": 0, "next_offset": None, "has_more": False}
+        raw = dict(message.get("raw_eml") or {})
+        raw["resource_id"] = "raw.eml"
+        raw_path = Path(str(message.get("package_root") or "")) / str(raw.get("path") or "")
+        raw["available"] = bool(raw.get("path") and raw_path.is_file())
+        raw["size_bytes"] = raw_path.stat().st_size if raw["available"] else None
+        message["raw_eml"] = raw
+        message["body"] = body
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            details={"mail": message, "bytes_returned": len(body["content"].encode("utf-8"))},
+        )
+
+    def read_mail_resource(self, package_id: str, resource_id: str, **options: Any) -> ServiceResult:
+        disabled = self._mail_read_disabled()
+        if disabled:
+            return disabled
+        self.initialize()
+        message = query_mail_message(self.cfg.db_path, package_id)
+        if message is None:
+            return ServiceResult(OperationStatus.FAILED, error_code="mail_not_found", message="邮件不存在")
+        try:
+            _validate_agent_mail_paths(message, self.cfg)
+            details = read_archived_mail_resource(message, resource_id, **options)
+        except MailAccessError as exc:
+            return ServiceResult(
+                OperationStatus.FAILED, error_code=exc.code, message=exc.message, details=exc.details
+            )
+        return ServiceResult(OperationStatus.SUCCESS, details={"resource": details, **details})
+
+    def prepare_mail_resources(
+        self, package_id: str, resource_ids: list[str], **options: Any
+    ) -> ServiceResult:
+        disabled = self._mail_read_disabled()
+        if disabled:
+            return disabled
+        self.initialize()
+        message = query_mail_message(self.cfg.db_path, package_id)
+        if message is None:
+            return ServiceResult(OperationStatus.FAILED, error_code="mail_not_found", message="邮件不存在")
+        try:
+            _validate_agent_mail_paths(message, self.cfg)
+            details = prepare_resources_to_workspace(
+                self.cfg, message, resource_ids, **options
+            )
+        except MailAccessError as exc:
+            return ServiceResult(
+                OperationStatus.FAILED, error_code=exc.code, message=exc.message, details=exc.details
+            )
+        status = (
+            OperationStatus.PARTIAL
+            if details["status"] == "partial"
+            else OperationStatus.FAILED
+            if details["status"] == "failed"
+            else OperationStatus.SUCCESS
+        )
+        return ServiceResult(
+            status,
+            error_code="preparation_failed" if details["failed_count"] else None,
+            message=(
+                f"已准备 {details['prepared_count']} 个资源"
+                if not details["failed_count"]
+                else f"已准备 {details['prepared_count']} 个，失败 {details['failed_count']} 个"
+            ),
+            details=details,
+        )
+
+    def get_mail_sync_status(self) -> ServiceResult:
+        """返回持久化调度、新鲜度、重试和跨进程同步状态。"""
+        self.initialize()
+        state = get_auto_receive_state(self.cfg.db_path)
+        retries = count_receive_retries(self.cfg.db_path)
+        newest = query_mail_messages(self.cfg.db_path, limit=1)
+        latest_local_at = None
+        if newest:
+            latest_local_at = newest[0].get("saved_at") or newest[0].get("received_at")
+        now = datetime.now()
+        last_success = _parse_datetime(state.get("last_success_at"))
+        latest_local = _parse_datetime(latest_local_at)
+        age = max(0, int((now - last_success).total_seconds())) if last_success else None
+        local_age = max(0, int((now - latest_local).total_seconds())) if latest_local else None
+        threshold = int(self.cfg.mcp_mail_freshness_seconds)
+        freshness = "unknown" if age is None else "fresh" if age <= threshold else "stale"
+        lock_path = self.cfg.data_root_path / ".locks" / "receive.lock"
+        details = {
+            **state,
+            **retries,
+            "enabled": bool(state.get("enabled")),
+            "background_status": "running" if state.get("enabled") else "stopped",
+            "is_syncing": not is_lock_available(lock_path),
+            "freshness": freshness,
+            "freshness_threshold_seconds": threshold,
+            "data_age_seconds": age,
+            "latest_local_mail_at": latest_local_at,
+            "latest_local_mail_age_seconds": local_age,
+            "last_error": _redact_text(str(state.get("last_error") or ""), self.cfg),
+        }
+        return ServiceResult(OperationStatus.SUCCESS, details=details)
+
+    def _mail_read_disabled(self) -> ServiceResult | None:
+        if self.cfg.mcp_mail_read_enabled:
+            return None
+        return ServiceResult(
+            OperationStatus.FAILED,
+            error_code="read_access_disabled",
+            message="本机 Agent 邮件读取尚未启用，请在 Agent/MCP 页面开启总开关",
+        )
 
     def list_trusted_domains(self) -> ServiceResult:
         """默认空列表；只返回域名规则，不包含邮件 URL。"""
@@ -1663,6 +2033,141 @@ def _classify_receive_error(message: str) -> str:
         if any(keyword in lowered for keyword in keywords):
             return code
     return "receive_failed"
+
+
+def _mail_time_range(
+    time_scope: str,
+    *,
+    recent_days: int | None,
+    date_from: str | None,
+    date_to: str | None,
+) -> tuple[str | None, str | None]:
+    scope = str(time_scope or "all").strip().lower()
+    today = datetime.now().date()
+    if scope in {"all", "latest"}:
+        return None, None
+    if scope == "today":
+        value = today.isoformat()
+        return value, f"{value}\uffff"
+    if scope == "yesterday":
+        value = (today - timedelta(days=1)).isoformat()
+        return value, f"{value}\uffff"
+    if scope == "recent_days":
+        days = int(recent_days or 3)
+        if days <= 0 or days > 3650:
+            raise ValueError("recent_days 必须在 1 到 3650 之间")
+        return (today - timedelta(days=days - 1)).isoformat(), f"{today.isoformat()}\uffff"
+    if scope == "date_range":
+        if not date_from or not date_to:
+            raise ValueError("date_range 必须同时提供 date_from 和 date_to")
+        start = datetime.strptime(date_from, "%Y-%m-%d").date()
+        end = datetime.strptime(date_to, "%Y-%m-%d").date()
+        if start > end:
+            raise ValueError("date_from 不能晚于 date_to")
+        return start.isoformat(), f"{end.isoformat()}\uffff"
+    raise ValueError("time_scope 仅支持 latest、today、yesterday、recent_days、date_range 或 all")
+
+
+def _mail_search_summary(row: dict[str, Any]) -> dict[str, Any]:
+    package_id = str(row.get("package_id") or "")
+    return {
+        "mail_id": package_id,
+        "package_id": package_id,
+        "subject": str(row.get("subject") or ""),
+        "from": str(row.get("from") or ""),
+        "to": list(row.get("to") or []),
+        "sent_at": row.get("sent_at"),
+        "received_at": row.get("received_at"),
+        "saved_at": row.get("saved_at"),
+        "summary": " ".join(str(row.get("body_summary") or "").split())[:300],
+        "counts": dict(row.get("counts") or {}),
+        "archive_status": str(row.get("archive_status") or ""),
+        "parse_status": str(row.get("parse_status") or ""),
+        "thread_ref": str(row.get("thread_ref") or ""),
+    }
+
+
+def _text_value_page(value: str, offset: int, max_chars: int) -> dict[str, Any]:
+    if offset > len(value):
+        return {
+            "content": "", "character_count": len(value), "offset": offset,
+            "next_offset": None, "has_more": False, "status": "invalid_range",
+        }
+    content = value[offset:offset + max_chars]
+    next_offset = offset + len(content)
+    return {
+        "content": content,
+        "character_count": len(value),
+        "offset": offset,
+        "next_offset": next_offset if next_offset < len(value) else None,
+        "has_more": next_offset < len(value),
+    }
+
+
+def _safe_agent_mail_message(message: dict[str, Any], cfg: AppConfig) -> dict[str, Any]:
+    result = dict(message)
+    package_id = str(result.get("package_id") or "")
+    result["mail_id"] = package_id
+    result["last_error"] = _redact_text(str(result.get("last_error") or ""), cfg)
+    result["archive"] = {
+        "status": str(result.get("archive_status") or ""),
+        "parse_status": str(result.get("parse_status") or ""),
+        "last_error": result["last_error"],
+        "legacy": bool(result.get("legacy")),
+    }
+    result["thread"] = {
+        "thread_ref": str(result.get("thread_ref") or ""),
+        "account_ref": str(result.get("account_ref") or ""),
+        "mailbox_ref": str(result.get("mailbox_ref") or ""),
+    }
+    return result
+
+
+def _validate_agent_mail_paths(message: dict[str, Any], cfg: AppConfig) -> None:
+    """数据库事实也必须在每次 Agent 访问前重新满足 DATA_ROOT 边界。"""
+    package_root_text = str(message.get("package_root") or "").strip()
+    if not package_root_text:
+        raise MailAccessError("resource_not_local", "邮件归档目录不可用")
+    try:
+        data_root = cfg.data_root_path.resolve()
+        package_root = Path(package_root_text).resolve()
+        assert_within_root(package_root, data_root)
+        for resource in message.get("resources") or []:
+            absolute = str(resource.get("absolute_path") or "").strip()
+            relative = str(resource.get("path") or "").strip()
+            if not absolute and not relative:
+                continue
+            candidate = Path(absolute) if absolute else package_root / relative
+            assert_within_root(candidate, package_root)
+        raw = message.get("raw_eml") or {}
+        raw_path = str(raw.get("path") or "").strip()
+        if raw_path:
+            assert_within_root(package_root / raw_path, package_root)
+    except (OSError, SecurityError) as exc:
+        raise MailAccessError("path_not_allowed", "邮件归档路径超出 DATA_ROOT") from exc
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
+def _redact_text(value: str, cfg: AppConfig) -> str:
+    text = str(value or "")
+    for secret in (cfg.gmail_app_password, cfg.qq_auth_code):
+        if secret:
+            text = text.replace(secret, "[已脱敏]")
+    text = re.sub(
+        r"(?i)(password|token|auth[_ -]?code|secret)\s*[:=]\s*[^\s,;]+",
+        r"\1=[已脱敏]",
+        text,
+    )
+    return text[:1000]
 
 
 def _mask_email(value: str) -> str:

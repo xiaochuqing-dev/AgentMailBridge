@@ -50,7 +50,7 @@ def test_formal_gui_uses_reference_three_column_layout(bridge_window):
         "logs", "maintenance", "agent", "about",
     }
     assert set(bridge_window.tab_buttons) == {"inbox", "send"}
-    assert set(bridge_window.nav_buttons) == {"history", "files_data", "settings", "about"}
+    assert set(bridge_window.nav_buttons) == {"agent", "history", "files_data", "settings", "about"}
     assert all(
         row.value_label.minimumWidth() >= 126
         for row in bridge_window.service_rows.values()
@@ -65,19 +65,21 @@ def test_navigation_switches_real_pages(bridge_window):
     assert bridge_window.tab_buttons["send"].isChecked()
     bridge_window.select_page("agent")
     assert bridge_window.page_stack.currentWidget() is bridge_window.pages["agent"]
-    assert bridge_window.tab_buttons["send"].isChecked()
+    assert bridge_window.nav_buttons["agent"].isChecked()
+    assert not any(button.isChecked() for button in bridge_window.tab_buttons.values())
     bridge_window.select_page("advanced")
     assert bridge_window.page_stack.currentWidget() is bridge_window.pages["advanced"]
     assert bridge_window.nav_buttons["settings"].isChecked()
 
 
 def test_agent_page_exposes_safe_stdio_configuration(bridge_window):
-    text = bridge_window.mcp_command_text.toPlainText()
-    assert "python -m agent_mail_bridge.mcp_server" in text
+    bridge_window._copy_mcp_config("json")
+    text = QApplication.clipboard().text()
+    assert "agent_mail_bridge.mcp_server" in text
     assert "recipient" not in text.lower()
     assert bridge_window.service.cfg.qq_auth_code not in text
-    bridge_window._copy_mcp_config("codex")
-    assert "codex mcp add agent-mail-bridge" in QApplication.clipboard().text()
+    assert bridge_window.pages["agent"].isWidgetType()
+    assert hasattr(bridge_window, "mcp_read_switch")
 
 
 def test_auto_receive_starts_immediately_then_uses_default_seconds(bridge_window):

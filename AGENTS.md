@@ -27,6 +27,13 @@ Use `runtime_paths.py`. Frozen program files are read-only under the install dir
 - Agents must not perform ad-hoc Copy-Item staging. AgentMailBridge validates allowed roots and performs atomic controlled staging.
 - Source, staged, pre-SMTP attachment and sent archive size/SHA-256 facts must remain auditable and must block sending on a pre-SMTP mismatch.
 - Real packaged MCP and loopback E2E evidence cannot be replaced by mocks; unexecuted external steps must be reported as unverified.
+- GUI is not required for local mail reads. The MCP service is provider-neutral and client-neutral.
+- Mail read access is one global opt-in, never per-message sharing.
+- Mail tools are read-only against the canonical archive; mail content may be read, but credentials and arbitrary filesystem paths may not.
+- `get_mail` and `read_mail_resource` must remain bounded and pageable.
+- `prepare_mail_resources` may copy only into an authorized workspace and must preserve source/target size and SHA-256.
+- `submit_result` must remain backward compatible.
+- MCP audit must not store complete mail bodies, attachment contents or secrets.
 
 ## Automatic receive invariants
 
@@ -53,12 +60,12 @@ Use `runtime_paths.py`. Frozen program files are read-only under the install dir
 ## Frontend information architecture
 
 - The top-level work area contains only Receive and Send.
-- The lower sidebar contains only History, Files & Data, Settings and About.
+- Agent/MCP is an independent left-side entry joined visually with History, Files & Data, Settings and About; it must not leave a detached gap.
 - Existing account configuration belongs only to Gmail and QQ account cards.
 - Add mailbox account is only a future-extension demo and must not route to an existing account editor.
 - The receive page must not contain account secrets or OAuth configuration.
 - The send page must not contain QQ account configuration.
-- Agent/MCP belongs only to Send and must not appear as another primary route or in Settings.
+- Agent/MCP owns one independent page and must not be duplicated in Send or Settings.
 - Advanced Settings is a secondary page reached from Settings and must not contain account-level authentication.
 - History records business actions; Files & Data manages stored objects and maintenance. Do not duplicate either list.
 - Gmail API and Gmail IMAP must use separate conditional authentication views.
@@ -77,6 +84,8 @@ Use `runtime_paths.py`. Frozen program files are read-only under the install dir
 - Received and sent summaries must keep non-zero attachment, inline-image, link and download counts visible even when body text exists.
 - Received and sent summary tables must look like unified rows, not independently interactive cells; dark theme must not inherit light item-hover backgrounds or show vertical hover/selection boundaries.
 - Inbox search must use mail facts across recipients, readable body, attachment/image names and links; resource matches must never duplicate a mail row.
+- Recent MCP calls and compact resource tables are unified rows with no vertical cell boundaries, focus bars or selection blocks.
+- Literal `|` or `｜` separators must not be used for the recent-call layout.
 
 ## Technical log invariants
 

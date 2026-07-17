@@ -77,10 +77,10 @@ def build_stylesheet(theme: str = "light") -> str:
     }}
     QScrollArea#rightPanel, QWidget#rightPanelContent {{
         background: #FCFCFE;
-        border-left: 1px solid {BORDER};
+        border: none;
     }}
     QWidget#sidebar {{
-        border-right: 1px solid {BORDER};
+        border: none;
     }}
     QWidget#titleBar {{
         border-bottom: 1px solid {BORDER};
@@ -424,7 +424,7 @@ def build_stylesheet(theme: str = "light") -> str:
         selection-color: {TEXT};
     }}
     QTableWidget::item {{ padding: 5px 6px; border-bottom: 1px solid #F0F1F4; }}
-    QTableWidget::item:hover {{ background: #F7F5FF; }}
+    QTableWidget::item:hover {{ background: transparent; }}
     QTableWidget#mailRecordTable {{
         alternate-background-color: #FFFFFF;
         selection-background-color: transparent;
@@ -439,6 +439,20 @@ def build_stylesheet(theme: str = "light") -> str:
     QTableWidget#mailRecordTable::item:hover,
     QTableWidget#mailRecordTable::item:selected,
     QTableWidget#mailRecordTable::item:focus {{
+        background: transparent;
+        border: none;
+        border-bottom: 1px solid #ECEEF3;
+        color: {TEXT};
+    }}
+    QTableWidget#compactResourceTable {{
+        alternate-background-color: #FFFFFF;
+        selection-background-color: transparent;
+        selection-color: {TEXT};
+    }}
+    QTableWidget#compactResourceTable::item,
+    QTableWidget#compactResourceTable::item:hover,
+    QTableWidget#compactResourceTable::item:selected,
+    QTableWidget#compactResourceTable::item:focus {{
         background: transparent;
         border: none;
         border-bottom: 1px solid #ECEEF3;
@@ -488,7 +502,7 @@ def build_stylesheet(theme: str = "light") -> str:
     QMainWindow, QWidget#windowRoot, QWidget#titleBar, QWidget#sidebar,
     QWidget#centralPanel, QWidget#rightPanelContent, QWidget#pageSurface,
     QWidget#bodySurface, QWidget#tabBar, QScrollArea {{ background: #171923; }}
-    QScrollArea#rightPanel, QWidget#rightPanelContent {{ background: #1C1E2A; border-left-color: #343746; }}
+    QScrollArea#rightPanel, QWidget#rightPanelContent {{ background: #1C1E2A; border: none; }}
     QWidget#sidebar, QWidget#titleBar, QWidget#tabBar {{ border-color: #343746; }}
     QLabel#fieldLabel, QLabel#muted, QLabel#hint {{ color: #AEB4C5; }}
     QLabel#statusName, QLabel#statusValue, QLabel#tipText, QLabel#statNumber,
@@ -515,7 +529,7 @@ def build_stylesheet(theme: str = "light") -> str:
     }}
     QTableWidget::item {{ border-bottom-color: #343746; }}
     QTableWidget::item:selected {{ background: #30354B; color: #E8EAF2; }}
-    QTableWidget::item:hover {{ background: #2A2E3E; color: #E8EAF2; }}
+    QTableWidget::item:hover {{ background: transparent; color: #E8EAF2; }}
     QTableWidget#mailRecordTable {{
         alternate-background-color: #222532;
         selection-background-color: transparent;
@@ -525,6 +539,20 @@ def build_stylesheet(theme: str = "light") -> str:
     QTableWidget#mailRecordTable::item:hover,
     QTableWidget#mailRecordTable::item:selected,
     QTableWidget#mailRecordTable::item:focus {{
+        background: transparent;
+        border: none;
+        border-bottom: 1px solid #343746;
+        color: #E8EAF2;
+    }}
+    QTableWidget#compactResourceTable {{
+        alternate-background-color: #222532;
+        selection-background-color: transparent;
+        selection-color: #E8EAF2;
+    }}
+    QTableWidget#compactResourceTable::item,
+    QTableWidget#compactResourceTable::item:hover,
+    QTableWidget#compactResourceTable::item:selected,
+    QTableWidget#compactResourceTable::item:focus {{
         background: transparent;
         border: none;
         border-bottom: 1px solid #343746;

@@ -65,7 +65,7 @@ def test_shared_summaries_are_bounded_and_always_show_resource_facts():
 
 def test_dark_table_hover_has_explicit_dark_and_mail_row_overrides():
     stylesheet = build_stylesheet("dark")
-    assert "QTableWidget::item:hover { background: #2A2E3E" in stylesheet
+    assert "QTableWidget::item:hover { background: transparent" in stylesheet
     assert "QTableWidget#mailRecordTable::item:hover" in stylesheet
     assert "selection-background-color: transparent" in stylesheet
 

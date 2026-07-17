@@ -177,6 +177,11 @@ class AppConfig:
     # 允许应用服务读取并发送文件的额外目录；默认只允许 DATA_ROOT。
     allowed_send_roots: list[Path] = field(default_factory=list)
 
+    # --- 本机 Agent 邮件读取 ---
+    # 明确 opt-in；关闭时不影响既有 submit_result 发件能力。
+    mcp_mail_read_enabled: bool = False
+    mcp_mail_freshness_seconds: int = 90
+
     # --- 收件规则 ---
     auto_receive_only_self_mail: bool = True
     receive_rule_mode: str = ""
@@ -315,6 +320,8 @@ class AppConfig:
             "owner_gmail": self.owner_gmail,
             "data_root": str(self.data_root_path),
             "allowed_send_roots": [str(item) for item in self.effective_allowed_send_roots],
+            "mcp_mail_read_enabled": self.mcp_mail_read_enabled,
+            "mcp_mail_freshness_seconds": self.mcp_mail_freshness_seconds,
             "auto_receive_only_self_mail": self.auto_receive_only_self_mail,
             "receive_rule_mode": self.receive_rule_mode,
             "receive_rule_senders": list(self.receive_rule_senders),
@@ -470,6 +477,18 @@ def load_config(env_path: Path | str | None = None) -> AppConfig:
         owner_gmail=os.getenv("OWNER_GMAIL", "").strip(),
         data_root=data_root,
         allowed_send_roots=allowed_send_roots,
+        mcp_mail_read_enabled=_as_bool(os.getenv("MCP_MAIL_READ_ENABLED"), False),
+        mcp_mail_freshness_seconds=max(
+            30,
+            min(
+                _as_positive_int(
+                    os.getenv("MCP_MAIL_FRESHNESS_SECONDS"),
+                    "MCP_MAIL_FRESHNESS_SECONDS",
+                    90,
+                ),
+                600,
+            ),
+        ),
         auto_receive_only_self_mail=legacy_only_self,
         receive_rule_mode=receive_rule_mode,
         receive_rule_senders=normalize_sender_rules(

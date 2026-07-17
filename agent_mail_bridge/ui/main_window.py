@@ -405,6 +405,7 @@ class BridgeWindow(QMainWindow):
         self.auto_watchdog.start()
         self.auto_failures = 0
         self._loading_auto_receive = False
+        self._loading_mcp_read_access = False
         self.setWindowTitle("Agent 邮箱桥接工具")
         self.setWindowIcon(brand_icon())
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
@@ -537,17 +538,27 @@ class BridgeWindow(QMainWindow):
         layout.addStretch(1)
 
         self.nav_buttons: dict[str, NavButton] = {}
+        nav_card = QFrame()
+        nav_card.setObjectName("navCard")
+        nav_layout = QVBoxLayout(nav_card)
+        nav_layout.setContentsMargins(0, 0, 0, 0)
+        nav_layout.setSpacing(0)
+
+        self.agent_nav_button = NavButton(
+            QIcon(line_icon_pixmap("terminal", 17, "#6F7585")), "Agent / MCP"
+        )
+        self.agent_nav_button.clicked.connect(
+            lambda checked=False: self.select_page("agent")
+        )
+        self.nav_buttons["agent"] = self.agent_nav_button
+        nav_layout.addWidget(self.agent_nav_button)
+        nav_layout.addWidget(horizontal_line())
         nav_specs = (
             ("history", "clock", "历史记录"),
             ("files_data", "database", "文件与数据"),
             ("settings", "settings", "设置"),
             ("about", "info", "关于"),
         )
-        nav_card = QFrame()
-        nav_card.setObjectName("navCard")
-        nav_layout = QVBoxLayout(nav_card)
-        nav_layout.setContentsMargins(0, 0, 0, 0)
-        nav_layout.setSpacing(0)
         for index, (key, icon_kind, text) in enumerate(nav_specs):
             button = NavButton(QIcon(line_icon_pixmap(icon_kind, 17, "#6F7585")), text)
             button.clicked.connect(lambda checked=False, page=key: self.select_page(page))
@@ -587,6 +598,17 @@ class BridgeWindow(QMainWindow):
             tab_layout.addWidget(button)
         self.tab_buttons["inbox"].setChecked(True)
         tab_layout.addStretch(1)
+        self.global_refresh_label = QLabel("刷新本地页面数据")
+        self.global_refresh_label.setObjectName("hint")
+        self.global_refresh_button = self._button(
+            "刷新", icon_kind="refresh", outline=True
+        )
+        self.global_refresh_button.clicked.connect(
+            lambda: self.request_refresh(self.global_refresh_button)
+        )
+        tab_layout.addWidget(self.global_refresh_label)
+        tab_layout.addWidget(self.global_refresh_button)
+        tab_layout.addSpacing(18)
         layout.addWidget(tabs)
 
         self.page_stack = QStackedWidget()
@@ -826,15 +848,11 @@ class BridgeWindow(QMainWindow):
         page, layout = self._standard_page(
             "收件",
             "日常收件工作台；邮箱地址、OAuth 和 IMAP 凭据请通过左侧 Gmail 账号卡片管理。",
-            header_action_label="刷新",
         )
         # 高内容页在当前屏幕可用高度足够时整页显示，较矮窗口保留滚动兜底。
         layout.setContentsMargins(24, 20, 22, 24)
         layout.setSpacing(12)
-        self.inbox_refresh_button = page.header_action_button
-        self.inbox_refresh_button.clicked.connect(
-            lambda: self.request_refresh(self.inbox_refresh_button)
-        )
+        self.inbox_refresh_button = self.global_refresh_button
         tools = QHBoxLayout()
         tools.setSpacing(9)
         tools.addWidget(QLabel("自动收取"))
@@ -977,10 +995,7 @@ class BridgeWindow(QMainWindow):
         page, layout = self._standard_page(
             "发邮件",
             "主题、正文、多个附件和多个链接会组成一封邮件；收件人固定为绑定的 Gmail。",
-            header_action_label="Agent 发件 / MCP",
-            header_action_icon="terminal",
         )
-        page.header_action_button.clicked.connect(lambda: self.select_page("agent"))
 
         # 旧版单文件控件继续作为程序兼容接口存在，但不再占用正式界面。
         self.send_path_edit = QLineEdit(page)
@@ -1048,6 +1063,9 @@ class BridgeWindow(QMainWindow):
         )
         attachment_layout.addLayout(attachment_header)
         self.send_attachment_table = DataTable(["文件名", "大小", "操作"])
+        self.send_attachment_table.setObjectName("compactResourceTable")
+        self.send_attachment_table.setAlternatingRowColors(False)
+        self.send_attachment_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.send_attachment_table.setMinimumHeight(102)
         self.send_attachment_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.send_attachment_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -1073,6 +1091,9 @@ class BridgeWindow(QMainWindow):
         link_add_row.addWidget(self._button("添加", self.add_send_link, outline=True))
         link_layout.addLayout(link_add_row)
         self.send_link_table = DataTable(["链接", "操作"])
+        self.send_link_table.setObjectName("compactResourceTable")
+        self.send_link_table.setAlternatingRowColors(False)
+        self.send_link_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.send_link_table.setMinimumHeight(72)
         self.send_link_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.send_link_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
@@ -1715,70 +1736,117 @@ class BridgeWindow(QMainWindow):
 
     def _build_agent_page(self) -> QWidget:
         page, layout = self._standard_page(
-            "发件 > Agent 发件 / MCP",
-            "本机 stdio MCP 按需启动；Agent 只能交付已授权工作区内的结果文件，收件人固定。",
+            "Agent / MCP",
+            "统一管理本机 stdio MCP 的邮件读取、资源准备、结果发送、工作区和调用审计。",
         )
-        back = QHBoxLayout()
-        back.addStretch(1)
-        back.addWidget(self._button("← 返回发件", lambda: self.select_page("send"), text_only=True))
-        layout.addLayout(back)
-
-        delivery_card = QFrame()
-        delivery_card.setObjectName("card")
-        delivery_layout = QVBoxLayout(delivery_card)
-        delivery_layout.setContentsMargins(16, 12, 16, 12)
-        delivery_header = QHBoxLayout()
-        delivery_title = QLabel("Agent 交付指令")
-        delivery_title.setObjectName("sectionTitle")
-        delivery_header.addWidget(delivery_title)
-        delivery_header.addStretch(1)
-        delivery_header.addWidget(
-            self._button("复制交付指令", self.copy_agent_delivery_instruction, primary=True)
-        )
-        delivery_layout.addLayout(delivery_header)
-        self.agent_delivery_title_edit = QLineEdit()
-        self.agent_delivery_title_edit.setPlaceholderText("邮件主题（可选）")
-        self.agent_delivery_title_edit.textChanged.connect(
-            self._update_agent_delivery_instruction
-        )
-        delivery_layout.addWidget(self.agent_delivery_title_edit)
-        self.agent_delivery_instruction = QTextEdit()
-        self.agent_delivery_instruction.setReadOnly(True)
-        self.agent_delivery_instruction.setMinimumHeight(260)
-        delivery_layout.addWidget(self.agent_delivery_instruction)
-        delivery_note = QLabel(
-            "指令不会包含本机用户名或工作区绝对路径；产物由 Agent 在当前已授权工作区内直接交付。"
-        )
-        delivery_note.setObjectName("hint")
-        delivery_note.setWordWrap(True)
-        delivery_layout.addWidget(delivery_note)
-        layout.addWidget(delivery_card)
-        self._update_agent_delivery_instruction()
 
         status_card = QFrame()
         status_card.setObjectName("card")
-        status_grid = QGridLayout(status_card)
-        status_grid.setContentsMargins(18, 14, 18, 14)
-        status_grid.setHorizontalSpacing(18)
-        status_grid.setVerticalSpacing(8)
-        status_grid.addWidget(QLabel("MCP 状态"), 0, 0)
+        status_layout = QVBoxLayout(status_card)
+        status_layout.setContentsMargins(18, 14, 18, 14)
+        status_header = QHBoxLayout()
+        status_title = QLabel("MCP 基本状态")
+        status_title.setObjectName("sectionTitle")
+        status_header.addWidget(status_title)
+        status_header.addStretch(1)
         mcp_command, _ = mcp_launch()
         packaged_mcp_ready = not get_runtime_paths().frozen or Path(mcp_command).is_file()
         self.mcp_status_label = QLabel(
-            "已安装 · 按需启动 · stdio" if packaged_mcp_ready else "内部 MCP 组件缺失"
+            "可用 · 本地 stdio" if packaged_mcp_ready else "内部 MCP 组件缺失"
         )
         self.mcp_status_label.setStyleSheet(f"color: {SUCCESS}; font-weight: 700;")
-        status_grid.addWidget(self.mcp_status_label, 0, 1)
-        status_grid.addWidget(QLabel("固定 Gmail"), 1, 0)
+        status_header.addWidget(self.mcp_status_label)
+        status_layout.addLayout(status_header)
+        capability = QLabel(
+            f"版本 {__version__}　支持搜索邮件、读取正文与附件、准备资源到工作区，以及发送最终结果。"
+        )
+        capability.setObjectName("hint")
+        capability.setWordWrap(True)
+        status_layout.addWidget(capability)
         self.mcp_recipient_label = QLabel(self.service.cfg.owner_gmail or "未配置")
-        status_grid.addWidget(self.mcp_recipient_label, 1, 1)
-        status_grid.addWidget(QLabel("允许目录"), 2, 0)
+        self.mcp_recipient_label.hide()
         self.mcp_roots_label = QLabel(
-            "；".join(str(path) for path in self.service.cfg.effective_allowed_send_roots)
+            "\n".join(str(path) for path in self.service.cfg.effective_allowed_send_roots)
         )
         self.mcp_roots_label.setWordWrap(True)
-        status_grid.addWidget(self.mcp_roots_label, 2, 1)
+        self.mcp_roots_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        roots_caption = QLabel("允许目录")
+        roots_caption.setObjectName("fieldLabel")
+        status_layout.addWidget(roots_caption)
+        status_layout.addWidget(self.mcp_roots_label)
         layout.addWidget(status_card)
+
+        read_card = QFrame()
+        read_card.setObjectName("card")
+        read_layout = QVBoxLayout(read_card)
+        read_layout.setContentsMargins(18, 14, 18, 14)
+        read_header = QHBoxLayout()
+        read_title = QLabel("邮件读取")
+        read_title.setObjectName("sectionTitle")
+        read_header.addWidget(read_title)
+        read_header.addStretch(1)
+        self.mcp_read_status_label = QLabel()
+        self.mcp_read_status_label.setObjectName("hint")
+        read_header.addWidget(self.mcp_read_status_label)
+        self.mcp_read_switch = ToggleSwitch()
+        self._loading_mcp_read_access = True
+        self.mcp_read_switch.setChecked(bool(self.service.cfg.mcp_mail_read_enabled))
+        self._loading_mcp_read_access = False
+        self.mcp_read_switch.toggled.connect(self._toggle_mcp_read_access)
+        read_header.addWidget(self.mcp_read_switch)
+        read_layout.addLayout(read_header)
+        read_hint = QLabel(
+            "启用后，能启动这份 MCP 配置的本机进程可按工具边界读取本地邮件归档。"
+            "不读取凭据，不修改或删除邮件，不逐封授权；可随时关闭。"
+        )
+        read_hint.setObjectName("hint")
+        read_hint.setWordWrap(True)
+        read_layout.addWidget(read_hint)
+        sync_row = QHBoxLayout()
+        sync_row.addWidget(QLabel("同步状态"))
+        self.mcp_sync_status_label = QLabel("尚未刷新")
+        self.mcp_sync_status_label.setObjectName("fieldLabel")
+        sync_row.addWidget(self.mcp_sync_status_label, 1)
+        read_layout.addLayout(sync_row)
+        layout.addWidget(read_card)
+        self._update_mcp_read_status()
+
+        config_card = QFrame()
+        config_card.setObjectName("card")
+        config_layout = QVBoxLayout(config_card)
+        config_layout.setContentsMargins(18, 14, 18, 14)
+        config_title = QLabel("统一配置")
+        config_title.setObjectName("sectionTitle")
+        config_layout.addWidget(config_title)
+        config_hint = QLabel("所有兼容本地 stdio MCP 的 Agent 共用同一个服务、配置和工具。")
+        config_hint.setObjectName("hint")
+        config_hint.setWordWrap(True)
+        config_layout.addWidget(config_hint)
+        config_actions = QHBoxLayout()
+        config_actions.addWidget(
+            self._button("复制 MCP 配置", lambda: self._copy_mcp_config("json"), primary=True)
+        )
+        config_actions.addWidget(self._button("查看接入说明", self._show_mcp_setup_guide))
+        config_actions.addWidget(self._button("MCP 自检", self.run_mcp_self_check))
+        config_actions.addStretch(1)
+        config_layout.addLayout(config_actions)
+        layout.addWidget(config_card)
+
+        example_card = QFrame()
+        example_card.setObjectName("card")
+        example_layout = QHBoxLayout(example_card)
+        example_layout.setContentsMargins(18, 14, 18, 14)
+        example_title = QLabel("示例指令")
+        example_title.setObjectName("sectionTitle")
+        example_layout.addWidget(example_title)
+        example_layout.addStretch(1)
+        example_layout.addWidget(
+            self._button("复制收件示例指令", lambda: self._copy_mcp_example("receive"))
+        )
+        example_layout.addWidget(
+            self._button("复制发件示例指令", lambda: self._copy_mcp_example("send"))
+        )
+        layout.addWidget(example_card)
 
         workspace_card = QFrame()
         workspace_card.setObjectName("card")
@@ -1794,7 +1862,8 @@ class BridgeWindow(QMainWindow):
         )
         workspace_layout.addLayout(workspace_header)
         workspace_hint = QLabel(
-            "只授权明确的项目目录；驱动器根目录、用户目录、AppData 和产品数据目录会被拒绝。变更从下一次 MCP 会话生效。"
+            "工作区只影响发件源路径和邮件资源准备目标，不限制本地邮件事实查询。"
+            "驱动器根目录、用户目录、AppData 和产品数据目录会被拒绝。"
         )
         workspace_hint.setObjectName("hint")
         workspace_hint.setWordWrap(True)
@@ -1804,58 +1873,34 @@ class BridgeWindow(QMainWindow):
         workspace_table_header = self.agent_workspace_table.horizontalHeader()
         workspace_table_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         workspace_table_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        self.agent_workspace_table.setColumnWidth(1, 82)
+        self.agent_workspace_table.setColumnWidth(1, 154)
         self.agent_workspace_table.setTextElideMode(Qt.TextElideMode.ElideNone)
         workspace_layout.addWidget(self.agent_workspace_table)
         layout.addWidget(workspace_card)
-
-        command_title = QLabel("本地启动与 Agent 配置")
-        command_title.setObjectName("sectionTitle")
-        layout.addWidget(command_title)
-        self.mcp_command_text = QTextEdit()
-        self.mcp_command_text.setReadOnly(True)
-        self.mcp_command_text.setFixedHeight(104)
-        command, args = mcp_launch()
-        launch_text = (
-            subprocess.list2cmdline([command, *args])
-            if get_runtime_paths().frozen
-            else "python -m agent_mail_bridge.mcp_server"
-        )
-        self.mcp_command_text.setPlainText(
-            f"内部接口：{launch_text}\n按需启动，会话结束自动退出\n\n"
-            f"Codex：{mcp_client_command('codex')}\n"
-            f"Claude Code：{mcp_client_command('claude')}"
-        )
-        layout.addWidget(self.mcp_command_text)
-        actions = QHBoxLayout()
-        actions.addWidget(self._button("复制 Codex 配置", lambda: self._copy_mcp_config("codex")))
-        actions.addWidget(self._button("复制 Claude Code 配置", lambda: self._copy_mcp_config("claude")))
-        actions.addWidget(self._button("复制通用 JSON", lambda: self._copy_mcp_config("json")))
-        actions.addWidget(self._button("MCP 自检", self.run_mcp_self_check))
-        self.mcp_refresh_button = self._button("刷新调用记录", primary=True)
-        self.mcp_refresh_button.clicked.connect(
-            lambda: self.request_refresh(self.mcp_refresh_button)
-        )
-        actions.addWidget(self.mcp_refresh_button)
-        actions.addStretch(1)
-        layout.addLayout(actions)
 
         calls_title = QLabel("最近 MCP 调用")
         calls_title.setObjectName("sectionTitle")
         layout.addWidget(calls_title)
         self.mcp_table = DataTable(
-            ["调用时间", "request_id", "文件路径", "发送状态", "错误代码"]
+            ["调用时间", "操作", "目标", "状态", "详情"]
         )
-        self.mcp_table.setMinimumHeight(170)
+        self.mcp_table.setObjectName("mailRecordTable")
+        self.mcp_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.mcp_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.mcp_table.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self.mcp_table.setWordWrap(True)
+        self.mcp_table.cellDoubleClicked.connect(self._open_mcp_call_detail)
+        self.mcp_table.setMinimumHeight(220)
         header = self.mcp_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        self.mcp_table.setColumnWidth(4, 92)
         layout.addWidget(self.mcp_table, 1)
         security = QLabel(
-            "安全边界：Agent 不能指定收件人、读取凭据、修改邮箱配置、删除文件或扫描任意目录。"
+            "安全边界：Agent 不能指定收件人、读取凭据、修改或删除邮件，也不能扫描任意目录。"
         )
         security.setObjectName("hint")
         security.setWordWrap(True)
@@ -2362,8 +2407,12 @@ class BridgeWindow(QMainWindow):
         self.page_stack.setCurrentWidget(self.pages[target])
         if hasattr(self, "right_panel"):
             self.right_panel.setVisible(target in {"inbox", "send", "agent"})
-        tab_target = "send" if target == "agent" else target
+        tab_target = target if target in {"inbox", "send"} else ""
         self._set_exclusive_checked(self.tab_buttons, tab_target)
+        if hasattr(self, "global_refresh_button"):
+            visible = target in {"inbox", "send"}
+            self.global_refresh_button.setVisible(visible)
+            self.global_refresh_label.setVisible(visible)
         nav_target = {
             "maintenance": "files_data",
             "advanced": "settings",
@@ -3299,6 +3348,7 @@ class BridgeWindow(QMainWindow):
                 raise RuntimeError(managed_result.message)
             maintenance = self.service.get_maintenance_status()
             auto_receive = self.service.get_auto_receive_state().details
+            mail_sync = self.service.get_mail_sync_status().details
             workspaces = self.service.list_agent_workspaces().details.get(
                 "workspaces", []
             )
@@ -3319,6 +3369,7 @@ class BridgeWindow(QMainWindow):
                 "managed_files": managed_result.details.get("files", []),
                 "maintenance": maintenance.to_dict(),
                 "auto_receive": auto_receive,
+                "mail_sync": mail_sync,
                 "workspaces": workspaces,
             },
         )
@@ -3338,6 +3389,7 @@ class BridgeWindow(QMainWindow):
         self.mcp_rows = result.details.get("mcp", [])
         self.managed_file_rows = result.details.get("managed_files", [])
         self._update_auto_receive_status(result.details.get("auto_receive", {}))
+        self._update_mcp_read_status(result.details.get("mail_sync", {}))
         self._apply_config_to_controls(status)
         if self.inbox_search.text().strip():
             self._filter_inbox()
@@ -3941,20 +3993,114 @@ class BridgeWindow(QMainWindow):
             return
         self.mcp_recipient_label.setText(self.service.cfg.owner_gmail or "未配置")
         self.mcp_roots_label.setText(
-            "；".join(str(path) for path in self.service.cfg.effective_allowed_send_roots)
+            "\n".join(str(path) for path in self.service.cfg.effective_allowed_send_roots)
         )
         self.mcp_table.setRowCount(0)
         for index, row in enumerate(self.mcp_rows):
             self.mcp_table.insertRow(index)
+            tool_name = str(row.get("tool_name") or "submit_result")
             values = [
-                self._short_time(row.get("created_at"), include_date=True),
-                str(row.get("request_id") or "—"),
-                str(row.get("file_path") or "已隐藏越界路径"),
-                str(row.get("status") or "—"),
-                str(row.get("error_code") or "—"),
+                self._short_time(row.get("called_at") or row.get("created_at"), include_date=True),
+                self._mcp_operation_text(tool_name),
+                self._mcp_target_text(row),
+                self._mcp_status_text(str(row.get("status") or "")),
             ]
             for column, value in enumerate(values):
-                self.mcp_table.setItem(index, column, QTableWidgetItem(value))
+                item = QTableWidgetItem(value)
+                item.setData(Qt.ItemDataRole.UserRole, row)
+                if column == 2:
+                    full_path = str(
+                        row.get("prepared_path")
+                        or row.get("source_path")
+                        or row.get("file_path")
+                        or ""
+                    )
+                    item.setToolTip(full_path or value)
+                self.mcp_table.setItem(index, column, item)
+            detail = self._button(
+                "查看详情",
+                lambda checked=False, value=row: self._show_mcp_call_detail(value),
+                text_only=True,
+            )
+            detail.setObjectName("compactButton")
+            self.mcp_table.setCellWidget(index, 4, detail)
+            self.mcp_table.setRowHeight(
+                index,
+                self._wrapped_row_height(self.mcp_table, ((2, values[2]),), minimum=48),
+            )
+
+    @staticmethod
+    def _mcp_operation_text(tool_name: str) -> str:
+        return {
+            "search_mails": "搜索邮件",
+            "get_mail": "读取邮件",
+            "read_mail_resource": "读取附件",
+            "prepare_mail_resources": "准备资源",
+            "list_agent_workspaces": "查询工作区",
+            "get_mail_sync_status": "查询同步",
+            "submit_result": "发送结果",
+        }.get(tool_name, "MCP 调用")
+
+    @staticmethod
+    def _mcp_status_text(status: str) -> str:
+        return {
+            "success": "成功",
+            "no_changes": "成功",
+            "partial": "部分完成",
+            "duplicate": "已完成",
+            "sent": "成功",
+            "read_access_disabled": "读取已关闭",
+            "failed": "失败",
+        }.get(status, status or "未知")
+
+    @staticmethod
+    def _mcp_target_text(row: dict) -> str:
+        target = str(row.get("target_summary") or "").strip()
+        if target:
+            return target
+        path = str(row.get("file_path") or row.get("source_path") or "")
+        if path:
+            parent = Path(path).parent.name
+            return f"文件：{Path(path).name}" + (f"（{parent}）" if parent else "")
+        return str(row.get("mail_id") or row.get("resource_id") or row.get("request_id") or "MCP 调用")
+
+    def _open_mcp_call_detail(self, row_index: int, _column: int) -> None:
+        if row_index < 0 or row_index >= len(self.mcp_rows):
+            return
+        self._show_mcp_call_detail(self.mcp_rows[row_index])
+
+    def _show_mcp_call_detail(self, row: dict) -> None:
+        details = row.get("details") if isinstance(row.get("details"), dict) else {}
+        hashes = details.get("hashes") or []
+        hash_text = "\n".join(
+            f"{item.get('filename') or item.get('resource_id')}  {item.get('sha256') or ''}"
+            for item in hashes
+        )
+        if not hash_text and details.get("source_sha256"):
+            hash_text = str(details.get("source_sha256"))
+        self._show_structured_detail(
+            "MCP 调用详情",
+            (
+                ("调用时间", row.get("called_at") or row.get("created_at")),
+                ("操作", self._mcp_operation_text(str(row.get("tool_name") or "submit_result"))),
+                ("工具名", row.get("tool_name") or "submit_result"),
+                ("状态", self._mcp_status_text(str(row.get("status") or ""))),
+                ("错误代码", row.get("error_code")),
+                ("查询条件", row.get("query_summary")),
+                ("目标", self._mcp_target_text(row)),
+                ("request_id", row.get("request_id")),
+                ("mail_id", row.get("mail_id")),
+                ("resource_id", row.get("resource_id")),
+                ("源路径", row.get("source_path") or row.get("file_path")),
+                ("准备后路径", row.get("prepared_path") or row.get("staged_path")),
+                ("结果数量", row.get("result_count")),
+                ("返回字节", row.get("bytes_returned")),
+                ("耗时", f"{int(row.get('duration_ms') or 0)} ms"),
+                ("触发同步", "是" if row.get("sync_triggered") else "否"),
+                ("使用缓存", "是" if row.get("cached") else "否"),
+                ("资源 Hash", hash_text),
+            ),
+        )
 
     def _schedule_inbox_filter(self, _text: str = "") -> None:
         self.inbox_search_timer.start()
@@ -4598,33 +4744,72 @@ class BridgeWindow(QMainWindow):
     def _return_from_outbound_detail(self) -> None:
         self.select_page(self._detail_return_page)
 
-    def _update_agent_delivery_instruction(self, *_args) -> None:
-        if not hasattr(self, "agent_delivery_instruction"):
+    def _toggle_mcp_read_access(self, enabled: bool) -> None:
+        if self._loading_mcp_read_access:
             return
-        title = " ".join(self.agent_delivery_title_edit.text().split())
-        subject_instruction = (
-            f"邮件主题使用：{title}。"
-            if title
-            else "邮件主题由你根据最终交付内容生成简洁、准确的标题。"
+        if enabled:
+            confirmation = QMessageBox.question(
+                self,
+                "启用本机 Agent 邮件读取",
+                "启用后，能启动当前 MCP 配置的本机进程可以按工具边界搜索和读取本地邮件归档。\n\n"
+                "该授权不是逐封分享；不会开放凭据、任意文件路径或邮件修改能力。是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if confirmation != QMessageBox.StandardButton.Yes:
+                self._loading_mcp_read_access = True
+                self.mcp_read_switch.setChecked(False)
+                self._loading_mcp_read_access = False
+                self._update_mcp_read_status()
+                return
+        result = self.service.set_mcp_mail_read_access(enabled)
+        if not result.ok:
+            self._loading_mcp_read_access = True
+            self.mcp_read_switch.setChecked(not enabled)
+            self._loading_mcp_read_access = False
+        self._update_mcp_read_status()
+        self._show_service_result(result)
+
+    def _update_mcp_read_status(self, sync: dict | None = None) -> None:
+        if not hasattr(self, "mcp_read_status_label"):
+            return
+        enabled = bool(self.service.cfg.mcp_mail_read_enabled)
+        self.mcp_read_status_label.setText("读取已启用" if enabled else "读取已关闭")
+        self.mcp_read_status_label.setStyleSheet(
+            f"color: {SUCCESS if enabled else TEXT_MUTED}; font-weight: 700;"
         )
-        self.agent_delivery_instruction.setPlainText(
-            "请使用已配置的 agent-mail-bridge MCP，将本轮任务的最终交付文件发送给我。\n\n"
-            "你需要根据当前任务上下文自行识别最终交付文件，不要要求我再次提供文件路径。\n"
-            f"{subject_instruction}\n\n"
-            "要求：\n"
-            "1. 使用 agent-mail-bridge 的 submit_result。\n"
-            "2. 不修改、重写或重新编码最终文件，也不为发送重新生成内容相同的副本。\n"
-            "3. 使用稳定 request_id；同一次交付重试复用同一 request_id。\n"
-            "4. 直接提交最终文件原路径，不自行使用 PowerShell、Copy-Item、cp 或临时脚本把文件复制到 AgentMailBridge Data 目录。\n"
-            "5. 如果返回 path_not_allowed，停止发送并说明需要授权哪个工作区，不擅自扩大路径权限。\n"
-            "6. 如果 MCP transport closed，不循环重复提交，明确报告连接状态。\n"
-            "7. 成功后报告 filename、size_bytes、send_status、SHA-256 和 request_id。\n"
-            "8. duplicate 表示该 request_id 已交付，不得再次重复发送。"
+        if sync is None:
+            sync = self.service.get_mail_sync_status().details
+        freshness = {
+            "fresh": "数据新鲜",
+            "stale": "本地数据较旧",
+            "unknown": "尚无成功同步时间",
+        }.get(str(sync.get("freshness") or ""), "状态未知")
+        running = "同步中" if sync.get("is_syncing") else "后台已开启" if sync.get("enabled") else "后台未开启"
+        last_success = self._short_time(sync.get("last_success_at"), include_date=True)
+        self.mcp_sync_status_label.setText(f"{running}　{freshness}　上次成功 {last_success}")
+
+    def _show_mcp_setup_guide(self) -> None:
+        command, args = mcp_launch()
+        self._show_structured_detail(
+            "MCP 接入说明",
+            (
+                ("服务名称", "agent-mail-bridge"),
+                ("传输方式", "本机 stdio，按需启动，会话结束退出"),
+                ("启动程序", subprocess.list2cmdline([command, *args])),
+                ("通用配置", generic_mcp_json()),
+                ("Codex 命令", mcp_client_command("codex")),
+                ("Claude Code 命令", mcp_client_command("claude")),
+            ),
         )
 
-    def copy_agent_delivery_instruction(self) -> None:
-        QApplication.clipboard().setText(self.agent_delivery_instruction.toPlainText())
-        self.show_message("交付指令已复制", "success")
+    def _copy_mcp_example(self, kind: str) -> None:
+        examples = {
+            "receive": "请调用 AgentMailBridge MCP，根据当前任务需要搜索并读取相关邮件及附件。",
+            "send": "请调用 AgentMailBridge MCP，将当前任务最终结果发送到我的邮箱。",
+        }
+        QApplication.clipboard().setText(examples[kind])
+        self.show_message("示例指令已复制", "success")
 
     def _populate_agent_workspaces(self, workspaces: list[str] | None = None) -> None:
         values = workspaces
@@ -4637,17 +4822,38 @@ class BridgeWindow(QMainWindow):
             item.setToolTip(str(raw_path))
             item.setData(Qt.ItemDataRole.UserRole, str(raw_path))
             self.agent_workspace_table.setItem(index, 0, item)
+            actions = QWidget()
+            actions_layout = QHBoxLayout(actions)
+            actions_layout.setContentsMargins(4, 3, 4, 3)
+            actions_layout.setSpacing(5)
+            copy_button = self._button(
+                "复制路径",
+                lambda checked=False, value=str(raw_path): self._copy_agent_workspace_path(value),
+                text_only=True,
+            )
             remove = self._button(
                 "移除",
                 lambda checked=False, value=str(raw_path): self.remove_agent_workspace(value),
                 text_only=True,
             )
+            copy_button.setObjectName("compactButton")
             remove.setObjectName("compactButton")
-            self.agent_workspace_table.setCellWidget(index, 1, remove)
-            self.agent_workspace_table.setRowHeight(index, 46)
+            actions_layout.addWidget(copy_button)
+            actions_layout.addWidget(remove)
+            self.agent_workspace_table.setCellWidget(index, 1, actions)
+            self.agent_workspace_table.setRowHeight(
+                index,
+                self._wrapped_row_height(
+                    self.agent_workspace_table, ((0, str(raw_path)),), minimum=46
+                ),
+            )
         self.mcp_roots_label.setText(
-            "；".join(str(path) for path in self.service.cfg.effective_allowed_send_roots)
+            "\n".join(str(path) for path in self.service.cfg.effective_allowed_send_roots)
         )
+
+    def _copy_agent_workspace_path(self, raw_path: str) -> None:
+        QApplication.clipboard().setText(raw_path)
+        self.show_message("工作区路径已复制", "success")
 
     def add_agent_workspace_from_dialog(self) -> None:
         path = QFileDialog.getExistingDirectory(

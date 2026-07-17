@@ -1,3 +1,3 @@
 """AgentMailBridge 的单一产品版本来源。"""
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"

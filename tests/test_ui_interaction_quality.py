@@ -61,13 +61,20 @@ def test_no_changes_is_neutral_and_partial_is_warning(quality_window):
     assert "FFF8E8" in quality_window.message_bar.styleSheet()
 
 
-def test_inbox_has_one_refresh_in_title_and_no_recent_log_refresh(quality_window):
+def test_receive_and_send_share_one_global_refresh(quality_window):
     inbox = quality_window.pages["inbox"]
     refresh_buttons = [
         button for button in inbox.findChildren(QPushButton) if button.text() == "刷新"
     ]
-    assert refresh_buttons == [quality_window.inbox_refresh_button]
-    assert not quality_window.inbox_refresh_button.icon().isNull()
+    assert refresh_buttons == []
+    assert quality_window.inbox_refresh_button is quality_window.global_refresh_button
+    assert not quality_window.global_refresh_button.icon().isNull()
+    quality_window.select_page("inbox")
+    assert quality_window.global_refresh_button.isVisible()
+    quality_window.select_page("send")
+    assert quality_window.global_refresh_button.isVisible()
+    quality_window.select_page("agent")
+    assert not quality_window.global_refresh_button.isVisible()
 
 
 def test_file_table_removes_path_column_but_keeps_complete_value_and_real_actions(quality_window, quality_app, tmp_path, monkeypatch):

@@ -42,10 +42,10 @@ def _all_text(widget) -> str:
 def test_final_primary_navigation_is_unique(v1_window):
     assert [button.text() for button in v1_window.tab_buttons.values()] == ["收件", "发件"]
     assert [button.text() for button in v1_window.nav_buttons.values()] == [
-        "历史记录", "文件与数据", "设置", "关于",
+        "Agent / MCP", "历史记录", "文件与数据", "设置", "关于",
     ]
     assert "advanced" not in v1_window.tab_buttons
-    assert "agent" not in v1_window.nav_buttons
+    assert "agent" in v1_window.nav_buttons
 
 
 def test_secondary_pages_keep_parent_navigation_context(v1_window):
@@ -54,7 +54,8 @@ def test_secondary_pages_keep_parent_navigation_context(v1_window):
     v1_window.select_page("maintenance")
     assert v1_window.nav_buttons["files_data"].isChecked()
     v1_window.select_page("agent")
-    assert v1_window.tab_buttons["send"].isChecked()
+    assert v1_window.nav_buttons["agent"].isChecked()
+    assert not any(button.isChecked() for button in v1_window.tab_buttons.values())
 
 
 def test_add_account_is_a_future_extension_demo(v1_qt_app):
@@ -87,10 +88,11 @@ def test_settings_is_primary_and_advanced_has_no_duplicate_account_or_mcp(v1_win
     assert "设置 > 高级设置" in advanced_text
 
 
-def test_send_page_owns_agent_mcp_and_record_management(v1_window):
+def test_send_page_keeps_record_management_without_duplicate_agent_route(v1_window):
     text = _all_text(v1_window.pages["send"])
-    assert "Agent 发件 / MCP" in text
+    assert "Agent 发件 / MCP" not in text
     assert "管理记录" in text
+    assert "复制 MCP 配置" in _all_text(v1_window.pages["agent"])
     v1_window.open_send_history()
     assert v1_window.page_stack.currentWidget() is v1_window.pages["history"]
     assert v1_window.history_type_filter.currentText() == "发件"
@@ -151,9 +153,9 @@ def test_one_click_health_check_aggregates_required_surfaces(v1_window, monkeypa
 
 def test_mcp_panel_preserves_fixed_recipient_and_path_boundary(v1_window):
     text = _all_text(v1_window.pages["agent"])
-    assert "固定 Gmail" in text
     assert "允许目录" in text
     assert "不能指定收件人" in text
+    assert "邮件读取" in text
     assert "MCP 自检" in text
 
 

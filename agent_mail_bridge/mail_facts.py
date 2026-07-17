@@ -8,6 +8,7 @@ from typing import Any
 from agent_mail_bridge.database import get_connection, get_mail_package, query_mail_resources
 from agent_mail_bridge.mail_common import parse_mailboxes
 from agent_mail_bridge.mail_links import classify_mail_link
+from agent_mail_bridge.mail_resource_access import resource_capabilities
 
 
 def list_mail_messages(
@@ -18,11 +19,13 @@ def list_mail_messages(
     date_from: str | None = None,
     date_to: str | None = None,
     sender: str | None = None,
+    recipient: str | None = None,
     subject_keyword: str | None = None,
     has_attachments: bool | None = None,
     status: str | None = None,
     limit: int = 100,
     offset: int = 0,
+    sort: str = "newest",
 ) -> list[dict[str, Any]]:
     safe_limit = _limit(limit)
     safe_offset = max(0, int(offset))
@@ -32,14 +35,20 @@ def list_mail_messages(
     _equal_filter(where, params, "mailbox_ref", mailbox_ref)
     _equal_filter(where, params, "archive_status", status)
     if date_from:
-        where.append("received_at >= ?")
+        where.append("COALESCE(received_at, saved_at) >= ?")
         params.append(date_from)
     if date_to:
-        where.append("received_at <= ?")
+        where.append("COALESCE(received_at, saved_at) <= ?")
         params.append(date_to)
     if sender:
         where.append("from_email LIKE ? COLLATE NOCASE")
         params.append(f"%{sender}%")
+    if recipient:
+        where.append(
+            "(to_emails LIKE ? COLLATE NOCASE OR cc_emails LIKE ? COLLATE NOCASE "
+            "OR bcc_emails LIKE ? COLLATE NOCASE)"
+        )
+        params.extend([f"%{recipient}%"] * 3)
     if subject_keyword:
         where.append("subject LIKE ? COLLATE NOCASE")
         params.append(f"%{subject_keyword}%")
@@ -47,9 +56,11 @@ def list_mail_messages(
         where.append("attachment_count > 0" if has_attachments else "attachment_count = 0")
     clause = " WHERE " + " AND ".join(where) if where else ""
     connection = get_connection(db_path)
+    direction = _sort_direction(sort)
     rows = connection.execute(
         f"SELECT * FROM mail_packages{clause} "
-        "ORDER BY COALESCE(received_at, saved_at) DESC, id DESC LIMIT ? OFFSET ?",
+        f"ORDER BY COALESCE(received_at, saved_at) {direction}, id {direction} "
+        "LIMIT ? OFFSET ?",
         (*params, safe_limit, safe_offset),
     ).fetchall()
     return [_package_dto(dict(row)) for row in rows]
@@ -119,12 +130,13 @@ def get_mail_thread(
     if not rows:
         return None
     messages = [_package_dto(dict(row)) for row in rows]
-    return {
+    result = {
         "thread_ref": thread_ref,
         "account_ref": messages[0]["account_ref"],
         "message_count": len(messages),
         "messages": messages,
     }
+    return result
 
 
 def search_mail_facts(
@@ -135,12 +147,16 @@ def search_mail_facts(
     mailbox_ref: str | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
+    subject: str | None = None,
+    sender: str | None = None,
+    recipient: str | None = None,
+    has_attachments: bool | None = None,
+    status: str | None = None,
     limit: int = 100,
     offset: int = 0,
+    sort: str = "newest",
 ) -> list[dict[str, Any]]:
     keyword = " ".join((query or "").split())
-    if not keyword:
-        return []
     where: list[str] = []
     params: list[Any] = []
     for token in keyword.split(" "):
@@ -175,15 +191,49 @@ def search_mail_facts(
         where.append("p.mailbox_ref = ?")
         params.append(mailbox_ref)
     if date_from:
-        where.append("p.received_at >= ?")
+        where.append("COALESCE(p.received_at, p.saved_at) >= ?")
         params.append(date_from)
     if date_to:
-        where.append("p.received_at <= ?")
+        where.append("COALESCE(p.received_at, p.saved_at) <= ?")
         params.append(date_to)
+    if subject:
+        where.append("p.subject LIKE ? COLLATE NOCASE")
+        params.append(f"%{subject}%")
+    if sender:
+        where.append("p.from_email LIKE ? COLLATE NOCASE")
+        params.append(f"%{sender}%")
+    if recipient:
+        where.append(
+            "(p.to_emails LIKE ? COLLATE NOCASE OR p.cc_emails LIKE ? COLLATE NOCASE "
+            "OR p.bcc_emails LIKE ? COLLATE NOCASE)"
+        )
+        params.extend([f"%{recipient}%"] * 3)
+    if has_attachments is not None:
+        where.append(
+            "p.attachment_count > 0" if has_attachments else "p.attachment_count = 0"
+        )
+    if status:
+        natural = _matching_status_values(status)
+        if natural:
+            placeholders = ",".join("?" for _ in natural)
+            where.append(
+                f"(lower(p.archive_status) IN ({placeholders}) "
+                f"OR lower(p.parse_status) IN ({placeholders}))"
+            )
+            params.extend(natural)
+            params.extend(natural)
+        else:
+            where.append(
+                "(p.archive_status = ? COLLATE NOCASE OR p.parse_status = ? COLLATE NOCASE)"
+            )
+            params.extend([status, status])
     connection = get_connection(db_path)
+    direction = _sort_direction(sort)
+    clause = " AND ".join(where) if where else "1 = 1"
     rows = connection.execute(
-        f"SELECT p.* FROM mail_packages p WHERE {' AND '.join(where)} "
-        "ORDER BY COALESCE(p.received_at, p.saved_at) DESC, p.id DESC LIMIT ? OFFSET ?",
+        f"SELECT p.* FROM mail_packages p WHERE {clause} "
+        f"ORDER BY COALESCE(p.received_at, p.saved_at) {direction}, p.id {direction} "
+        "LIMIT ? OFFSET ?",
         (*params, _limit(limit), max(0, int(offset))),
     ).fetchall()
     return [_package_dto(dict(row)) for row in rows]
@@ -192,7 +242,7 @@ def search_mail_facts(
 def _package_dto(row: dict[str, Any]) -> dict[str, Any]:
     body = str(row.get("search_text") or "")
     package_root = str(row.get("package_root") or "")
-    return {
+    result = {
         "package_id": str(row.get("package_id") or ""),
         "account_ref": str(row.get("account_ref") or ""),
         "mailbox_ref": str(row.get("mailbox_ref") or ""),
@@ -236,6 +286,7 @@ def _package_dto(row: dict[str, Any]) -> dict[str, Any]:
         "package_root": package_root,
         "legacy": bool(row.get("legacy")),
     }
+    return result
 
 
 def _matching_status_values(token: str) -> list[str]:
@@ -271,7 +322,7 @@ def _resource_dto(
             anchor_text=str(row.get("display_name") or ""),
         )
         link_kind = str((classified or {}).get("link_type") or "webpage")
-    return {
+    result = {
         "resource_id": str(row.get("resource_id") or ""),
         "package_id": str(row.get("package_id") or ""),
         "category": _user_category(internal_type),
@@ -292,6 +343,10 @@ def _resource_dto(
         "status_display": _resource_status_display(str(row.get("status") or "")),
         "error": str(row.get("error") or ""),
     }
+    result["capabilities"] = resource_capabilities(result)
+    result["capability"] = result["capabilities"][0]
+    result["available"] = bool(result.get("absolute_path")) and "unavailable" not in result["capabilities"]
+    return result
 
 
 def _user_category(internal_type: str) -> str:
@@ -362,3 +417,12 @@ def _limit(value: int) -> int:
     if number <= 0:
         raise ValueError("limit 必须大于 0")
     return min(number, 500)
+
+
+def _sort_direction(value: str) -> str:
+    normalized = str(value or "newest").strip().lower()
+    if normalized == "newest":
+        return "DESC"
+    if normalized == "oldest":
+        return "ASC"
+    raise ValueError("sort 仅支持 newest 或 oldest")

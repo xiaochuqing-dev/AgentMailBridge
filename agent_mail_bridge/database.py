@@ -141,6 +141,33 @@ CREATE TABLE IF NOT EXISTS mcp_calls (
     updated_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS mcp_audit_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    call_id TEXT NOT NULL UNIQUE,
+    called_at TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    operation_type TEXT NOT NULL,
+    client_name TEXT,
+    session_id TEXT,
+    request_id TEXT,
+    query_summary TEXT,
+    mail_id TEXT,
+    resource_id TEXT,
+    result_count INTEGER,
+    target_summary TEXT,
+    source_path TEXT,
+    prepared_path TEXT,
+    status TEXT NOT NULL,
+    error_code TEXT,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    bytes_returned INTEGER NOT NULL DEFAULT 0,
+    cached INTEGER NOT NULL DEFAULT 0,
+    ensure_fresh INTEGER NOT NULL DEFAULT 0,
+    sync_triggered INTEGER NOT NULL DEFAULT 0,
+    details_json TEXT
+);
+
 CREATE TABLE IF NOT EXISTS mail_packages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     package_id TEXT NOT NULL UNIQUE,
@@ -339,6 +366,10 @@ CREATE INDEX IF NOT EXISTS idx_mcp_calls_created
     ON mcp_calls(created_at);
 CREATE INDEX IF NOT EXISTS idx_mcp_calls_request_id
     ON mcp_calls(request_id);
+CREATE INDEX IF NOT EXISTS idx_mcp_audit_called
+    ON mcp_audit_events(called_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_mcp_audit_tool
+    ON mcp_audit_events(tool_name, called_at DESC);
 CREATE INDEX IF NOT EXISTS idx_receive_retries_next_retry
     ON receive_retries(next_retry_at);
 """
@@ -1680,6 +1711,114 @@ def query_recent_mcp_calls(
             "SELECT * FROM mcp_calls ORDER BY id DESC LIMIT ?", (max(1, limit),)
         ).fetchall()
         return [dict(row) for row in rows]
+
+
+def insert_mcp_audit_event(
+    db_path: Path | str,
+    *,
+    call_id: str,
+    called_at: str,
+    completed_at: str,
+    tool_name: str,
+    operation_type: str,
+    status: str,
+    client_name: str | None = None,
+    session_id: str | None = None,
+    request_id: str | None = None,
+    query_summary: str | None = None,
+    mail_id: str | None = None,
+    resource_id: str | None = None,
+    result_count: int | None = None,
+    target_summary: str | None = None,
+    source_path: str | None = None,
+    prepared_path: str | None = None,
+    error_code: str | None = None,
+    duration_ms: int = 0,
+    bytes_returned: int = 0,
+    cached: bool = False,
+    ensure_fresh: bool = False,
+    sync_triggered: bool = False,
+    details: dict[str, Any] | None = None,
+) -> int:
+    """记录统一 MCP 审计；查询和详情均不保存正文或资源内容。"""
+    safe_query = " ".join(str(query_summary or "").split())[:500] or None
+    safe_target = " ".join(str(target_summary or "").split())[:500] or None
+    details_json = json.dumps(details or {}, ensure_ascii=False, sort_keys=True)
+    with _get_conn(db_path) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO mcp_audit_events
+                (call_id, called_at, completed_at, tool_name, operation_type,
+                 client_name, session_id, request_id, query_summary, mail_id,
+                 resource_id, result_count, target_summary, source_path,
+                 prepared_path, status, error_code, duration_ms, bytes_returned,
+                 cached, ensure_fresh, sync_triggered, details_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                call_id, called_at, completed_at, tool_name, operation_type,
+                client_name, session_id, request_id, safe_query, mail_id,
+                resource_id, result_count, safe_target, source_path,
+                prepared_path, status, error_code, max(0, int(duration_ms)),
+                max(0, int(bytes_returned)), 1 if cached else 0,
+                1 if ensure_fresh else 0, 1 if sync_triggered else 0,
+                details_json,
+            ),
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
+
+
+def query_recent_mcp_audit_events(
+    db_path: Path | str, limit: int = 100
+) -> list[dict[str, Any]]:
+    """返回新统一审计，并无损补入尚未迁移的旧 submit_result 记录。"""
+    safe_limit = max(1, min(int(limit), 500))
+    with _get_conn(db_path) as conn:
+        audit_rows = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM mcp_audit_events ORDER BY called_at DESC, id DESC LIMIT ?",
+                (safe_limit,),
+            ).fetchall()
+        ]
+        legacy_rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT c.* FROM mcp_calls c
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM mcp_audit_events a
+                    WHERE a.tool_name = 'submit_result' AND a.request_id = c.request_id
+                )
+                ORDER BY c.id DESC LIMIT ?
+                """,
+                (safe_limit,),
+            ).fetchall()
+        ]
+    unified = list(audit_rows)
+    for row in legacy_rows:
+        unified.append(
+            {
+                **row,
+                "call_id": f"legacy-{row.get('id')}",
+                "called_at": row.get("created_at"),
+                "completed_at": row.get("updated_at"),
+                "tool_name": "submit_result",
+                "operation_type": "send",
+                "target_summary": row.get("title") or Path(str(row.get("file_path") or "")).name,
+                "source_path": row.get("file_path"),
+                "prepared_path": row.get("staged_path"),
+                "duration_ms": 0,
+                "bytes_returned": 0,
+                "cached": 0,
+                "ensure_fresh": 0,
+                "sync_triggered": 0,
+                "details_json": "{}",
+            }
+        )
+    unified.sort(key=lambda row: str(row.get("called_at") or ""), reverse=True)
+    return unified[:safe_limit]
 
 
 def link_sent_file_to_outbound(

@@ -1,6 +1,6 @@
 # AgentMailBridge
 
-AgentMailBridge v1.1.0 是面向个人用户的本地优先 Windows 邮箱桥接工具。它通过 Gmail 收取完整邮件，通过 QQ SMTP 将正文、链接和多个附件作为一封邮件发送到固定 Gmail，并向 Codex、Claude Code 等本地 Agent 提供受控的 stdio MCP 交付能力。
+AgentMailBridge v1.2.0 是面向个人用户的本地优先 Windows 邮箱桥接工具。它在后台通过 Gmail 收取并归档完整邮件，通过 QQ SMTP 将正文、链接和多个附件发送到固定 Gmail，并向任意兼容本地 stdio MCP 的 Agent 提供受控邮件读取、资源准备和结果回邮能力。GUI 只负责配置和观察，不是 Agent 读取本地邮件归档的必经路径。
 
 项目不提供多租户、任意收件人、通用 Gmail MCP、遥测或云同步。邮箱凭据、OAuth、数据库、邮件附件和归档由用户保留在本机。
 
@@ -16,22 +16,21 @@ AgentMailBridge v1.1.0 是面向个人用户的本地优先 Windows 邮箱桥接
 
 - 顶部主工作区只有“收件”和“发件”。
 - 左侧已有 Gmail、QQ 账号卡片用于管理当前账号；“添加邮箱账号”仅展示未来扩展说明，不新增第二个同类型账号。
-- 左侧底部只有“历史记录”“文件与数据”“设置”“关于”。
-- Agent / MCP 位于发件页标题区；高级设置是“设置 > 高级设置”的二级页面。
+- 左侧独立“Agent / MCP”入口与“历史记录”“文件与数据”“设置”“关于”组成贴合的统一导航卡；高级设置是“设置 > 高级设置”的二级页面。
 - 历史记录只回答“发生过什么业务行为”，以产品化摘要、中文状态和结构化详情展示收件、发件和 Agent / MCP；文件与数据管理真实收件文件、发送归档、Agent 结果、存储概览、备份、恢复和一致性扫描。
 - 收件页不重复显示 Gmail 管理卡；正常窗口完整展示今日文件与最近日志，不出现页面级滚动，较矮窗口才启用滚动兜底。数据较多时表格内部滚动，不使用分页。
-- 收件页标题右侧提供唯一刷新入口；“当前收件偏好”支持“仅本人邮件”“当前扫描范围内全部邮件”和“自定义规则”。自定义规则可按发件人/域名、主题关键词和是否含附件过滤，分类之间为 AND、分类内部为 OR；手动与自动收件、Gmail API 与 IMAP 共用同一业务规则。
+- 收件和发件共用顶部唯一“刷新本地页面数据”入口；“当前收件偏好”支持“仅本人邮件”“当前扫描范围内全部邮件”和“自定义规则”。自定义规则可按发件人/域名、主题关键词和是否含附件过滤，分类之间为 AND、分类内部为 OR；手动与自动收件、Gmail API 与 IMAP 共用同一业务规则。
 - 收件结果明确区分成功、无新邮件、部分完成和失败；无新邮件不计入失败或错误。
 - “今日收到邮件”每封邮件只显示一条紧凑记录；正文摘要最多一至两行，附件、邮件图片、链接和下载数量始终可见。双击整行或点击“查看邮件”进入详情查看完整正文和资源。
 - 收件搜索使用邮件事实层，可按主题、发件人、收件人、抄送人、完整可读正文、附件名、邮件图片名、链接文字、域名、URL 和状态查找；同一邮件多个资源命中仍只显示一条。
 - 发件页支持可选主题、正文、0 至多个附件和 0 至多个链接；一次确认只生成并发送一封 MIME 邮件，最近发送与历史记录也按邮件展示。
 - “文件与数据”以 `mail_resources` 作为新收件资源权威来源，并保留未映射旧数据兼容；表格显示所属邮件，可从文件进入邮件详情，也可从邮件详情定位附件。未知大小、真实 0 字节和文件不存在分别显示。
 - 右侧连接健康以五个独立状态项展示 Gmail、QQ SMTP、Agent/MCP、凭据/OAuth 和 SQLite/数据目录，并提供定向处理入口。
-- v1.1.0 的收件和最近发送表格使用统一整行视觉，浅色/深色 Hover 不闪白、不出现竖向单元格分割，同时保持 Windows 中文 UI、线性图标和 100%/125%/150% DPI 适配。
+- v1.2.0 的收件、发件资源和最近调用表格使用统一整行视觉，浅色/深色 Hover 不闪白、不出现竖向单元格分割或选择分块，同时保持 Windows 中文 UI、线性图标和 100%/125%/150% DPI 适配。
 
 ## Windows 安装
 
-运行 `AgentMailBridge-1.1.0-Setup.exe`。默认安装到 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需 Python、Git 或管理员权限。桌面和开始菜单只指向 `AgentMailBridge.exe`；内部 `AgentMailBridgeMCP.exe` 不创建快捷方式、托盘或开机启动项。
+运行 `AgentMailBridge-1.2.0-Setup.exe`。默认安装到 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需 Python、Git 或管理员权限。桌面和开始菜单只指向 `AgentMailBridge.exe`；内部 `AgentMailBridgeMCP.exe` 不创建快捷方式、托盘或开机启动项。
 
 安装版数据位置：
 
@@ -50,7 +49,17 @@ Gmail IMAP 密码和 QQ SMTP 授权码保存在 Windows Credential Manager。界
 
 ## Agent / MCP
 
-在发件页标题区进入“Agent 发件 / MCP”。页面提供可直接复制的完整交付指令和工作区授权管理；指令不要求用户填写最终文件路径，Agent 应自行识别本轮最终交付文件并直接提交原始路径。MCP 按需启动，stdin 关闭后退出，只提供 `submit_result`：
+从左侧进入“Agent / MCP”。页面提供邮件读取总开关、同步状态、单一通用 MCP 配置、两个简短示例、授权工作区和统一最近调用。读取开关默认关闭；用户启用一次后，本机兼容 MCP 的 Agent 可直接搜索本地归档，不需要逐封分享、打开 GUI、复制 AppData 路径或重新上传附件。MCP 按需启动，stdin 关闭后退出，提供七个工具：
+
+- `search_mails`：按最新、今天、昨天、最近若干天或日期范围搜索，支持主题、发件人、收件人、附件和状态过滤。
+- `get_mail`：分页读取邮件元数据、完整可读正文和资源清单。
+- `read_mail_resource`：严格按邮件归属分页读取文本、CSV/TSV、图片元数据和真实 raw.eml，二进制只返回安全描述。
+- `prepare_mail_resources`：把指定资源原子复制到授权工作区，校验大小和 SHA-256，不执行、不解压。
+- `list_agent_workspaces`：列出明确授权的工作区。
+- `get_mail_sync_status`：读取后台同步、新鲜度、重试和跨进程互斥状态。
+- `submit_result`：保持向后兼容，把 Agent 最终结果发送到固定 Gmail。
+
+`submit_result` 结构仍为：
 
 ```json
 {
@@ -60,11 +69,11 @@ Gmail IMAP 密码和 QQ SMTP 授权码保存在 Windows Credential Manager。界
 }
 ```
 
-收件人固定为 `OWNER_GMAIL`，文件必须位于 `DATA_ROOT` 或用户明确授权的工作区。授权只在下一次 Agent/MCP 进程启动时生效，并拒绝磁盘根目录、用户主目录、Windows、Program Files、ProgramData、AppData、产品数据目录和秘密文件。GUI 手动选择全局文件不会扩大 Agent 信任范围。
+邮件读取只能访问 `DATA_ROOT` 内的规范归档，不能读取凭据或任意文件系统路径；资源准备只能写入用户明确授权的工作区。收件人固定为 `OWNER_GMAIL`，提交文件必须位于 `DATA_ROOT` 或授权工作区。授权拒绝磁盘根目录、用户主目录、Windows、Program Files、ProgramData、AppData、产品数据目录和秘密文件。GUI 手动选择全局文件不会扩大 Agent 信任范围。
 
 Windows MCP stdin、stdout 和 stderr 明确使用 UTF-8，首条请求可兼容 UTF-8 BOM；stdout 只输出逐行 JSON-RPC 并在每条响应后 flush。中文目录、中文文件名、空格路径和中文标题可直接提交，不需要 Agent 修改 code page 或手工执行 Copy-Item。
 
-`submit_result` 会先验证源路径仍在允许目录，再原子复制到产品受控 staging，并校验 source、staged、SMTP 附件来源与 sent 归档的大小和 SHA-256。结果返回文件名、字节数和完整 Hash 链，`mcp_calls` 保存 staging 状态与失败原因；安全白名单和固定收件人不变。
+`submit_result` 会先验证源路径仍在允许目录，再原子复制到产品受控 staging，并校验 source、staged、SMTP 附件来源与 sent 归档的大小和 SHA-256。读取、准备、同步和发送统一写入 `mcp_audit_events`，旧 `mcp_calls` 保持兼容；审计不保存完整邮件正文、附件内容或秘密。
 
 ## 自动收件可靠性
 
@@ -97,8 +106,8 @@ powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
 
 流程会清理旧构建、运行 pytest、构建 GUI 与内部 MCP、执行 packaged smoke 和秘密排除扫描，并生成：
 
-- `release\AgentMailBridge-1.1.0-Setup.exe`
-- `release\AgentMailBridge-1.1.0-Windows-x64.zip`
+- `release\AgentMailBridge-1.2.0-Setup.exe`
+- `release\AgentMailBridge-1.2.0-Windows-x64.zip`
 - `release\checksums.sha256`
 
-详细说明见 `docs/GUI使用说明.md`、`docs/MCP使用说明.md`、`docs/安全与诊断说明.md`、`docs/Windows安装与升级说明.md`、`docs/统一邮件归档设计.md`、`docs/邮件事实查询说明.md` 和最终专项报告。
+详细说明见 `docs/GUI使用说明.md`、`docs/MCP使用说明.md`、`docs/Agent邮件读取与资源交付设计.md`、`docs/MCP邮件读取工具说明.md`、`docs/安全与诊断说明.md`、`docs/Windows安装与升级说明.md`、`docs/统一邮件归档设计.md`、`docs/邮件事实查询说明.md` 和最终专项报告。

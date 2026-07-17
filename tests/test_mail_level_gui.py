@@ -238,23 +238,57 @@ def test_composer_sends_body_three_attachments_and_two_links_as_one_call(
     assert mail_gui_window.send_links == []
 
 
-def test_agent_instruction_has_full_safe_delivery_contract_and_copy(mail_gui_window):
-    mail_gui_window.agent_delivery_title_edit.clear()
-    instruction = mail_gui_window.agent_delivery_instruction.toPlainText()
-    assert "自行识别最终交付文件" in instruction
-    assert "不要要求我再次提供文件路径" in instruction
-    assert "submit_result" in instruction
-    assert "稳定 request_id" in instruction
-    assert "不自行使用 PowerShell、Copy-Item" in instruction
-    assert "path_not_allowed" in instruction
-    assert "transport closed" in instruction
-    assert "duplicate" in instruction
-    assert "C:\\Users\\" not in instruction
+def test_agent_page_is_unified_without_legacy_delivery_template(mail_gui_window):
+    page = mail_gui_window.pages["agent"]
+    text = _page_text(page)
+    assert "复制 MCP 配置" in text
+    assert "查看接入说明" in text
+    assert "MCP 自检" in text
+    assert "复制收件示例指令" in text
+    assert "复制发件示例指令" in text
+    assert "复制交付指令" not in text
+    assert not hasattr(mail_gui_window, "agent_delivery_title_edit")
+    assert not hasattr(mail_gui_window, "agent_delivery_instruction")
+    assert mail_gui_window.mcp_read_switch.isChecked() is False
 
-    mail_gui_window.agent_delivery_title_edit.setText("自定义交付主题")
-    mail_gui_window.copy_agent_delivery_instruction()
-    assert "自定义交付主题" in QApplication.clipboard().text()
-    assert mail_gui_window.message_bar.label.text() == "交付指令已复制"
+    mail_gui_window._copy_mcp_example("receive")
+    assert QApplication.clipboard().text() == (
+        "请调用 AgentMailBridge MCP，根据当前任务需要搜索并读取相关邮件及附件。"
+    )
+
+
+def test_recent_mcp_calls_are_unified_rows_without_literal_separators(mail_gui_window):
+    full_path = str(mail_gui_window.service.cfg.data_root_path / "准备" / "完整文件名.md")
+    mail_gui_window.mcp_rows = [
+        {
+            "called_at": "2026-07-17 10:00:00",
+            "tool_name": "search_mails",
+            "target_summary": "最近 3 天包含提示词的邮件",
+            "status": "success",
+            "result_count": 2,
+        },
+        {
+            "called_at": "2026-07-17 10:01:00",
+            "tool_name": "prepare_mail_resources",
+            "target_summary": "文件：完整文件名.md",
+            "prepared_path": full_path,
+            "status": "success",
+        },
+    ]
+    mail_gui_window._populate_mcp_history()
+    headers = [
+        mail_gui_window.mcp_table.horizontalHeaderItem(index).text()
+        for index in range(mail_gui_window.mcp_table.columnCount())
+    ]
+    assert headers == ["调用时间", "操作", "目标", "状态", "详情"]
+    assert all("|" not in value and "｜" not in value for value in headers)
+    assert mail_gui_window.mcp_table.showGrid() is False
+    assert mail_gui_window.mcp_table.objectName() == "mailRecordTable"
+    assert mail_gui_window.mcp_table.selectionMode().name == "NoSelection"
+    assert mail_gui_window.mcp_table.horizontalHeader().sectionResizeMode(2).name == "Stretch"
+    assert mail_gui_window.mcp_table.item(1, 2).text() == "文件：完整文件名.md"
+    assert mail_gui_window.mcp_table.item(1, 2).toolTip() == full_path
+    assert mail_gui_window.mcp_table.cellWidget(1, 4).text() == "查看详情"
 
 
 def test_recent_sent_table_uses_stretch_columns_and_no_small_fixed_height(mail_gui_window):
@@ -262,7 +296,22 @@ def test_recent_sent_table_uses_stretch_columns_and_no_small_fixed_height(mail_g
     assert header.sectionResizeMode(0).name == "Stretch"
     assert header.sectionResizeMode(1).name == "Stretch"
     assert mail_gui_window.sent_table.maximumHeight() >= 16_777_215
-    assert "Agent 发件 / MCP" in _page_text(mail_gui_window.pages["send"])
+    assert "Agent 发件 / MCP" not in _page_text(mail_gui_window.pages["send"])
+    assert mail_gui_window.nav_buttons["agent"].text() == "Agent / MCP"
+
+
+def test_agent_navigation_is_joined_and_send_resource_rows_have_no_cell_selection(mail_gui_window):
+    nav_card = mail_gui_window.agent_nav_button.parentWidget()
+    assert nav_card.objectName() == "navCard"
+    assert mail_gui_window.nav_buttons["history"].parentWidget() is nav_card
+    for table in (
+        mail_gui_window.send_attachment_table,
+        mail_gui_window.send_link_table,
+    ):
+        assert table.objectName() == "compactResourceTable"
+        assert table.showGrid() is False
+        assert table.selectionMode().name == "NoSelection"
+        assert table.focusPolicy().name == "NoFocus"
 
 
 def test_received_and_sent_tables_use_compact_unified_rows(mail_gui_window):
