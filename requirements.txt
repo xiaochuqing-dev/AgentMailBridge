@@ -12,8 +12,9 @@ google-api-python-client>=2.0.0
 google-auth-httplib2>=0.2.0
 google-auth-oauthlib>=1.0.0
 
-# 第二批次正式桌面界面
-PySide6>=6.8,<7
+# 第二批次正式桌面界面；项目只使用 QtCore/QtGui/QtNetwork/QtWidgets。
+# 使用 Essentials 避免安装未使用的 WebEngine、Multimedia 等 Addons。
+PySide6-Essentials>=6.8,<7
 
 # Windows 凭据使用系统 Credential Manager，标准库 ctypes 实现，无额外依赖
 

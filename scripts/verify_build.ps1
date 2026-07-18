@@ -15,12 +15,20 @@ foreach ($file in @($GuiExe, $McpExe)) {
     if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing build artifact: $file" }
 }
 
+$DistFiles = @(Get-ChildItem -LiteralPath $DistPath -Recurse -File)
 $forbiddenNames = @('.env', 'credentials.json', 'token.json', 'agent_mail_bridge.db')
-$leaks = Get-ChildItem -LiteralPath $DistPath -Recurse -File | Where-Object {
+$leaks = $DistFiles | Where-Object {
     $forbiddenNames -contains $_.Name.ToLowerInvariant() -or
     $_.FullName -match '[\\/]secrets[\\/]'
 }
 if ($leaks) { throw "Forbidden files found in build: $($leaks.FullName -join ', ')" }
+
+$DiscoveryDocuments = @($DistFiles | Where-Object {
+    $_.FullName -match '[\\/]googleapiclient[\\/]discovery_cache[\\/]documents[\\/][^\\/]+\.json$'
+})
+if ($DiscoveryDocuments.Count -ne 1 -or $DiscoveryDocuments[0].Name -ne 'gmail.v1.json') {
+    throw "Packaged Google discovery data must contain only gmail.v1.json: $($DiscoveryDocuments.FullName -join ', ')"
+}
 
 if (-not $SkipSelfTests) {
     $GuiSelfTest = Start-Process -FilePath $GuiExe -ArgumentList "--packaged-self-test" -Wait -PassThru -WindowStyle Hidden

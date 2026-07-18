@@ -45,6 +45,9 @@ Name: "desktopicon"; Description: "在桌面创建 AgentMailBridge 快捷方式�
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
+[InstallDelete]
+Type: filesandordirs; Name: "{app}\_internal"
+
 [Icons]
 Name: "{group}\AgentMailBridge"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Comment: "本地优先的邮箱桥接工具"
 Name: "{autodesktop}\AgentMailBridge"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Comment: "本地优先的邮箱桥接工具"; Tasks: desktopicon

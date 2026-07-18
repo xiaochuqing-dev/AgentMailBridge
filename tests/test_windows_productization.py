@@ -217,5 +217,35 @@ def test_installer_desktop_shortcut_targets_only_the_gui_exe():
     assert "在桌面创建 AgentMailBridge 快捷方式（仅主程序）" in installer
     assert 'Name: "{autodesktop}\\AgentMailBridge"' in installer
     assert 'Filename: "{app}\\{#MyAppExeName}"' in installer
+    assert 'Type: filesandordirs; Name: "{app}\\_internal"' in installer
     icon_section = installer.split("[Icons]", 1)[1].split("[Run]", 1)[0]
     assert "AgentMailBridgeMCP.exe" not in icon_section
+
+
+def test_windows_dependencies_use_pyside_essentials_only():
+    root = Path(__file__).resolve().parents[1]
+    requirements = (root / "requirements.txt").read_text(encoding="utf-8")
+    pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+
+    assert "PySide6-Essentials>=6.8,<7" in requirements
+    assert '"PySide6-Essentials>=6.8,<7"' in pyproject
+    assert "\nPySide6>=" not in requirements
+    assert '"PySide6>=' not in pyproject
+
+
+def test_windows_packaging_keeps_only_gmail_discovery_data():
+    root = Path(__file__).resolve().parents[1]
+    spec = (
+        root / "packaging" / "windows" / "AgentMailBridge.spec"
+    ).read_text(encoding="utf-8")
+    hook = (
+        root
+        / "packaging"
+        / "windows"
+        / "hooks"
+        / "hook-googleapiclient.model.py"
+    ).read_text(encoding="utf-8")
+
+    assert spec.count("hookspath=[str(HOOK_DIR)]") == 2
+    assert 'includes=["documents/gmail.v1.json"]' in hook
+    assert "collect_data_files" in hook

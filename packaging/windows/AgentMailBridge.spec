@@ -10,6 +10,7 @@ ICON = ROOT / "agent_mail_bridge" / "resources" / "branding" / "agentmailbridge.
 VERSION_FILE = ROOT / "packaging" / "windows" / "version_info.txt"
 MCP_VERSION_FILE = ROOT / "packaging" / "windows" / "version_info_mcp.txt"
 RESOURCE_DIR = ROOT / "agent_mail_bridge" / "resources"
+HOOK_DIR = ROOT / "packaging" / "windows" / "hooks"
 
 common_datas = [
     (str(RESOURCE_DIR), "agent_mail_bridge/resources"),
@@ -29,7 +30,7 @@ gui_analysis = Analysis(
     binaries=[],
     datas=common_datas,
     hiddenimports=common_hiddenimports,
-    hookspath=[],
+    hookspath=[str(HOOK_DIR)],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[],
@@ -63,7 +64,7 @@ mcp_analysis = Analysis(
     binaries=[],
     datas=common_datas,
     hiddenimports=common_hiddenimports,
-    hookspath=[],
+    hookspath=[str(HOOK_DIR)],
     hooksconfig={},
     runtime_hooks=[],
     excludes=["PySide6"],
