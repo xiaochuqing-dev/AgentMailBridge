@@ -160,7 +160,11 @@ def _make_message(
 def tmp_cfg(tmp_path: Path) -> AppConfig:
     credentials_path = tmp_path / "credentials.json"
     credentials_path.write_text(
-        '{"installed":{"client_id":"test","client_secret":"test"}}',
+        '{"installed":{"client_id":"1234567890-fake.apps.googleusercontent.com",'
+        '"client_secret":"fake-client-secret-for-tests-only",'
+        '"auth_uri":"https://accounts.google.com/o/oauth2/auth",'
+        '"token_uri":"https://oauth2.googleapis.com/token",'
+        '"redirect_uris":["http://localhost"]}}',
         encoding="utf-8",
     )
     cfg = AppConfig(

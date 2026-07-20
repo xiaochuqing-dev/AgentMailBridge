@@ -10,6 +10,14 @@ Do not expand the project into SaaS, multi-tenant infrastructure, a general emai
 
 - The recipient is fixed by `OWNER_GMAIL`.
 - Gmail OAuth scope must remain exactly `gmail.readonly`.
+- OAuth and Gmail API network operations must never run on the Qt GUI thread.
+- OAuth authorization must be cancellable and time-bounded.
+- OAuth callback servers must close on success, failure, timeout, cancel and application exit.
+- Only Google Desktop installed-app credentials are accepted; Web OAuth credentials are rejected explicitly.
+- A failed credentials or Token replacement must preserve the previous working file.
+- OAuth authorization URLs, callback state/code, Client Secret and Tokens must never enter logs, reports or diagnostics.
+- Successful Token exchange and successful Gmail API verification are distinct states; Gmail API re-verification must reuse a valid Token without reopening browser authorization.
+- Real OAuth acceptance requires manual user interaction; Computer Use and browser automation are forbidden.
 - MCP file access is limited to `DATA_ROOT` and `ALLOWED_SEND_ROOTS`.
 - A GUI user-selected global file does not expand MCP trust.
 - Gmail IMAP and QQ SMTP secrets live in Windows Credential Manager and are never echoed back.
@@ -92,7 +100,7 @@ Use `runtime_paths.py`. Frozen program files are read-only under the install dir
 - Normal automatic no-change checks must not create permanent `app_events` noise; scheduler health belongs in `auto_receive_state`.
 - `app_events` retention may delete only technical events. It must never delete business history, outbound records, MCP audit, retry state, mail packages, resources, raw mail or attachments.
 - File-log rotation and SQLite event retention are separate mechanisms and must both remain bounded.
-- AgentMailBridge v1.1.0 is the current product version. Route B multi-mailbox remains future scope.
+- AgentMailBridge v1.2.1 is the current product version. Route B multi-mailbox remains future scope.
 
 ## History and managed-file invariants
 

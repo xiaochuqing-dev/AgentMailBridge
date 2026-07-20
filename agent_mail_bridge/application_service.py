@@ -16,7 +16,7 @@ import json
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from agent_mail_bridge.config import (
     AppConfig,
@@ -811,7 +811,11 @@ class ApplicationService:
         self, source: str | Path, *, replace: bool = False
     ) -> ServiceResult:
         """验证并把 OAuth 客户端配置导入当前用户的受控目录。"""
-        from agent_mail_bridge.oauth_storage import import_oauth_credentials
+        from agent_mail_bridge.oauth_storage import (
+            OAuthImportError,
+            import_oauth_credentials,
+            validate_oauth_credentials_file,
+        )
 
         try:
             target = import_oauth_credentials(
@@ -825,35 +829,71 @@ class ApplicationService:
                 error_code="oauth_credentials_exists",
                 message=str(exc),
             )
-        except (OSError, ValueError) as exc:
+        except OAuthImportError as exc:
             return ServiceResult(
                 OperationStatus.FAILED,
-                error_code="oauth_import_failed",
+                error_code=exc.error_code,
                 message=str(exc),
+            )
+        except OSError:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="credentials_unreadable",
+                message="OAuth 客户端配置无法安全导入",
+            )
+        try:
+            validated = validate_oauth_credentials_file(target)
+        except OAuthImportError as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code=exc.error_code,
+                message="OAuth 客户端配置已写入但复核失败，请重新导入",
             )
         return ServiceResult(
             OperationStatus.SUCCESS,
-            message="OAuth 客户端配置已安全导入",
-            details={"credentials_path": str(target)},
+            message="Desktop app OAuth 客户端配置已安全导入",
+            details={
+                "client_type": validated.summary.client_type,
+                "project_id": validated.summary.project_id,
+                "client_id_suffix": validated.summary.client_id_suffix,
+            },
         )
 
-    def authorize_gmail_api(self) -> ServiceResult:
-        """显式执行浏览器 OAuth 授权。"""
+    def create_gmail_oauth_session(
+        self,
+        *,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        timeout_seconds: float = 300.0,
+    ):
+        """创建一次可取消 OAuth 会话；创建本身不执行网络或浏览器操作。"""
+        from agent_mail_bridge.gmail_api_auth import GmailOAuthSession
+
+        return GmailOAuthSession(
+            self.cfg,
+            progress_callback=progress_callback,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def authorize_gmail_api(
+        self,
+        *,
+        session=None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        timeout_seconds: float = 300.0,
+    ) -> ServiceResult:
+        """执行显式 OAuth 会话；GUI 必须从后台 Worker 调用。"""
         self.initialize()
-        try:
-            from agent_mail_bridge.gmail_api_auth import get_gmail_api_service
-            service = get_gmail_api_service(self.cfg, interactive=True)
-            profile = service.users().getProfile(userId="me").execute()
-            return ServiceResult(
-                OperationStatus.SUCCESS,
-                message="Gmail API 授权成功",
-                details={"email": profile.get("emailAddress", "")},
-            )
-        except Exception as exc:  # noqa: BLE001
-            return ServiceResult(
-                OperationStatus.FAILED,
-                error_code="oauth_failed", message=str(exc), needs_auth=True,
-            )
+        active_session = session or self.create_gmail_oauth_session(
+            progress_callback=progress_callback,
+            timeout_seconds=timeout_seconds,
+        )
+        return active_session.run()
+
+    def clear_gmail_oauth_token(self) -> ServiceResult:
+        """清除本地 Token，但绝不删除 Desktop credentials。"""
+        from agent_mail_bridge.gmail_api_auth import clear_local_gmail_token
+
+        return clear_local_gmail_token(self.cfg)
 
     def get_today_files(self) -> ServiceResult:
         self.initialize()
@@ -1891,19 +1931,10 @@ class ApplicationService:
             )
 
     def diagnose_gmail_api(self) -> ServiceResult:
-        try:
-            from agent_mail_bridge.gmail_api_auth import get_gmail_api_service
-            service = get_gmail_api_service(self.cfg, interactive=False)
-            profile = service.users().getProfile(userId="me").execute()
-            return ServiceResult(
-                OperationStatus.SUCCESS, message="Gmail API 连接正常",
-                details={"email": profile.get("emailAddress", "")},
-            )
-        except Exception as exc:  # noqa: BLE001
-            return ServiceResult(
-                OperationStatus.FAILED, error_code="gmail_api_diagnose_failed",
-                message=str(exc), needs_auth=True,
-            )
+        self.initialize()
+        from agent_mail_bridge.gmail_api_auth import reverify_gmail_authorization
+
+        return reverify_gmail_authorization(self.cfg)
 
     def diagnose_qq_smtp(self) -> ServiceResult:
         """连接并认证 QQ SMTP，不发送邮件。"""
@@ -1936,8 +1967,10 @@ class ApplicationService:
         try:
             from PySide6 import __version__ as pyside_version
             from agent_mail_bridge import __version__ as app_version
+            from agent_mail_bridge.gmail_api_auth import get_oauth_diagnostics
 
             oauth = get_oauth_state(self.cfg)
+            oauth_runtime = get_oauth_diagnostics(self.cfg)
             recent_events = query_recent_events(self.cfg.db_path, 100)
             recent_errors = [
                 row for row in recent_events
@@ -1962,6 +1995,12 @@ class ApplicationService:
                 f"Gmail API credentials：{'已配置' if self.cfg.gmail_api_credentials_path.exists() else '未配置'}",
                 f"Gmail API token：{'存在' if self.cfg.gmail_api_token_path.exists() else '不存在'}",
                 f"OAuth 状态：{oauth.get('state', 'UNKNOWN')}",
+                f"OAuth Desktop 凭据有效：{'是' if oauth_runtime['desktop_credentials_valid'] else '否'}",
+                f"OAuth 当前阶段：{oauth_runtime['stage']}",
+                f"OAuth 回环地址：{oauth_runtime['callback_host']}",
+                f"OAuth 回环已绑定：{'是' if oauth_runtime['callback_bound'] else '否'}",
+                f"OAuth 已收到回调：{'是' if oauth_runtime['callback_received'] else '否'}",
+                f"OAuth 端口已释放：{'是' if oauth_runtime['port_released'] else '否'}",
                 f"IMAP：{'已配置' if self.cfg.gmail_address and self.cfg.gmail_app_password else '未配置'}",
                 f"QQ SMTP：{'已配置' if self.cfg.qq_email and self.cfg.qq_auth_code else '未配置'}",
                 f"允许发送目录数量：{len(self.cfg.effective_allowed_send_roots)}",

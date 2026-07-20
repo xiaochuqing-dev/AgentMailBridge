@@ -27,6 +27,7 @@ from agent_mail_bridge.gmail_api_auth import (
     get_gmail_api_service,
     validate_credentials_file,
 )
+from agent_mail_bridge.models import OperationStatus, ServiceResult
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
@@ -36,10 +37,11 @@ def _make_creds_file(path: Path) -> None:
     path.write_text(
         json.dumps({
             "installed": {
-                "client_id": "test.apps.googleusercontent.com",
+                "client_id": "1234567890-fake.apps.googleusercontent.com",
                 "client_secret": "secret",
                 "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                 "token_uri": "https://oauth2.googleapis.com/token",
+                "redirect_uris": ["http://localhost"],
             }
         }),
         encoding="utf-8",
@@ -54,7 +56,7 @@ def _write_token(path: Path, *, scopes=SCOPES, expired=False,
         "token": "fake_access_token",
         "refresh_token": refresh_token,
         "token_uri": "https://oauth2.googleapis.com/token",
-        "client_id": "test.apps.googleusercontent.com",
+        "client_id": "1234567890-fake.apps.googleusercontent.com",
         "client_secret": "secret",
         "scopes": scopes,
     }
@@ -161,6 +163,7 @@ class TestTokenExpiredRefresh:
             assert service == "fake_service"
             # 应该调用了 refresh
             fake_creds.refresh.assert_called_once()
+            assert fake_creds.refresh.call_args.args[0].timeout_seconds == 20
             # token 应被保存
             assert cfg.gmail_api_token_path.exists()
 
@@ -169,26 +172,29 @@ class TestNoTokenStartsFlow:
     def test_no_token_starts_flow(self, tmp_path):
         cfg = _cfg(tmp_path, token_exists=False)
         with patch(
-            "agent_mail_bridge.gmail_api_auth.InstalledAppFlow"
-        ) as MockFlow, patch(
+            "agent_mail_bridge.gmail_api_auth.GmailOAuthSession.run"
+        ) as mock_run, patch(
+            "agent_mail_bridge.gmail_api_auth.Credentials"
+        ) as MockCreds, patch(
             "agent_mail_bridge.gmail_api_auth.build"
         ) as mock_build:
             fake_creds = MagicMock()
             fake_creds.valid = True
             fake_creds.expired = False
+            fake_creds.refresh_token = "refresh123"
             fake_creds.scopes = SCOPES
-            fake_creds.to_json.return_value = '{"token": "new"}'
-
-            fake_flow = MagicMock()
-            fake_flow.run_local_server.return_value = fake_creds
-            MockFlow.from_client_secrets_file.return_value = fake_flow
+            MockCreds.from_authorized_user_file.return_value = fake_creds
             mock_build.return_value = "fake_service"
+
+            def complete_session():
+                _write_token(cfg.gmail_api_token_path)
+                return ServiceResult(OperationStatus.SUCCESS, message="授权完成")
+
+            mock_run.side_effect = complete_session
 
             service = get_gmail_api_service(cfg)
             assert service == "fake_service"
-            MockFlow.from_client_secrets_file.assert_called_once()
-            fake_flow.run_local_server.assert_called_once()
-            # token 应被保存
+            mock_run.assert_called_once()
             assert cfg.gmail_api_token_path.exists()
 
 
@@ -196,24 +202,31 @@ class TestTokenSave:
     def test_token_saved_to_path(self, tmp_path):
         cfg = _cfg(tmp_path, token_exists=False)
         with patch(
-            "agent_mail_bridge.gmail_api_auth.InstalledAppFlow"
-        ) as MockFlow, patch(
+            "agent_mail_bridge.gmail_api_auth.GmailOAuthSession.run"
+        ) as mock_run, patch(
+            "agent_mail_bridge.gmail_api_auth.Credentials"
+        ) as MockCreds, patch(
             "agent_mail_bridge.gmail_api_auth.build"
         ) as mock_build:
             fake_creds = MagicMock()
             fake_creds.valid = True
             fake_creds.expired = False
+            fake_creds.refresh_token = "refresh123"
             fake_creds.scopes = SCOPES
-            fake_creds.to_json.return_value = '{"token": "saved"}'
-
-            fake_flow = MagicMock()
-            fake_flow.run_local_server.return_value = fake_creds
-            MockFlow.from_client_secrets_file.return_value = fake_flow
+            MockCreds.from_authorized_user_file.return_value = fake_creds
             mock_build.return_value = "fake_service"
 
+            def complete_session():
+                _write_token(cfg.gmail_api_token_path)
+                return ServiceResult(OperationStatus.SUCCESS, message="授权完成")
+
+            mock_run.side_effect = complete_session
+
             get_gmail_api_service(cfg)
-            token_content = cfg.gmail_api_token_path.read_text(encoding="utf-8")
-            assert "saved" in token_content
+            token_content = json.loads(
+                cfg.gmail_api_token_path.read_text(encoding="utf-8")
+            )
+            assert token_content["refresh_token"] == "refresh123"
 
 
 class TestScopeMismatch:

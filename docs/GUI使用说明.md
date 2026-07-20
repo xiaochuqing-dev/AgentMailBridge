@@ -1,6 +1,6 @@
 # AgentMailBridge GUI 使用说明
 
-AgentMailBridge 1.2.0 的用户入口只有 `AgentMailBridge.exe`。
+AgentMailBridge 1.2.1 的用户入口只有 `AgentMailBridge.exe`。
 
 顶部主工作区只有“收件”和“发件”。左侧已有 Gmail、QQ 账号卡片用于管理当前账号；“添加邮箱账号”只展示未来扩展和当前限制，不会修改已有账号。左侧下方的“Agent / MCP”“历史记录”“文件与数据”“设置”“关于”使用同一贴合导航卡，不留脱离其他页面的空隙。
 
@@ -16,6 +16,14 @@ AgentMailBridge 1.2.0 的用户入口只有 `AgentMailBridge.exe`。
 - 关于：版本、产品定位、仓库、LICENSE、第三方说明和本地优先说明。
 
 Gmail API、Gmail IMAP 和 QQ SMTP 分别使用专属账号页。Gmail IMAP 密码和 QQ 授权码保存在 Windows Credential Manager，界面只显示固定掩码。替换 OAuth 客户端配置需确认，不会静默删除 token。
+
+Gmail API 页只接受 Google Cloud 的 Desktop app `credentials.json`。导入成功后会显示 Desktop app 类型、可用的项目 ID 和 Client ID 脱敏尾号；Web application JSON、非 Google 官方端点或非法回环地址会被明确拒绝。新文件验证或写入失败时，旧凭据和旧 Token 保持不变。
+
+点击“开始 Gmail OAuth 授权”后，授权在独立 QThread 中运行，界面会依次显示凭据检查、本地回环、浏览器等待、Token 交换和 Gmail 验证阶段。回环只绑定 `127.0.0.1` 随机端口，默认等待 5 分钟。用户可随时取消，也可重新打开浏览器或复制当前会话的同一授权链接；取消、超时、失败和关闭窗口都会关闭服务器并释放端口。
+
+Google OAuth 应用“已发布”与“已通过 Google 验证”不是同一状态。AgentMailBridge 不会自动点击“高级”、绕过警告或操作账号密码、验证码和 2FA。浏览器无法完成时，请检查是否仍停留在 Google 页面、浏览器已关闭、`127.0.0.1` 被代理或防火墙拦截。
+
+Token 交换成功后会继续验证 Gmail Profile 和当前配置账号。Gmail API 未启用、临时网络错误、配额或 5xx 会显示“已取得授权，API 待重新验证”，此时点击“重新验证 Gmail API”即可，不会重复打开浏览器。授权了错误账号时只显示脱敏地址，且不会覆盖旧 Token。清除本地 Token 必须二次确认，Desktop credentials 会保留。
 
 “当前收件偏好”默认是“仅本人邮件”。点击“编辑偏好”可选择“仅本人邮件”“当前扫描范围内全部邮件”或“自定义规则”。自定义规则只支持发件人完整邮箱或 `@domain.com`、主题关键词和“仅保存含附件的邮件”；不同分类必须同时满足，同一分类命中任一项即可。空自定义规则不能保存。该设置由 Gmail API、Gmail IMAP、手动立即收取和自动收取共用，旧布尔配置会自动无损迁移。
 

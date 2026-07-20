@@ -1,6 +1,10 @@
 # Windows 安装、升级与卸载
 
-运行 `AgentMailBridge-1.2.0-Setup.exe`。默认安装到 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需管理员权限。开始菜单和可选桌面快捷方式只指向 `AgentMailBridge.exe`；内部 `AgentMailBridgeMCP.exe` 不创建快捷方式或开机启动项。
+运行 `AgentMailBridge-1.2.1-Setup.exe`。默认安装到 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需管理员权限。开始菜单和可选桌面快捷方式只指向 `AgentMailBridge.exe`；内部 `AgentMailBridgeMCP.exe` 不创建快捷方式或开机启动项。
+
+从 v1.2.0 升级到 v1.2.1 前，正常退出主窗口和托盘，再运行新版安装器覆盖安装。v1.2.1 只替换程序文件并修复 Gmail OAuth 首次配置；配置、credentials.json、token.json、Credential Manager、SQLite、邮件归档、工作区和日志继续位于安装目录外。安装器清理旧安装目录 `_internal` 时不会触碰 `%LOCALAPPDATA%\AgentMailBridge` 用户目录。
+
+首次 Gmail OAuth 必须使用 Desktop app JSON。本地回调监听 `127.0.0.1` 随机端口；企业代理、安全软件或防火墙需要允许浏览器访问本机回环。覆盖升级后，已有匹配 Client ID 且包含 refresh token 的 Token 应继续有效；凭据更换导致 Client ID 不匹配时会明确要求重新授权，不会反复刷新旧 Token。
 
 从 v1.1.0 升级到 v1.2.0 前，正常退出主窗口和托盘，再运行新版安装器覆盖安装。稳定 AppId 只替换程序文件；配置、收件规则、OAuth、Credential Manager、DATA_ROOT、SQLite、received、send、sent、backups 和工作区授权位于安装目录外并保留。v1.2.0 不重建数据库，只增量新增统一 MCP 审计表和非敏感邮件读取配置；旧 `mcp_calls`、邮件、资源、发送记录和自动收件状态全部保留。
 

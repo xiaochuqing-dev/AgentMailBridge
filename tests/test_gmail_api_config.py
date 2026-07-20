@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -43,6 +44,20 @@ def _set_env(monkeypatch, **kwargs):
         monkeypatch.delenv(k, raising=False)
     for k, v in kwargs.items():
         monkeypatch.setenv(k, v)
+
+
+def _desktop_oauth_json() -> str:
+    return json.dumps(
+        {
+            "installed": {
+                "client_id": "123456-test.apps.googleusercontent.com",
+                "client_secret": "test-secret",
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "redirect_uris": ["http://localhost"],
+            }
+        }
+    )
 
 
 class TestReceiveBackend:
@@ -91,12 +106,21 @@ class TestEffectiveBackend:
 
     def test_auto_prefers_gmail_api_when_configured(self, tmp_path):
         creds = tmp_path / "credentials.json"
-        creds.write_text("{}", encoding="utf-8")
+        creds.write_text(_desktop_oauth_json(), encoding="utf-8")
         cfg = AppConfig(
             gmail_receive_backend="auto",
             gmail_api_credentials_path=creds,
         )
         assert _effective_receive_backend(cfg) == "gmail_api"
+
+    def test_auto_falls_back_to_imap_when_credentials_are_invalid(self, tmp_path):
+        creds = tmp_path / "credentials.json"
+        creds.write_text("{}", encoding="utf-8")
+        cfg = AppConfig(
+            gmail_receive_backend="auto",
+            gmail_api_credentials_path=creds,
+        )
+        assert _effective_receive_backend(cfg) == "imap"
 
     def test_auto_falls_back_to_imap_when_not_configured(self, tmp_path):
         cfg = AppConfig(

@@ -1,6 +1,6 @@
 # AgentMailBridge MCP 使用说明
 
-AgentMailBridge v1.2.0 MCP 是本机按需启动的通用 stdio 服务。它不监听端口、不常驻、不创建快捷方式或托盘；兼容 MCP 的本机 Agent 启动进程，stdin 关闭后服务退出。不同客户端使用同一个服务、配置和工具，不存在 Codex 专用或 Claude 专用业务端点。
+AgentMailBridge v1.2.1 MCP 是本机按需启动的通用 stdio 服务。它不监听端口、不常驻、不创建快捷方式或托盘；兼容 MCP 的本机 Agent 启动进程，stdin 关闭后服务退出。v1.2.1 的 OAuth Hotfix 不改变 MCP 工具、协议和安全边界。不同客户端使用同一个服务、配置和工具，不存在 Codex 专用或 Claude 专用业务端点。
 
 从左侧“Agent / MCP”页面复制唯一的标准 JSON 配置。安装版 command 指向安装目录中的 `AgentMailBridgeMCP.exe` 且 args 为空；源码版为：
 

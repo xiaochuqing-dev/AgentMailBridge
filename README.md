@@ -1,6 +1,6 @@
 # AgentMailBridge
 
-AgentMailBridge v1.2.0 是面向个人用户的本地优先 Windows 邮箱桥接工具。它在后台通过 Gmail 收取并归档完整邮件，通过 QQ SMTP 将正文、链接和多个附件发送到固定 Gmail，并向任意兼容本地 stdio MCP 的 Agent 提供受控邮件读取、资源准备和结果回邮能力。GUI 只负责配置和观察，不是 Agent 读取本地邮件归档的必经路径。
+AgentMailBridge v1.2.1 是面向个人用户的本地优先 Windows 邮箱桥接工具。它在后台通过 Gmail 收取并归档完整邮件，通过 QQ SMTP 将正文、链接和多个附件发送到固定 Gmail，并向任意兼容本地 stdio MCP 的 Agent 提供受控邮件读取、资源准备和结果回邮能力。GUI 只负责配置和观察，不是 Agent 读取本地邮件归档的必经路径。
 
 项目不提供多租户、任意收件人、通用 Gmail MCP、遥测或云同步。邮箱凭据、OAuth、数据库、邮件附件和归档由用户保留在本机。
 
@@ -30,7 +30,7 @@ AgentMailBridge v1.2.0 是面向个人用户的本地优先 Windows 邮箱桥接
 
 ## Windows 安装
 
-运行 `AgentMailBridge-1.2.0-Setup.exe`。默认安装到 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需 Python、Git 或管理员权限。桌面和开始菜单只指向 `AgentMailBridge.exe`；内部 `AgentMailBridgeMCP.exe` 不创建快捷方式、托盘或开机启动项。
+运行 `AgentMailBridge-1.2.1-Setup.exe`。默认安装到 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需 Python、Git 或管理员权限。桌面和开始菜单只指向 `AgentMailBridge.exe`；内部 `AgentMailBridgeMCP.exe` 不创建快捷方式、托盘或开机启动项。
 
 安装版数据位置：
 
@@ -46,6 +46,10 @@ AgentMailBridge v1.2.0 是面向个人用户的本地优先 Windows 邮箱桥接
 Gmail API 与 Gmail IMAP 使用互斥的条件配置页。Gmail API 页负责选择并验证 `credentials.json`、导入受控 OAuth 目录、授权和连接测试；Gmail IMAP 页只管理 Google 生成的应用专用密码。QQ 账号页管理 QQ 地址、SMTP 授权码和连接测试。
 
 Gmail IMAP 密码和 QQ SMTP 授权码保存在 Windows Credential Manager。界面只显示固定掩码和配置状态，不回显旧值。Gmail OAuth scope 固定为 `gmail.readonly`。
+
+Gmail API 首次配置必须使用 Google Cloud 创建的 Desktop app `credentials.json`，Web application JSON 会被明确拒绝。OAuth 在后台 Worker 中运行，本地回调只绑定 `127.0.0.1` 随机端口，默认 5 分钟超时；等待期间 GUI 保持响应，可取消、重新打开浏览器或复制同一授权链接。Google OAuth 应用“已发布”不等于“已通过 Google 验证”，安全警告只能由用户在浏览器中自行决定是否继续。
+
+Token 仅在 state 校验成功后交换，并通过同目录临时文件、落盘和原子替换保存。Token 交换成功但 Gmail API 暂时不可用时，会保留已取得的长期授权并允许“重新验证 Gmail API”，无需重复打开浏览器。请确保 `127.0.0.1`、`localhost` 和 `::1` 不经过代理，并在 Google Cloud 项目中启用 Gmail API。详细错误可按结构化错误码排查，见 `docs/Gmail OAuth配置与故障排查说明.md`。
 
 ## Agent / MCP
 
@@ -106,8 +110,8 @@ powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
 
 流程会清理旧构建、运行 pytest、构建 GUI 与内部 MCP、执行 packaged smoke 和秘密排除扫描，并生成：
 
-- `release\AgentMailBridge-1.2.0-Setup.exe`
-- `release\AgentMailBridge-1.2.0-Windows-x64.zip`
+- `release\AgentMailBridge-1.2.1-Setup.exe`
+- `release\AgentMailBridge-1.2.1-Windows-x64.zip`
 - `release\checksums.sha256`
 
-详细说明见 `docs/GUI使用说明.md`、`docs/MCP使用说明.md`、`docs/Agent邮件读取与资源交付设计.md`、`docs/MCP邮件读取工具说明.md`、`docs/安全与诊断说明.md`、`docs/Windows安装与升级说明.md`、`docs/统一邮件归档设计.md`、`docs/邮件事实查询说明.md` 和最终专项报告。
+详细说明见 `docs/GUI使用说明.md`、`docs/Gmail OAuth配置与故障排查说明.md`、`docs/MCP使用说明.md`、`docs/Agent邮件读取与资源交付设计.md`、`docs/MCP邮件读取工具说明.md`、`docs/安全与诊断说明.md`、`docs/Windows安装与升级说明.md`、`docs/统一邮件归档设计.md`、`docs/邮件事实查询说明.md` 和最终专项报告。

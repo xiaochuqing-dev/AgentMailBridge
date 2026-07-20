@@ -1,5 +1,18 @@
 # CHANGELOG
 
+## 1.2.1 Gmail OAuth 首次配置可靠性与 GUI 无阻塞 Hotfix - 2026-07-18
+
+- Gmail OAuth 授权改为 QObject + QThread 后台会话；Gmail API、IMAP 和 QQ 连接测试使用后台任务，Qt GUI 主线程不再执行网络等待。
+- 新增可测试状态机、唯一 session_id、非法跳转保护、旧会话隔离、同进程单会话和操作系统级跨进程 OAuth 锁。
+- 用受控 `127.0.0.1` 随机端口回环服务器替代阻塞式 `run_local_server`，支持 5 分钟超时、真实取消、应用退出清理、state 校验、静态完成页和端口释放。
+- OAuth 页面新增阶段状态、取消、重新打开浏览器、复制同一授权链接、重新验证 Gmail API、清除本地 Token 和代理/防火墙提示。
+- credentials.json 只接受严格有效的 Google Desktop app；Web application、混合节点、非官方端点、非法 redirect URI、损坏编码和过大文件均拒绝，替换失败保留旧配置。
+- Token 改为 fsync 后原子替换，校验 Client ID、只读 scope 和 refresh token；失败授权、账号不匹配或保存失败不会破坏旧 Token。
+- Token 交换与 Gmail Profile 验证分离；Gmail API 未启用、网络、配额或 5xx 可进入 AUTHORIZED_UNVERIFIED 并直接重试验证，账号不匹配不会静默改绑。
+- OAuth 日志和诊断只记录阶段、回环状态、错误码与耗时，不记录授权 URL、state、code、Client Secret 或 Token。
+- 修复测试隔离只禁止读取 `.env`、却仍可能通过默认配置路径写入源码 `.env` 的漏洞；全局测试夹具现在同时重定向运行目录与配置文件，并增加默认写入隔离回归。
+- Python、GUI、MCP、EXE metadata 和 Inno Setup 版本统一升级为 1.2.1。
+
 ## 1.2.0 后台邮件运行时通用 Agent 读取与 GUI 统一收口专项 - 2026-07-17
 
 - 新增全局一次性邮件读取开关；GUI 关闭后，本机兼容 stdio MCP 的 Agent 仍可按安全边界读取规范本地归档。

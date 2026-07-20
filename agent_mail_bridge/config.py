@@ -286,11 +286,19 @@ class AppConfig:
 
     @property
     def gmail_api_configured(self) -> bool:
-        """Gmail API 是否已配置（credentials.json 存在即视为已配置）。
+        """Gmail API 是否具有严格有效的 Desktop credentials.json。
 
         auto 模式据此判断是否优先走 gmail_api。
         """
-        return self.gmail_api_credentials_path.exists()
+        if not self.gmail_api_credentials_path.exists():
+            return False
+        try:
+            from agent_mail_bridge.oauth_storage import validate_oauth_credentials_file
+
+            validate_oauth_credentials_file(self.gmail_api_credentials_path)
+        except (OSError, ValueError):
+            return False
+        return True
 
     def mask(self) -> dict:
         """返回脱敏后的配置摘要，供 show-config / 日志使用。"""
@@ -590,7 +598,7 @@ def require_receive_config(cfg: AppConfig) -> None:
 def _effective_receive_backend(cfg: AppConfig) -> str:
     """解析 auto 模式实际使用的后端。
 
-    auto: 优先 gmail_api（credentials.json 存在），否则回退 imap。
+    auto: 优先 gmail_api（credentials.json 严格有效），否则回退 imap。
     imap / gmail_api: 原样返回。
     """
     backend = cfg.gmail_receive_backend

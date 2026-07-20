@@ -110,6 +110,11 @@ def test_dark_theme_defines_neutral_text_and_card_surfaces(product_window):
     stylesheet = QApplication.instance().styleSheet()
     assert "QLabel#statusValue" in stylesheet
     assert "QFrame#heroCard" in stylesheet
+    assert "QMainWindow, QDialog" in stylesheet
+    assert "QFrame#accountPanel, QFrame#credentialCard" in stylesheet
+    assert "QPushButton#accountChoice:checked" in stylesheet
+    assert "QPushButton#textButton, QPushButton#compactButton" in stylesheet
+    assert "color: #C6BEFF" in stylesheet
     assert "#242736" in stylesheet
 
 

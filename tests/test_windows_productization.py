@@ -19,7 +19,11 @@ from agent_mail_bridge.oauth_storage import OAuthImportError, import_oauth_crede
 from agent_mail_bridge.runtime_paths import discover_runtime_paths
 from agent_mail_bridge.desktop_runtime import SingleInstanceGuard, StartupManager
 from agent_mail_bridge.mcp_client_config import generic_mcp_json, mcp_launch
-from agent_mail_bridge.ui.settings_store import import_legacy_env, save_env_values
+from agent_mail_bridge.ui.settings_store import (
+    default_env_path,
+    import_legacy_env,
+    save_env_values,
+)
 
 
 def test_runtime_paths_source_mode_keep_developer_layout(tmp_path: Path):
@@ -67,6 +71,14 @@ def test_regular_config_save_never_writes_nonempty_secret(tmp_path: Path):
     assert "QQ_EMAIL" in content
     assert "must-not-be-written" not in content
     assert "QQ_AUTH_CODE" not in content
+
+
+def test_default_config_writes_are_isolated_from_project_env(tmp_path: Path):
+    target = default_env_path()
+
+    assert target == (tmp_path / "isolated.env").resolve()
+    save_env_values({"GMAIL_ADDRESS": "isolated-test@gmail.com"})
+    assert target.is_file()
 
 
 def test_credential_update_verification_failure_restores_previous_value():
@@ -127,7 +139,11 @@ def test_oauth_credentials_are_validated_and_copied_atomically(tmp_path: Path):
     source = tmp_path / "credentials.json"
     target = tmp_path / "OAuth" / "credentials.json"
     source.write_text(
-        '{"installed":{"client_id":"id","client_secret":"secret"}}',
+        '{"installed":{"client_id":"1234567890-fake.apps.googleusercontent.com",'
+        '"client_secret":"fake-client-secret-for-tests-only",'
+        '"auth_uri":"https://accounts.google.com/o/oauth2/auth",'
+        '"token_uri":"https://oauth2.googleapis.com/token",'
+        '"redirect_uris":["http://localhost"]}}',
         encoding="utf-8",
     )
     assert import_oauth_credentials(source, destination=target) == target
@@ -142,7 +158,7 @@ def test_oauth_credentials_are_validated_and_copied_atomically(tmp_path: Path):
 
 
 def test_product_version_is_shared_with_mcp():
-    assert __version__ == "1.2.0"
+    assert __version__ == "1.2.1"
     assert SERVER_VERSION == __version__
 
 
@@ -156,10 +172,10 @@ def test_windows_version_resources_match_product_version():
     root = Path(__file__).resolve().parents[1]
     for name in ("version_info.txt", "version_info_mcp.txt"):
         content = (root / "packaging" / "windows" / name).read_text(encoding="utf-8")
-        assert "filevers=(1, 2, 0, 0)" in content
-        assert "prodvers=(1, 2, 0, 0)" in content
-        assert "u'FileVersion', u'1.2.0'" in content
-        assert "u'ProductVersion', u'1.2.0'" in content
+        assert "filevers=(1, 2, 1, 0)" in content
+        assert "prodvers=(1, 2, 1, 0)" in content
+        assert "u'FileVersion', u'1.2.1'" in content
+        assert "u'ProductVersion', u'1.2.1'" in content
 
 
 def test_startup_command_supports_source_and_frozen(monkeypatch, tmp_path: Path):

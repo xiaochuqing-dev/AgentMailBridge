@@ -269,6 +269,13 @@ def test_smtp_timeout_reaches_underlying_connection(tmp_cfg, monkeypatch):
 def test_oauth_state_distinguishes_missing_credentials_and_scope(tmp_cfg):
     tmp_cfg.gmail_api_credentials_path = tmp_cfg.data_root_path / "missing.json"
     assert get_oauth_state(tmp_cfg)["state"] == "CREDENTIALS_MISSING"
-    tmp_cfg.gmail_api_credentials_path.write_text('{"installed": {}}', encoding="utf-8")
+    tmp_cfg.gmail_api_credentials_path.write_text(
+        '{"installed":{"client_id":"1234567890-fake.apps.googleusercontent.com",'
+        '"client_secret":"fake-client-secret-for-tests-only",'
+        '"auth_uri":"https://accounts.google.com/o/oauth2/auth",'
+        '"token_uri":"https://oauth2.googleapis.com/token",'
+        '"redirect_uris":["http://localhost"]}}',
+        encoding="utf-8",
+    )
     tmp_cfg.gmail_api_scopes = ["https://mail.google.com/"]
     assert get_oauth_state(tmp_cfg)["state"] == "SCOPE_MISMATCH"

@@ -120,6 +120,31 @@ def build_stylesheet(theme: str = "light") -> str:
         color: #555A68;
         font-size: 12px;
     }}
+    QLabel#oauthExpectedAccount {{
+        color: #4A3E87;
+        background: #F4F1FF;
+        border: 1px solid #D8D0FF;
+        border-radius: 4px;
+        padding: 7px 9px;
+        font-size: 11px;
+    }}
+    QLabel#oauthResultDetail {{
+        border: 1px solid transparent;
+        border-radius: 4px;
+        padding: 8px 10px;
+        font-size: 11px;
+        font-weight: 600;
+    }}
+    QLabel#oauthResultDetail[severity="warning"] {{
+        color: #8A5700;
+        background: #FFF7E8;
+        border-color: #F2D39A;
+    }}
+    QLabel#oauthResultDetail[severity="danger"] {{
+        color: {DANGER};
+        background: #FFF2F4;
+        border-color: #F0BCC2;
+    }}
     QLabel#sendFileValue {{ font-size: 12px; font-weight: 700; }}
     QLabel#successText {{ color: {SUCCESS}; font-weight: 700; }}
     QLabel#errorText {{ color: {DANGER}; }}
@@ -499,12 +524,27 @@ def build_stylesheet(theme: str = "light") -> str:
         return base
     return base + f"""
     * {{ color: #E8EAF2; }}
-    QMainWindow, QWidget#windowRoot, QWidget#titleBar, QWidget#sidebar,
+    QMainWindow, QDialog, QWidget#windowRoot, QWidget#titleBar, QWidget#sidebar,
     QWidget#centralPanel, QWidget#rightPanelContent, QWidget#pageSurface,
     QWidget#bodySurface, QWidget#tabBar, QScrollArea {{ background: #171923; }}
     QScrollArea#rightPanel, QWidget#rightPanelContent {{ background: #1C1E2A; border: none; }}
     QWidget#sidebar, QWidget#titleBar, QWidget#tabBar {{ border-color: #343746; }}
     QLabel#fieldLabel, QLabel#muted, QLabel#hint {{ color: #AEB4C5; }}
+    QLabel#oauthExpectedAccount {{
+        color: #D6CEFF;
+        background: #29243C;
+        border-color: #5A4F82;
+    }}
+    QLabel#oauthResultDetail[severity="warning"] {{
+        color: #FFD27A;
+        background: #352B1C;
+        border-color: #6A5329;
+    }}
+    QLabel#oauthResultDetail[severity="danger"] {{
+        color: #FF9CA5;
+        background: #382128;
+        border-color: #713743;
+    }}
     QLabel#statusName, QLabel#statusValue, QLabel#tipText, QLabel#statNumber,
     QLabel#statCaption, QLabel#healthName, QLabel#healthDetail {{ color: #C7CBD8; }}
     QFrame#card, QLineEdit, QComboBox, QSpinBox, QTextEdit, QTableWidget,
@@ -515,6 +555,15 @@ def build_stylesheet(theme: str = "light") -> str:
     QFrame#heroCard, QFrame#overviewMetric, QFrame#statPurple, QFrame#statGreen,
     QFrame#statBlue, QFrame#statRed, QFrame#healthItem {{
         background: #242736;
+        border-color: #3A3E50;
+    }}
+    QFrame#accountPanel, QFrame#credentialCard {{
+        background: #222532;
+        border-color: #3A3E50;
+    }}
+    QLabel#credentialMask {{
+        color: #D5D8E3;
+        background: #1D202C;
         border-color: #3A3E50;
     }}
     QLineEdit#inboxSearch {{ background: #222532; border-color: #3A3E50; }}
@@ -561,8 +610,27 @@ def build_stylesheet(theme: str = "light") -> str:
     QHeaderView::section {{ color: #BFC4D3; }}
     QPushButton {{ background: #292C3A; border-color: #42465A; }}
     QPushButton:hover, QPushButton#titleButton:hover {{ background: #35394B; }}
-    QPushButton#outlinePurple {{ background: #242736; }}
-    QPushButton#textButton, QPushButton#compactButton {{ background: #292C3A; border-color: #4A4E63; }}
+    QPushButton#outlinePurple {{ color: #C6BEFF; background: #242736; }}
+    QPushButton#textButton, QPushButton#compactButton {{
+        color: #C6BEFF;
+        background: #292C3A;
+        border-color: #4A4E63;
+    }}
+    QPushButton#accountChoice {{
+        color: #D5D8E3;
+        background: #222532;
+        border-color: #4A4E63;
+    }}
+    QPushButton#accountChoice:hover {{
+        color: #C6BEFF;
+        background: #292C3A;
+        border-color: #8072D9;
+    }}
+    QPushButton#accountChoice:checked {{
+        color: #C6BEFF;
+        background: #30304B;
+        border-color: {PURPLE};
+    }}
     QPushButton#tabButton, QPushButton#navButton {{ background: transparent; }}
     QPushButton#navButton, QPushButton#tabButton {{ color: #C7CBD8; }}
     QScrollBar::handle:vertical {{ background: #555A6C; }}
