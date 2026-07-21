@@ -3,12 +3,12 @@
 职责：
 1. 校验待发送文件存在、大小合理、扩展名可发送。
 2. 计算 sha256，复制到 send/YYYY-MM-DD/。
-3. 使用 QQ SMTP 以 QQ 邮箱身份发送到 OWNER_GMAIL（收件人固定）。
+3. MCP/CLI 结果固定发送到 OWNER_GMAIL；GUI 手动邮件可使用用户明确输入的收件人。
 4. 发送成功后复制到 sent/YYYY-MM-DD/。
 5. 写入 sent_files 表与日志。
 6. 返回结构化结果。
 
-注意：收件人固定为 OWNER_GMAIL，不允许任意传 to。
+注意：任意收件人能力只属于 GUI 手动操作，MCP submit_result 不接受 recipient。
 日志中绝不打印完整 QQ 授权码。
 """
 
@@ -39,6 +39,7 @@ from agent_mail_bridge.database import (
     update_send_attempt,
 )
 from agent_mail_bridge.logging_setup import get_logger
+from agent_mail_bridge.receive_rules import invalid_sender_rules
 from agent_mail_bridge.security import (
     SecurityError,
     assert_within_allowed_roots,
@@ -60,6 +61,9 @@ from agent_mail_bridge.utils import (
 
 logger = get_logger("mail_send")
 
+OUTBOUND_ORIGIN_HEADER = "X-AgentMailBridge-Origin"
+OUTBOUND_ID_HEADER = "X-AgentMailBridge-Outbound-ID"
+
 
 def _sender_account_ref(cfg: AppConfig) -> str:
     return f"qq:{cfg.qq_email.strip().casefold() or 'unconfigured'}"
@@ -71,6 +75,29 @@ def _outbound_id_for_request(request_id: str) -> str:
 
 def _outbound_resource_id(outbound_id: str, order: int) -> str:
     return f"outres_{uuid.uuid5(uuid.NAMESPACE_URL, f'{outbound_id}:{order}').hex}"
+
+
+def normalize_manual_recipient(value: str) -> str:
+    """校验 GUI 明确收件人并阻止 CRLF/Header 注入。"""
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("收件人不能为空")
+    if any(char in raw for char in ("\r", "\n")) or any(
+        ord(char) < 32 for char in raw
+    ):
+        raise ValueError("收件人包含非法控制字符")
+    if "," in raw or ";" in raw or "，" in raw or "；" in raw:
+        raise ValueError("当前仅支持一个明确收件人")
+    if raw.startswith("@") or invalid_sender_rules((raw,)):
+        raise ValueError("收件人邮箱格式无效")
+    return raw
+
+
+def _validate_outbound_id(value: str) -> str:
+    outbound_id = str(value or "").strip()
+    if not outbound_id or any(ord(char) < 33 for char in outbound_id):
+        raise ValueError("outbound_id 无效")
+    return outbound_id
 
 
 class SmtpStageError(Exception):
@@ -158,6 +185,21 @@ def send_file_to_owner_gmail(
     stem, _ext = split_ext(source_path.name)
     if not subject:
         subject = f"Agent执行结果 - {source_path.name}"
+    outbound_id = f"out_{uuid.uuid4().hex}"
+    create_outbound_message(
+        cfg.db_path,
+        outbound_id=outbound_id,
+        sender_account_ref=_sender_account_ref(cfg),
+        sender_ref=cfg.qq_email,
+        source_origin="legacy_file_api",
+        request_id=None,
+        subject=subject,
+        body_text="",
+        to_emails=[cfg.owner_gmail],
+        attachment_count=1,
+        link_count=0,
+        status="sending",
+    )
 
     log_event(
         cfg.db_path, "INFO", "send",
@@ -171,18 +213,21 @@ def send_file_to_owner_gmail(
             subject=subject,
             file_path=send_copy_path,
             source_name=source_path.name,
+            outbound_id=outbound_id,
         )
         _smtp_send(cfg, msg_obj)
     except smtplib.SMTPAuthenticationError as exc:
         err = f"SMTP 认证失败：{exc}。请检查 QQ_EMAIL 与 QQ_AUTH_CODE（授权码，非QQ登录密码）。"
         logger.error(err)
         log_event(cfg.db_path, "ERROR", "send", err)
+        update_outbound_message(cfg.db_path, outbound_id, status="failed", error=err)
         _record_failure(cfg, source_path, send_copy_path, sha, subject, err)
         return {"ok": False, "error": err}
     except Exception as exc:  # noqa: BLE001
         err = f"发送失败：{exc}"
         logger.exception("SMTP 发送异常")
         log_event(cfg.db_path, "ERROR", "send", err)
+        update_outbound_message(cfg.db_path, outbound_id, status="failed", error=err)
         _record_failure(cfg, source_path, send_copy_path, sha, subject, err)
         return {"ok": False, "error": err}
 
@@ -205,6 +250,17 @@ def send_file_to_owner_gmail(
         sent_at=sent_at,
         status="sent",
         error_message=None,
+        original_filename=source_path.name,
+        size_bytes=size_bytes,
+        source_origin="legacy_file_api",
+        source_sha256=sha,
+        staged_sha256=sha256_of_file(send_copy_path),
+        attachment_sha256=sha256_of_file(send_copy_path),
+        sent_archive_sha256=sha256_of_file(sent_copy_path),
+        outbound_id=outbound_id,
+    )
+    update_outbound_message(
+        cfg.db_path, outbound_id, status="sent", sent_at=sent_at, error=None
     )
 
     log_event(
@@ -221,6 +277,7 @@ def send_file_to_owner_gmail(
         "sent_copy_path": str(sent_copy_path),
         "to": cfg.owner_gmail,
         "sent_at": sent_at,
+        "outbound_id": outbound_id,
     }
 
 
@@ -231,13 +288,17 @@ def send_outbound_mail(
     attachment_paths: list[str | Path],
     links: list[dict[str, Any] | str],
     cfg: AppConfig,
+    recipient: str | None = None,
     source_origin: str = "manual_gui",
     outbound_id: str | None = None,
 ) -> dict[str, Any]:
     """发送一封带一个正文、N 个附件和显式链接的 MIME 邮件。"""
     try:
-        require_send_config(cfg)
-    except ConfigError as exc:
+        require_send_config(cfg, require_owner=recipient is None)
+        target_recipient = normalize_manual_recipient(
+            cfg.owner_gmail if recipient is None else recipient
+        )
+    except (ConfigError, ValueError) as exc:
         return _send_error_result("", "configuration_error", str(exc))
 
     normalized_links: list[dict[str, str]] = []
@@ -300,7 +361,10 @@ def send_outbound_mail(
             if sources else "来自 AgentMailBridge 的邮件"
         )
 
-    mail_id = outbound_id or f"out_{uuid.uuid4().hex}"
+    try:
+        mail_id = _validate_outbound_id(outbound_id or f"out_{uuid.uuid4().hex}")
+    except ValueError as exc:
+        return _send_error_result("", "invalid_outbound_id", str(exc))
     create_outbound_message(
         cfg.db_path,
         outbound_id=mail_id,
@@ -310,7 +374,7 @@ def send_outbound_mail(
         request_id=None,
         subject=actual_subject,
         body_text=clean_body,
-        to_emails=[cfg.owner_gmail],
+        to_emails=[target_recipient],
         attachment_count=len(sources),
         link_count=len(normalized_links),
         status="sending",
@@ -377,6 +441,8 @@ def send_outbound_mail(
             body_text=clean_body,
             resources=staged_resources,
             links=normalized_links,
+            recipient=target_recipient,
+            outbound_id=mail_id,
         )
         _smtp_send_with_stage(cfg, message)
     except Exception as exc:  # noqa: BLE001
@@ -398,7 +464,7 @@ def send_outbound_mail(
                 cfg.db_path,
                 source_path=str(item["path"]), send_copy_path=str(item["staged_path"]),
                 sent_copy_path=None, sha256=item["sha256"], subject=actual_subject,
-                from_email=cfg.qq_email, to_email=cfg.owner_gmail, sent_at=None,
+                from_email=cfg.qq_email, to_email=target_recipient, sent_at=None,
                 status="failed", error_message=error,
                 original_filename=item["display_name"], size_bytes=item["size_bytes"],
                 source_origin=source_origin, source_sha256=item["sha256"],
@@ -449,7 +515,7 @@ def send_outbound_mail(
             source_path=str(item["path"]), send_copy_path=str(item["staged_path"]),
             sent_copy_path=str(archive_path) if str(archive_path) not in {"", "."} else None,
             sha256=item["sha256"], subject=actual_subject,
-            from_email=cfg.qq_email, to_email=cfg.owner_gmail, sent_at=sent_at,
+            from_email=cfg.qq_email, to_email=target_recipient, sent_at=sent_at,
             status=resource_status, error_message=resource_error,
             original_filename=item["display_name"], size_bytes=item["size_bytes"],
             source_origin=source_origin, source_sha256=item["sha256"],
@@ -477,7 +543,7 @@ def send_outbound_mail(
         "outbound_id": mail_id,
         "subject": actual_subject,
         "body_text": clean_body,
-        "to": cfg.owner_gmail,
+        "to": target_recipient,
         "sent_at": sent_at,
         "attachment_count": len(staged_resources),
         "link_count": len(normalized_links),
@@ -509,12 +575,16 @@ def _build_outbound_email(
     body_text: str,
     resources: list[dict[str, Any]],
     links: list[dict[str, str]],
+    recipient: str,
+    outbound_id: str,
 ) -> EmailMessage:
     message = EmailMessage()
     message["From"] = cfg.qq_email
-    message["To"] = cfg.owner_gmail
+    message["To"] = normalize_manual_recipient(recipient)
     message["Subject"] = subject
     message["Date"] = formatdate(localtime=True)
+    message[OUTBOUND_ORIGIN_HEADER] = "outbound"
+    message[OUTBOUND_ID_HEADER] = _validate_outbound_id(outbound_id)
     sections: list[str] = []
     if body_text:
         sections.append(body_text.rstrip())
@@ -554,6 +624,7 @@ def _build_email(
     subject: str,
     file_path: Path,
     source_name: str,
+    outbound_id: str | None = None,
 ) -> EmailMessage:
     """构建 MIME 邮件。
 
@@ -565,6 +636,10 @@ def _build_email(
     msg["To"] = cfg.owner_gmail
     msg["Subject"] = subject
     msg["Date"] = formatdate(localtime=True)
+    msg[OUTBOUND_ORIGIN_HEADER] = "outbound"
+    msg[OUTBOUND_ID_HEADER] = _validate_outbound_id(
+        outbound_id or f"out_{uuid.uuid4().hex}"
+    )
 
     stem, ext = split_ext(source_name)
 
@@ -809,6 +884,7 @@ def send_file_with_request(
             subject=actual_subject,
             file_path=send_copy_path,
             source_name=confirmed_name,
+            outbound_id=outbound_id,
         )
         _smtp_send_with_stage(cfg, message)
     except SmtpStageError as exc:

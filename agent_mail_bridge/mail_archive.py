@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import email
 import json
 import os
 import re
@@ -17,18 +18,24 @@ from urllib.parse import urlsplit
 
 from agent_mail_bridge.config import AppConfig
 from agent_mail_bridge.database import (
+    get_outbound_message,
     get_mail_package_by_identity,
     query_mail_resources,
+    query_mail_packages_missing_contacts,
     query_legacy_messages_for_backfill,
     query_received_files_by_message,
     query_trusted_domains,
     save_migration_metadata,
     store_mail_archive_atomically,
+    update_mail_package_contact_facts,
 )
 from agent_mail_bridge.mail_common import (
     NormalizedMail,
     canonical_gmail_address,
     derive_thread_ref,
+    format_mail_address_header,
+    parse_mail_address_header,
+    parse_mailboxes,
 )
 from agent_mail_bridge.mail_links import detect_mail_links
 from agent_mail_bridge.security import SecurityError, assert_within_root
@@ -36,6 +43,7 @@ from agent_mail_bridge.trusted_downloads import download_trusted_url, is_host_tr
 from agent_mail_bridge.utils import sanitize_filename, sha256_of_bytes, sha256_of_file, split_ext
 
 
+# v1 清单继续采用可选字段扩展，避免旧读取方因版本号变化拒绝已有契约。
 MANIFEST_SCHEMA_VERSION = 1
 LEGACY_MIGRATION_KEY = "unified_mail_archive_v1"
 
@@ -165,7 +173,7 @@ def archive_normalized_mail(
                 "original_url": None,
                 "content_id": attachment.content_id or None,
                 "size_bytes": len(attachment.content) if not attachment.error else None,
-                "sha256": sha256_of_bytes(attachment.content) if attachment.content and not attachment.error else None,
+                "sha256": sha256_of_bytes(attachment.content) if not attachment.error else None,
                 "status": attachment.security_status,
                 "error": attachment.error or None,
                 "sort_order": sort_order,
@@ -277,21 +285,28 @@ def archive_normalized_mail(
         downloaded_count = sum(item["resource_type"] == "downloaded_file" for item in resources)
         archive_status = "partial" if errors else "ready"
         thread_ref = derive_thread_ref(mail, message_id)
+        contact_facts = _contact_facts(
+            cfg,
+            from_raw=mail.from_raw,
+            to_raw=mail.to_raw,
+            cc_raw=mail.cc_raw,
+            bcc_raw=mail.bcc_raw,
+            reply_to_raw=mail.reply_to_raw,
+            outbound_origin=mail.outbound_origin,
+            outbound_id=mail.outbound_id,
+        )
         package = {
             "package_id": package_id,
             "account_ref": account_ref,
             "mailbox_ref": mail.mailbox_ref or _default_mailbox_ref(mail.backend),
             "backend": mail.backend,
             "message_id": message_id,
-            "provider_message_id": mail.backend_message_id or None,
+            "provider_message_id": mail.backend_message_id or mail.uid or None,
             "thread_ref": thread_ref,
             "gmail_thread_id": mail.thread_id or None,
             "gmail_uid": mail.uid or None,
             "subject": mail.subject,
-            "from_email": mail.from_raw,
-            "to_emails": mail.to_raw,
-            "cc_emails": mail.cc_raw,
-            "bcc_emails": mail.bcc_raw,
+            **contact_facts,
             "sent_at": mail.sent_at or mail.received_at,
             "received_at": mail.received_at,
             "saved_at": saved_at,
@@ -332,6 +347,109 @@ def archive_normalized_mail(
             attachment_count,
             "; ".join(errors),
         )
+
+
+def backfill_mail_contact_facts(cfg: AppConfig) -> dict[str, int | str]:
+    """从真实 raw.eml 或旧已存 Header 幂等补充 decoded/structured 联系人事实。"""
+    rows = query_mail_packages_missing_contacts(cfg.db_path)
+    migrated = 0
+    failed = 0
+    for row in rows:
+        try:
+            headers = {
+                "from_raw": str(row.get("from_raw_header") or row.get("from_email") or ""),
+                "to_raw": str(row.get("to_raw_header") or row.get("to_emails") or ""),
+                "cc_raw": str(row.get("cc_raw_header") or row.get("cc_emails") or ""),
+                "bcc_raw": str(row.get("bcc_raw_header") or row.get("bcc_emails") or ""),
+                "reply_to_raw": str(row.get("reply_to_raw_header") or ""),
+                "outbound_origin": str(row.get("outbound_origin") or ""),
+                "outbound_id": str(row.get("outbound_id") or ""),
+            }
+            root = Path(str(row.get("package_root") or ""))
+            raw_relative = str(row.get("raw_eml_path") or "")
+            if raw_relative and root:
+                raw_path = root / raw_relative
+                assert_within_root(raw_path, cfg.data_root_path)
+                if raw_path.is_file():
+                    message = email.message_from_bytes(raw_path.read_bytes())
+                    headers = {
+                        "from_raw": ", ".join(message.get_all("From", [])),
+                        "to_raw": ", ".join(message.get_all("To", [])),
+                        "cc_raw": ", ".join(message.get_all("Cc", [])),
+                        "bcc_raw": ", ".join(message.get_all("Bcc", [])),
+                        "reply_to_raw": ", ".join(message.get_all("Reply-To", [])),
+                        "outbound_origin": str(
+                            message.get("X-AgentMailBridge-Origin", "")
+                        ).strip(),
+                        "outbound_id": str(
+                            message.get("X-AgentMailBridge-Outbound-ID", "")
+                        ).strip(),
+                    }
+            facts = _contact_facts(cfg, **headers)
+            update_mail_package_contact_facts(
+                cfg.db_path, str(row["package_id"]), **facts
+            )
+            migrated += 1
+        except Exception:  # noqa: BLE001 - 单封失败不能阻塞后续邮件
+            failed += 1
+    return {
+        "status": "partial" if failed else "completed",
+        "migrated": migrated,
+        "failed": failed,
+    }
+
+
+def _contact_facts(
+    cfg: AppConfig,
+    *,
+    from_raw: str,
+    to_raw: str,
+    cc_raw: str,
+    bcc_raw: str,
+    reply_to_raw: str,
+    outbound_origin: str,
+    outbound_id: str,
+) -> dict[str, Any]:
+    raw_values = {
+        "from": str(from_raw or ""),
+        "to": str(to_raw or ""),
+        "cc": str(cc_raw or ""),
+        "bcc": str(bcc_raw or ""),
+        "reply_to": str(reply_to_raw or ""),
+    }
+    contacts = {
+        key: [item.to_dict() for item in parse_mail_address_header(value)]
+        for key, value in raw_values.items()
+    }
+    clean_origin = str(outbound_origin or "").strip()
+    clean_outbound_id = str(outbound_id or "").strip()
+    outbound = (
+        get_outbound_message(cfg.db_path, clean_outbound_id)
+        if clean_origin.casefold() == "outbound" and clean_outbound_id
+        else None
+    )
+    expected_senders = set(
+        parse_mailboxes(str((outbound or {}).get("sender_ref") or ""))
+    )
+    actual_senders = set(parse_mailboxes(raw_values["from"]))
+    local_outbound = bool(
+        outbound and expected_senders and expected_senders == actual_senders
+    )
+    return {
+        "from_email": format_mail_address_header(raw_values["from"]) or raw_values["from"],
+        "to_emails": format_mail_address_header(raw_values["to"]) or raw_values["to"],
+        "cc_emails": format_mail_address_header(raw_values["cc"]) or raw_values["cc"],
+        "bcc_emails": format_mail_address_header(raw_values["bcc"]) or raw_values["bcc"],
+        "from_raw_header": raw_values["from"],
+        "to_raw_header": raw_values["to"],
+        "cc_raw_header": raw_values["cc"],
+        "bcc_raw_header": raw_values["bcc"],
+        "reply_to_raw_header": raw_values["reply_to"],
+        "contacts_json": json.dumps(contacts, ensure_ascii=False, separators=(",", ":")),
+        "outbound_origin": clean_origin,
+        "outbound_id": clean_outbound_id,
+        "local_outbound": local_outbound,
+    }
 
 
 def backfill_legacy_mail_packages(cfg: AppConfig) -> dict[str, Any]:
@@ -562,9 +680,10 @@ def _readable_document(mail: NormalizedMail, message_id: str) -> str:
         f'gmail_message_id: "{mail.backend_message_id}"',
         f'gmail_thread_id: "{mail.thread_id}"',
         f'message_id: "{message_id}"',
-        f'from: "{mail.from_raw}"',
-        f'to: "{mail.to_raw}"',
-        f'cc: "{mail.cc_raw}"',
+        f'from: "{format_mail_address_header(mail.from_raw) or mail.from_raw}"',
+        f'to: "{format_mail_address_header(mail.to_raw) or mail.to_raw}"',
+        f'cc: "{format_mail_address_header(mail.cc_raw) or mail.cc_raw}"',
+        f'reply_to: "{format_mail_address_header(mail.reply_to_raw) or mail.reply_to_raw}"',
         f'subject: "{mail.subject}"',
         f'received_at: "{mail.received_at}"',
         "---", "", mail.body_text.strip() or "(本邮件无正文)", "",
@@ -635,6 +754,27 @@ def _manifest(
             "to": package.get("to_emails", ""),
             "cc": package.get("cc_emails", ""),
             "bcc": package.get("bcc_emails", ""),
+            "reply_to": [
+                (
+                    f"{item.get('display_name')} <{item.get('address')}>"
+                    if item.get("display_name") and item.get("address")
+                    else item.get("address") or item.get("display_name") or ""
+                )
+                for item in json.loads(package.get("contacts_json") or "{}").get(
+                    "reply_to", []
+                )
+            ],
+            "raw_headers": {
+                "from": package.get("from_raw_header", ""),
+                "to": package.get("to_raw_header", ""),
+                "cc": package.get("cc_raw_header", ""),
+                "bcc": package.get("bcc_raw_header", ""),
+                "reply_to": package.get("reply_to_raw_header", ""),
+            },
+            "contacts": json.loads(package.get("contacts_json") or "{}"),
+            "outbound_origin": package.get("outbound_origin", ""),
+            "outbound_id": package.get("outbound_id", ""),
+            "local_outbound": bool(package.get("local_outbound")),
             "sent_at": package.get("sent_at"),
             "received_at": package.get("received_at"),
             "saved_at": package.get("saved_at"),

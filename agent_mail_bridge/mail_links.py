@@ -21,6 +21,19 @@ _CLOUD_HOSTS = {
     "1drv.ms", "docs.google.com", "drive.google.com", "dropbox.com",
     "notion.site", "notion.so", "onedrive.live.com", "sharepoint.com",
 }
+_GENERIC_ANCHOR_TEXT = {
+    "view", "report", "open", "more", "details", "click", "click here",
+    "查看", "打开", "详情", "报告", "更多",
+}
+_KNOWN_PROVIDERS = {
+    "drive.google.com": "Google Drive 文档",
+    "docs.google.com": "Google 文档",
+    "1drv.ms": "OneDrive 文档",
+    "onedrive.live.com": "OneDrive 文档",
+    "dropbox.com": "Dropbox 文档",
+    "notion.so": "Notion 文档",
+    "notion.site": "Notion 文档",
+}
 
 
 def detect_mail_links(plain_text: str, html_text: str) -> list[dict[str, str]]:
@@ -38,15 +51,17 @@ def detect_mail_links(plain_text: str, html_text: str) -> list[dict[str, str]]:
     candidates.extend(parser.links)
 
     result: list[dict[str, str]] = []
-    seen: set[str] = set()
+    seen: dict[str, int] = {}
     for raw_url, source_type, anchor_text in candidates:
         item = classify_mail_link(raw_url, source_type=source_type, anchor_text=anchor_text)
         if item is None:
             continue
         key = item["url"].casefold()
         if key in seen:
+            if _is_meaningful_anchor(anchor_text):
+                result[seen[key]] = item
             continue
-        seen.add(key)
+        seen[key] = len(result)
         result.append(item)
     return result
 
@@ -84,7 +99,13 @@ def classify_mail_link(
         link_type = "webpage"
         status = "recognized"
     path_name = unquote(PurePosixPath(parsed.path).name)
-    display_name = (anchor_text or "").strip() or path_name or hostname
+    display_name = productized_link_display_name(
+        link_type=link_type,
+        hostname=hostname,
+        path_name=path_name,
+        anchor_text=anchor_text,
+        suffix=suffix,
+    )
     return {
         "url": normalized,
         "hostname": hostname,
@@ -93,6 +114,49 @@ def classify_mail_link(
         "display_name": display_name,
         "status": status,
     }
+
+
+def productized_link_display_name(
+    *,
+    link_type: str,
+    hostname: str,
+    path_name: str = "",
+    anchor_text: str = "",
+    suffix: str = "",
+) -> str:
+    """生成包含类型和主机的可理解名称，避免只显示 view/report。"""
+    anchor = " ".join(str(anchor_text or "").split()).strip()
+    path_label = " ".join(str(path_name or "").split()).strip()
+    meaningful_anchor = _is_meaningful_anchor(anchor)
+    if link_type == "cloud_document":
+        provider = next(
+            (
+                label
+                for host, label in _KNOWN_PROVIDERS.items()
+                if hostname == host or hostname.endswith(f".{host}")
+            ),
+            "云端文档",
+        )
+        return f"{anchor} · {hostname}" if meaningful_anchor else f"{provider} · {hostname}"
+    if link_type == "downloadable_file":
+        kind = f"{suffix.lstrip('.').upper()} 下载" if suffix else "文件下载"
+        name = anchor if meaningful_anchor else path_label
+        return f"{kind} · {hostname}" + (f" · {name}" if name else "")
+    if link_type == "image_link":
+        name = anchor if meaningful_anchor else path_label
+        return f"图片链接 · {hostname}" + (f" · {name}" if name else "")
+    if meaningful_anchor:
+        return f"{anchor} · {hostname}"
+    return f"网页 · {hostname}" + (f" · {path_label}" if path_label else "")
+
+
+def _is_meaningful_anchor(value: str) -> bool:
+    anchor = " ".join(str(value or "").split()).strip()
+    return bool(
+        anchor
+        and anchor.casefold() not in _GENERIC_ANCHOR_TEXT
+        and not anchor.casefold().startswith(("http://", "https://"))
+    )
 
 
 class _LinkHTMLParser(HTMLParser):

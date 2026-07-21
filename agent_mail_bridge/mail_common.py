@@ -30,6 +30,22 @@ class AttachmentData:
     error: str = ""
 
 
+@dataclass(frozen=True)
+class MailAddress:
+    """同时保留原始地址头、可读显示名和规范地址。"""
+
+    raw_header: str
+    display_name: str
+    address: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "raw_header": self.raw_header,
+            "display_name": self.display_name,
+            "address": self.address,
+        }
+
+
 @dataclass
 class NormalizedMail:
     """后端读取后交给统一处理流程的邮件。"""
@@ -51,20 +67,64 @@ class NormalizedMail:
     body_plain: str = ""
     body_html: str = ""
     bcc_raw: str = ""
+    reply_to_raw: str = ""
     sent_at: str = ""
     references_raw: str = ""
     in_reply_to_raw: str = ""
     mailbox_ref: str = ""
+    outbound_origin: str = ""
+    outbound_id: str = ""
+
+
+def parse_mail_address_header(value: str | None) -> list[MailAddress]:
+    """容错解析 RFC 2047 地址头，显示名失败时仍尽量保留邮箱地址。"""
+    raw = str(value or "").strip()
+    if not raw:
+        return []
+    parsed = getaddresses([raw])
+    result: list[MailAddress] = []
+    seen: set[tuple[str, str]] = set()
+    for raw_name, raw_address in parsed:
+        display_name = decode_mime_header(str(raw_name or "")).strip().strip('"')
+        address = str(raw_address or "").strip()
+        # 常见损坏 Header 会把整个值落入 name；对解码后的值再做一次保守解析。
+        if not address and display_name and "@" in display_name:
+            fallback = getaddresses([display_name])
+            if fallback:
+                fallback_name, fallback_address = fallback[0]
+                if fallback_address:
+                    display_name = decode_mime_header(fallback_name).strip().strip('"')
+                    address = fallback_address.strip()
+        if not address and not display_name:
+            continue
+        key = (address.casefold(), display_name.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(MailAddress(raw, display_name, address))
+    return result
+
+
+def format_mail_address(item: MailAddress) -> str:
+    if item.display_name and item.address:
+        return f"{item.display_name} <{item.address}>"
+    return item.address or item.display_name
+
+
+def format_mail_address_header(value: str | None) -> str:
+    """把地址 Header 转为不含 encoded-word 的人类可读文本。"""
+    parsed = parse_mail_address_header(value)
+    return ", ".join(filter(None, (format_mail_address(item) for item in parsed)))
 
 
 def parse_mailboxes(*header_values: str | None) -> list[str]:
     """解析显示名、多收件人和异常空值，统一返回小写地址。"""
-    values = [value for value in header_values if value]
     result: list[str] = []
-    for _display_name, address in getaddresses(values):
-        normalized = address.strip().lower()
-        if normalized and "@" in normalized and normalized not in result:
-            result.append(normalized)
+    for value in header_values:
+        for item in parse_mail_address_header(value):
+            normalized = item.address.strip().lower()
+            if normalized and "@" in normalized and normalized not in result:
+                result.append(normalized)
     return result
 
 
@@ -226,10 +286,13 @@ def normalized_mail_from_raw(
         body_plain=body_plain,
         body_html=body_html,
         bcc_raw=", ".join(message.get_all("Bcc", [])),
+        reply_to_raw=", ".join(message.get_all("Reply-To", [])),
         sent_at=received_at,
         references_raw=str(message.get("References", "")),
         in_reply_to_raw=str(message.get("In-Reply-To", "")),
         mailbox_ref=mailbox_ref,
+        outbound_origin=str(message.get("X-AgentMailBridge-Origin", "")).strip(),
+        outbound_id=str(message.get("X-AgentMailBridge-Outbound-ID", "")).strip(),
     )
 
 

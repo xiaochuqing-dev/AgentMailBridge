@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 from agent_mail_bridge.database import get_connection, get_mail_package, query_mail_resources
-from agent_mail_bridge.mail_common import parse_mailboxes
+from agent_mail_bridge.mail_common import (
+    parse_mail_address_header,
+    parse_mailboxes,
+)
 from agent_mail_bridge.mail_links import classify_mail_link
 from agent_mail_bridge.mail_resource_access import resource_capabilities
 
@@ -173,6 +177,8 @@ def search_mail_facts(
             "(p.subject LIKE ? COLLATE NOCASE OR p.from_email LIKE ? COLLATE NOCASE "
             "OR p.to_emails LIKE ? COLLATE NOCASE OR p.cc_emails LIKE ? COLLATE NOCASE "
             "OR p.bcc_emails LIKE ? COLLATE NOCASE "
+            "OR p.contacts_json LIKE ? COLLATE NOCASE "
+            "OR p.reply_to_raw_header LIKE ? COLLATE NOCASE "
             "OR p.search_text LIKE ? COLLATE NOCASE "
             "OR p.archive_status LIKE ? COLLATE NOCASE "
             "OR p.parse_status LIKE ? COLLATE NOCASE OR EXISTS ("
@@ -181,7 +187,7 @@ def search_mail_facts(
             "OR r.original_url LIKE ? COLLATE NOCASE OR r.status LIKE ? COLLATE NOCASE))"
             f"{status_clause})"
         )
-        params.extend([pattern] * 12)
+        params.extend([pattern] * 14)
         params.extend(status_values)
         params.extend(status_values)
     if account_ref:
@@ -242,6 +248,17 @@ def search_mail_facts(
 def _package_dto(row: dict[str, Any]) -> dict[str, Any]:
     body = str(row.get("search_text") or "")
     package_root = str(row.get("package_root") or "")
+    contacts = _contacts_for_row(row)
+    public_contacts = {
+        key: _public_contact_items(value) for key, value in contacts.items()
+    }
+    from_contact = public_contacts["from"][0] if public_contacts["from"] else {}
+    from_display = str(from_contact.get("display_name") or "")
+    from_address = str(from_contact.get("address") or "")
+    readable_from = (
+        format_mail_address_header_from_dict(from_contact)
+        or str(row.get("from_email") or "")
+    )
     result = {
         "package_id": str(row.get("package_id") or ""),
         "account_ref": str(row.get("account_ref") or ""),
@@ -251,10 +268,24 @@ def _package_dto(row: dict[str, Any]) -> dict[str, Any]:
         "provider_message_id": str(row.get("provider_message_id") or ""),
         "thread_ref": str(row.get("thread_ref") or ""),
         "subject": str(row.get("subject") or ""),
-        "from": str(row.get("from_email") or ""),
+        "from": readable_from,
+        "from_display": from_display,
+        "from_address": from_address,
+        "from_addresses": public_contacts["from"],
         "to": parse_mailboxes(str(row.get("to_emails") or "")),
         "cc": parse_mailboxes(str(row.get("cc_emails") or "")),
         "bcc": parse_mailboxes(str(row.get("bcc_emails") or "")),
+        "to_addresses": public_contacts["to"],
+        "cc_addresses": public_contacts["cc"],
+        "bcc_addresses": public_contacts["bcc"],
+        "reply_to": public_contacts["reply_to"],
+        "raw_headers": {
+            "from": str(row.get("from_raw_header") or ""),
+            "to": str(row.get("to_raw_header") or ""),
+            "cc": str(row.get("cc_raw_header") or ""),
+            "bcc": str(row.get("bcc_raw_header") or ""),
+            "reply_to": str(row.get("reply_to_raw_header") or ""),
+        },
         "sent_at": row.get("sent_at"),
         "received_at": row.get("received_at"),
         "saved_at": row.get("saved_at"),
@@ -285,8 +316,58 @@ def _package_dto(row: dict[str, Any]) -> dict[str, Any]:
         "last_error": str(row.get("last_error") or ""),
         "package_root": package_root,
         "legacy": bool(row.get("legacy")),
+        "outbound_origin": {
+            "origin": str(row.get("outbound_origin") or ""),
+            "outbound_id": str(row.get("outbound_id") or ""),
+            "is_local": bool(row.get("local_outbound")),
+        },
     }
     return result
+
+
+def format_mail_address_header_from_dict(item: dict[str, Any]) -> str:
+    display = str(item.get("display_name") or "")
+    address = str(item.get("address") or "")
+    if display and address:
+        return f"{display} <{address}>"
+    return address or display
+
+
+def _public_contact_items(items: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """普通 GUI/MCP 字段只返回可读联系人；原始编码集中放在 raw_headers。"""
+    return [
+        {
+            "display_name": str(item.get("display_name") or ""),
+            "address": str(item.get("address") or ""),
+        }
+        for item in items
+        if item.get("display_name") or item.get("address")
+    ]
+
+
+def _contacts_for_row(row: dict[str, Any]) -> dict[str, list[dict[str, str]]]:
+    contacts: dict[str, list[dict[str, str]]] = {}
+    try:
+        parsed = json.loads(str(row.get("contacts_json") or "{}"))
+        if isinstance(parsed, dict):
+            contacts = {
+                key: [dict(item) for item in value if isinstance(item, dict)]
+                for key, value in parsed.items()
+                if isinstance(value, list)
+            }
+    except (TypeError, ValueError, json.JSONDecodeError):
+        contacts = {}
+    fallbacks = {
+        "from": row.get("from_raw_header") or row.get("from_email"),
+        "to": row.get("to_raw_header") or row.get("to_emails"),
+        "cc": row.get("cc_raw_header") or row.get("cc_emails"),
+        "bcc": row.get("bcc_raw_header") or row.get("bcc_emails"),
+        "reply_to": row.get("reply_to_raw_header"),
+    }
+    for key, raw in fallbacks.items():
+        if key not in contacts:
+            contacts[key] = [item.to_dict() for item in parse_mail_address_header(str(raw or ""))]
+    return contacts
 
 
 def _matching_status_values(token: str) -> list[str]:
@@ -315,26 +396,41 @@ def _resource_dto(
     source_type = str(row.get("source_type") or "")
     url = str(row.get("original_url") or "")
     link_kind = ""
-    if internal_type == "link" and url:
+    classified = None
+    if internal_type in {"link", "downloaded_file"} and url:
         classified = classify_mail_link(
             url,
             source_type=source_type or "plain_text",
-            anchor_text=str(row.get("display_name") or ""),
+            anchor_text=(
+                str(row.get("display_name") or "")
+                if internal_type == "link"
+                else ""
+            ),
         )
         link_kind = str((classified or {}).get("link_type") or "webpage")
+    display_name = str(row.get("display_name") or "")
+    hostname = ""
+    if classified:
+        hostname = str(classified.get("hostname") or "")
+        already_productized = bool(
+            display_name and hostname and f"· {hostname}" in display_name
+        )
+        if internal_type == "link" and not already_productized:
+            display_name = str(classified.get("display_name") or display_name)
     result = {
         "resource_id": str(row.get("resource_id") or ""),
         "package_id": str(row.get("package_id") or ""),
         "category": _user_category(internal_type),
         "internal_type": internal_type,
         "source": source_type,
-        "display_name": str(row.get("display_name") or ""),
+        "display_name": display_name,
         "original_name": str(row.get("original_name") or ""),
         "mime_type": str(row.get("mime_type") or ""),
         "path": row.get("local_path"),
         "absolute_path": _absolute_package_path(package_root, row.get("local_path")),
         "url": row.get("original_url"),
         "link_kind": link_kind,
+        "hostname": hostname,
         "kind_display": _resource_kind_display(internal_type, link_kind),
         "content_id": row.get("content_id"),
         "size_bytes": row.get("size_bytes"),

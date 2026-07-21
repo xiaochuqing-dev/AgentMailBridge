@@ -74,12 +74,15 @@ def _normalized(
             filename=filename,
         )
     raw = message.as_bytes()
+    provider_suffix = message_id.strip("<>").replace("@", "-")
     normalized = normalized_mail_from_raw(
         raw,
         backend=backend,
-        backend_message_id="provider-1" if backend == "gmail_api" else "",
+        backend_message_id=(
+            f"provider-{provider_suffix}" if backend == "gmail_api" else ""
+        ),
         thread_id=thread_id,
-        uid="101" if backend == "imap" else "",
+        uid=f"uid-{provider_suffix}" if backend == "imap" else "",
         received_at="2026-07-15 10:00:00",
         saved_date="2026-07-15",
         max_attachment_bytes=tmp_cfg.max_attachment_bytes,
