@@ -353,6 +353,7 @@ class TestAttachments:
 class TestSelfMailFilter:
     def test_skip_non_self_from(self, tmp_cfg):
         # from 不是用户自己 -> 跳过
+        tmp_cfg.receive_rule_mode = "self_only"
         msg = _make_message(
             gmail_id="m1",
             from_header="other@gmail.com",
@@ -369,6 +370,7 @@ class TestSelfMailFilter:
 
     def test_skip_non_self_to(self, tmp_cfg):
         # to 不含用户自己 -> 跳过
+        tmp_cfg.receive_rule_mode = "self_only"
         msg = _make_message(
             gmail_id="m1",
             from_header="user@gmail.com",
@@ -384,6 +386,7 @@ class TestSelfMailFilter:
 
     def test_self_mail_with_display_name(self, tmp_cfg):
         # From 含昵称 "Name" <user@gmail.com>，应正确提取
+        tmp_cfg.receive_rule_mode = "self_only"
         msg = _make_message(
             gmail_id="m1",
             from_header='"我的名字" <user@gmail.com>',

@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from agent_mail_bridge.config import AppConfig
-from agent_mail_bridge.mail_archive import archive_normalized_mail
+from agent_mail_bridge.database import get_mail_package_by_identity
+from agent_mail_bridge.mail_archive import archive_normalized_mail, stable_account_ref
 from agent_mail_bridge.mail_common import (
     NormalizedMail,
     fallback_dedup_key,
@@ -18,12 +19,10 @@ from agent_mail_bridge.security import assert_within_root
 from agent_mail_bridge.utils import sanitize_filename, sha256_of_bytes, split_ext
 
 
-def process_normalized_mail(cfg: AppConfig, mail: NormalizedMail) -> dict[str, Any]:
+def process_normalized_mail(
+    cfg: AppConfig, mail: NormalizedMail, *, apply_receive_rule: bool = True
+) -> dict[str, Any]:
     """处理两个后端共同的业务规则并返回结构化单封结果。"""
-    matched, reason = match_receive_rule(cfg, mail)
-    if not matched:
-        return {"status": "skipped", "reason": reason, "saved_files": []}
-
     message_id = normalize_message_id(mail.message_id)
     if not message_id:
         message_id = fallback_dedup_key(
@@ -35,6 +34,33 @@ def process_normalized_mail(cfg: AppConfig, mail: NormalizedMail) -> dict[str, A
             body_text=mail.body_text,
             attachments=mail.attachments,
         )
+
+    # 正式归档事实优先于当前规则。规则变化不能把已归档邮件误报为 rule_skipped。
+    provider_message_id = mail.backend_message_id or mail.uid
+    existing = get_mail_package_by_identity(
+        cfg.db_path,
+        stable_account_ref(cfg),
+        message_id,
+        backend=mail.backend,
+        provider_message_id=provider_message_id,
+    )
+    if existing and existing.get("archive_status") in {"ready", "legacy"}:
+        return {
+            "status": "duplicate",
+            "reason": "already_archived",
+            "message_id": message_id,
+            "package_id": str(existing.get("package_id") or ""),
+            "saved_files": [],
+        }
+
+    if apply_receive_rule:
+        matched, reason = match_receive_rule(cfg, mail)
+        if not matched:
+            return {
+                "status": "skipped",
+                "reason": reason,
+                "saved_files": [],
+            }
 
     archived = archive_normalized_mail(cfg, mail, message_id)
     return {

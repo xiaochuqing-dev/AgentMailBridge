@@ -52,6 +52,34 @@ def save_env_values(
     temporary.replace(env_path)
 
 
+def persist_receive_rule_migration(cfg) -> bool:
+    """幂等固化 v2 收件规则语义；失败时原配置文件由原子写保护留。"""
+    if not bool(getattr(cfg, "receive_rule_migration_needed", False)):
+        return False
+    if os.getenv("AGENT_MAIL_BRIDGE_DISABLE_DOTENV") == "1":
+        return False
+    env_path = Path(getattr(cfg, "loaded_env_path", default_env_path()))
+    if not env_path.exists():
+        # 首次安装尚未形成配置文件时只使用新默认；首次保存会写入全部标记。
+        return False
+    save_env_values(
+        {
+            "RECEIVE_RULE_CONFIG_VERSION": "2",
+            "RECEIVE_RULE_MODE": str(getattr(cfg, "receive_rule_mode", "all_scanned")),
+            "RECEIVE_RULE_MODE_SOURCE": str(
+                getattr(cfg, "receive_rule_mode_source", "migrated_implicit_default")
+            ),
+            "AUTO_RECEIVE_ONLY_SELF_MAIL": str(
+                bool(getattr(cfg, "auto_receive_only_self_mail", False))
+            ).lower(),
+        },
+        env_path,
+    )
+    cfg.receive_rule_config_version = 2
+    cfg.receive_rule_migration_needed = False
+    return True
+
+
 @dataclass(frozen=True)
 class ConfigImportResult:
     destination: Path

@@ -3,7 +3,7 @@
 职责：
 1. 通过 Gmail API（HTTPS 443）读取邮件，绕过 IMAP 993 端口限制。
 2. 去重：优先 RFC Message-ID（兼容 IMAP 逻辑），否则用 gmail_api:<id>。
-3. 只收自发自收邮件（from==用户Gmail 且 to 含用户Gmail）。
+3. 由统一收件规则决定候选邮件是否归档，默认接收当前扫描范围内全部邮件。
 4. 提取正文（优先 text/plain，其次 HTML 清洗）与附件。
 5. 保存正文/附件到本地日期目录，写入 SQLite。
 6. 返回与 IMAP 后端一致的 result dict，供 mail_receive 协调入口统一处理。
@@ -17,10 +17,10 @@ from __future__ import annotations
 import base64
 import email
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from agent_mail_bridge.config import AppConfig
 from agent_mail_bridge.database import (
@@ -33,6 +33,7 @@ from agent_mail_bridge.database import (
     query_due_receive_retries,
     receive_retry_is_due,
     record_receive_failure,
+    record_receive_rule_evaluation,
 )
 from agent_mail_bridge.logging_setup import get_logger
 from agent_mail_bridge.mail_common import (
@@ -42,6 +43,8 @@ from agent_mail_bridge.mail_common import (
     normalized_mail_from_raw,
 )
 from agent_mail_bridge.mail_processing import process_normalized_mail
+from agent_mail_bridge.mail_archive import stable_account_ref
+from agent_mail_bridge.receive_rules import receive_rule_fingerprint
 from agent_mail_bridge.security import (
     check_size_ok,
     is_dangerous,
@@ -117,8 +120,6 @@ def receive_gmail_api_messages(
         "global_error": False,
         "retry_deferred": 0,
     }
-
-    gmail_addr = cfg.gmail_address.lower().strip()
 
     if not automatic:
         log_event(
@@ -222,11 +223,184 @@ def receive_gmail_api_messages(
     return result
 
 
+def rescan_gmail_api_messages(
+    cfg: AppConfig,
+    *,
+    date_from: datetime,
+    date_to: datetime,
+    service: Any | None = None,
+    apply_receive_rule: bool = True,
+    cancel_check: Callable[[], bool] | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    scan_id: str,
+    page_size: int = 100,
+    scan_cap: int = 5000,
+) -> dict[str, Any]:
+    """分页重扫明确历史范围，不复用普通 lookback，也不修改 Gmail 状态。"""
+    from agent_mail_bridge.config import require_receive_config
+
+    require_receive_config(cfg)
+    safe_page_size = max(1, min(int(page_size), 500))
+    safe_scan_cap = max(1, min(int(scan_cap), 10_000))
+    result: dict[str, Any] = {
+        "ok": True,
+        "fetched": 0,
+        "saved": 0,
+        "skipped": 0,
+        "rule_skipped": 0,
+        "matched": 0,
+        "attachments": 0,
+        "accepted": 0,
+        "duplicates": 0,
+        "failed": 0,
+        "saved_files": [],
+        "errors": [],
+        "global_error": False,
+        "cancelled": False,
+        "truncated": False,
+        "scan_id": scan_id,
+    }
+    log_event(
+        cfg.db_path,
+        "INFO",
+        "receive_history",
+        f"历史补扫开始：backend=gmail_api，scan_id={scan_id}",
+    )
+    if service is None:
+        try:
+            service = _build_service(cfg)
+        except Exception as exc:  # noqa: BLE001
+            result.update(ok=False, global_error=True)
+            result["errors"].append(_describe_auth_error(exc))
+            return result
+    query = _historical_query(cfg, date_from, date_to)
+    page_token: str | None = None
+    fingerprint = receive_rule_fingerprint(cfg) if apply_receive_rule else "all_scanned_override"
+    account_ref = stable_account_ref(cfg)
+    while result["fetched"] < safe_scan_cap:
+        if cancel_check and cancel_check():
+            result["cancelled"] = True
+            break
+        request: dict[str, Any] = {
+            "userId": "me",
+            "q": query,
+            "maxResults": min(safe_page_size, safe_scan_cap - result["fetched"]),
+        }
+        if page_token:
+            request["pageToken"] = page_token
+        try:
+            page = service.users().messages().list(**request).execute()
+        except Exception as exc:  # noqa: BLE001
+            result.update(ok=False, global_error=True)
+            result["errors"].append(_describe_api_error(exc))
+            break
+        messages = page.get("messages", []) or []
+        for item in messages:
+            if cancel_check and cancel_check():
+                result["cancelled"] = True
+                break
+            provider_id = str(item.get("id") or "")
+            thread_id = str(item.get("threadId") or "")
+            result["fetched"] += 1
+            try:
+                single = _process_one_unified(
+                    service,
+                    cfg,
+                    provider_id,
+                    thread_id,
+                    result,
+                    apply_receive_rule=apply_receive_rule,
+                )
+                status = str(single.get("status") or "")
+                if status == "skipped":
+                    result["rule_skipped"] += 1
+                    evaluation_result = "rule_skipped"
+                elif status == "duplicate":
+                    result["matched"] += 1
+                    evaluation_result = "duplicate"
+                else:
+                    result["matched"] += 1
+                    evaluation_result = status or "saved"
+                record_receive_rule_evaluation(
+                    cfg.db_path,
+                    account_ref=account_ref,
+                    backend="gmail_api",
+                    provider_message_id=provider_id,
+                    message_id=str(single.get("message_id") or "") or None,
+                    result=evaluation_result,
+                    reason=str(single.get("reason") or "matched"),
+                    rule_fingerprint=fingerprint,
+                    scan_id=scan_id,
+                )
+                clear_receive_retry(cfg.db_path, "gmail_api", provider_id)
+            except Exception as exc:  # noqa: BLE001
+                is_partial = isinstance(exc, Exception) and type(exc).__name__ == "MailArchivePartialError"
+                if is_partial:
+                    result["matched"] += 1
+                result["failed"] += 1
+                result["errors"].append(f"历史邮件处理失败：{type(exc).__name__}")
+                record_receive_failure(
+                    cfg.db_path,
+                    backend="gmail_api",
+                    resource_id=provider_id,
+                    message_id=str(getattr(exc, "message_id", provider_id)),
+                    error=str(exc),
+                )
+                record_receive_rule_evaluation(
+                    cfg.db_path,
+                    account_ref=account_ref,
+                    backend="gmail_api",
+                    provider_message_id=provider_id,
+                    message_id=str(getattr(exc, "message_id", "")) or None,
+                    result="partial" if is_partial else "failed",
+                    reason=type(exc).__name__,
+                    rule_fingerprint=fingerprint,
+                    scan_id=scan_id,
+                )
+            if progress_callback:
+                try:
+                    progress_callback(dict(result))
+                except Exception:  # noqa: BLE001 - 进度展示失败不能中断邮件归档
+                    logger.warning("历史补扫进度回调失败", exc_info=True)
+            if result["fetched"] >= safe_scan_cap:
+                break
+        if result["cancelled"]:
+            break
+        page_token = page.get("nextPageToken")
+        if not page_token:
+            break
+    if page_token and result["fetched"] >= safe_scan_cap:
+        result["truncated"] = True
+    retry_counts = count_receive_retries(cfg.db_path)
+    result.update(
+        pending_retries=retry_counts["pending"],
+        needs_attention=retry_counts["needs_attention"],
+    )
+    log_event(
+        cfg.db_path,
+        "WARNING" if result["failed"] or result["truncated"] else "SUCCESS",
+        "receive_history",
+        f"历史补扫完成：scan_id={scan_id}，扫描 {result['fetched']}，"
+        f"新增 {result['saved']}，重复 {result['duplicates']}，"
+        f"规则跳过 {result['rule_skipped']}，失败 {result['failed']}",
+    )
+    return result
+
+
 def _query_with_lookback(cfg: AppConfig) -> str:
     """每轮重叠回看并依靠 Message-ID/唯一约束去重，优先防漏。"""
     cutoff = now_local() - timedelta(minutes=max(1, cfg.receive_lookback_minutes))
     base = cfg.gmail_api_query.strip()
     return f"{base} after:{int(cutoff.timestamp())}".strip()
+
+
+def _historical_query(cfg: AppConfig, date_from: datetime, date_to: datetime) -> str:
+    base = cfg.gmail_api_query.strip()
+    # Gmail after/before 使用 epoch；结束时间加一秒形成用户可理解的闭区间。
+    return (
+        f"{base} after:{int(date_from.timestamp()) - 1} "
+        f"before:{int(date_to.timestamp()) + 1}"
+    ).strip()
 
 
 # ============================================================
@@ -244,147 +418,15 @@ def _build_service(cfg: AppConfig) -> Any:
 # 内部：单封邮件处理
 # ============================================================
 
-def _process_one(
-    service: Any,
-    cfg: AppConfig,
-    gmail_addr: str,
-    gmail_message_id: str,
-    gmail_thread_id: str,
-    result: dict[str, Any],
-) -> None:
-    """抓取并处理单封 Gmail API 邮件。"""
-    msg = service.users().messages().get(
-        userId="me",
-        id=gmail_message_id,
-        format="full",
-    ).execute()
-
-    payload = msg.get("payload") or {}
-    headers = _headers_to_dict(payload.get("headers") or [])
-
-    # ---- 去重 key：优先 RFC Message-ID，否则 gmail_api:<id> ----
-    rfc_message_id = _find_header(
-        headers, ("Message-ID", "Message-Id", "Message-id")
-    ).strip()
-    dedup_key = rfc_message_id if rfc_message_id else f"gmail_api:{gmail_message_id}"
-
-    if message_id_exists(cfg.db_path, dedup_key):
-        result["skipped"] += 1
-        logger.debug("跳过已记录邮件：%s", dedup_key)
-        return
-
-    # ---- 解析发件 / 收件 / 主题 ----
-    from_raw = _find_header(headers, ("From",))
-    to_raw = _find_header(headers, ("To",))
-    subject = decode_mime_header(_find_header(headers, ("Subject",)))
-
-    from_email = parseaddr(from_raw)[1].lower().strip()
-    to_emails = [parseaddr(x)[1].lower().strip() for x in _split_addresses(to_raw)]
-
-    # ---- 自发自收过滤 ----
-    if cfg.auto_receive_only_self_mail:
-        if from_email != gmail_addr:
-            logger.debug("跳过非自发自收邮件（from 不匹配）：%s", from_email)
-            return
-        if gmail_addr not in to_emails:
-            logger.debug("跳过非自发自收邮件（to 不含本人）：%s", to_raw)
-            return
-
-    # ---- 时间 ----
-    received_dt = _parse_internal_date(msg.get("internalDate"))
-    received_at = fmt_datetime(received_dt)
-
-    # ---- 正文与附件 ----
-    body_text, attachments = _extract_payload(payload, cfg, service,
-                                              gmail_message_id, received_dt)
-
-    # ---- 保存正文 ----
-    body_path = build_body_path(cfg, subject, received_dt)
-    body_md = _compose_body_md(
-        message_id=dedup_key,
-        gmail_message_id=gmail_message_id,
-        gmail_thread_id=gmail_thread_id,
-        from_email=from_email,
-        to_raw=to_raw,
-        subject=subject,
-        received_at=received_at,
-        body_text=body_text,
-        attachments=attachments,
-    )
-    write_text(body_path, body_md)
-    body_sha = sha256_of_file(body_path)
-
-    saved_date = received_dt.strftime("%Y-%m-%d")
-
-    # ---- 写入收件主记录 ----
-    insert_received_message(
-        cfg.db_path,
-        message_id=dedup_key,
-        gmail_uid=None,
-        subject=subject,
-        from_email=from_email,
-        to_email=to_raw,
-        received_at=received_at,
-        saved_date=saved_date,
-        body_file_path=str(body_path),
-        body_sha256=body_sha,
-        has_attachments=len(attachments) > 0,
-        status="saved",
-        source="gmail_api",
-        gmail_message_id=gmail_message_id,
-        gmail_thread_id=gmail_thread_id,
-        backend="gmail_api",
-    )
-
-    # ---- 写入正文文件记录 ----
-    insert_received_file(
-        cfg.db_path,
-        message_id=dedup_key,
-        file_type="body",
-        original_filename=subject or "无标题邮件",
-        saved_filename=body_path.name,
-        saved_path=str(body_path),
-        sha256=body_sha,
-        size_bytes=body_path.stat().st_size,
-        mime_type="text/markdown",
-        saved_date=saved_date,
-        status="normal",
-    )
-
-    # ---- 写入附件文件记录 ----
-    for att in attachments:
-        insert_received_file(
-            cfg.db_path,
-            message_id=dedup_key,
-            file_type="attachment",
-            original_filename=att["original_filename"],
-            saved_filename=att["saved_filename"],
-            saved_path=str(att["saved_path"]),
-            sha256=att["sha256"],
-            size_bytes=att["size_bytes"],
-            mime_type=att["mime_type"],
-            saved_date=saved_date,
-            status="normal",
-        )
-        result["attachments"] += 1
-
-    result["saved"] += 1
-    log_event(
-        cfg.db_path,
-        "SUCCESS",
-        "receive",
-        f"已保存邮件（Gmail API）：{subject or '(无标题)'} | 附件 {len(attachments)} 个",
-    )
-    logger.info("已保存邮件（Gmail API）：%s（附件 %d 个）", subject, len(attachments))
-
-
 def _process_one_unified(
     service: Any,
     cfg: AppConfig,
     gmail_message_id: str,
     gmail_thread_id: str,
     result: dict[str, Any],
-) -> None:
+    *,
+    apply_receive_rule: bool = True,
+) -> dict[str, Any]:
     """读取 Gmail 真实 raw bytes，再交给统一 RFC822 归档流程。"""
     msg = service.users().messages().get(
         userId="me", id=gmail_message_id, format="raw"
@@ -406,7 +448,10 @@ def _process_one_unified(
         max_attachment_bytes=cfg.max_attachment_bytes,
         mailbox_ref="gmail:me/inbox",
     )
-    single = process_normalized_mail(cfg, normalized)
+    single = process_normalized_mail(
+        cfg, normalized, apply_receive_rule=apply_receive_rule
+    )
+    single.setdefault("message_id", normalized.message_id)
     status = single["status"]
     if status in {"saved", "partial"}:
         result["accepted"] += 1
@@ -424,6 +469,7 @@ def _process_one_unified(
         result["skipped"] += 1
     else:
         result["skipped"] += 1
+    return single
 
 
 def _api_message_datetime(headers: dict[str, str], internal_date: Any):

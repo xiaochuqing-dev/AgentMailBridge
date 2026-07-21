@@ -44,6 +44,7 @@ from agent_mail_bridge.database import (
     insert_mcp_audit_event,
     legacy_archive_backfill_needed,
     outbound_mail_migration_needed,
+    v13_mail_migration_needed,
     log_event,
     get_outbound_message as query_outbound_message,
     query_recent_mcp_calls,
@@ -65,8 +66,11 @@ from agent_mail_bridge.database import (
 from agent_mail_bridge.file_index import list_received_files_for_date, scan_file_status
 from agent_mail_bridge.gmail_api_auth import get_oauth_state
 from agent_mail_bridge.logging_setup import get_logger, setup_logging
-from agent_mail_bridge.mail_receive import receive_mails
-from agent_mail_bridge.mail_archive import backfill_legacy_mail_packages
+from agent_mail_bridge.mail_receive import historical_rescan_mails, receive_mails
+from agent_mail_bridge.mail_archive import (
+    backfill_legacy_mail_packages,
+    backfill_mail_contact_facts,
+)
 from agent_mail_bridge.mail_facts import (
     get_mail_message as query_mail_message,
     get_mail_thread as query_mail_thread,
@@ -157,8 +161,18 @@ class ApplicationService:
     def initialize(self) -> ServiceResult:
         """初始化安全目录、数据库和日志。"""
         initialized_now = False
+        receive_rule_migration_error = ""
         with self._setup_lock:
             if not self._ready:
+                try:
+                    from agent_mail_bridge.ui.settings_store import (
+                        persist_receive_rule_migration,
+                    )
+
+                    persist_receive_rule_migration(self.cfg)
+                except OSError as exc:
+                    # 原子保存失败会保留旧文件；本次仍使用已验证的新语义。
+                    receive_rule_migration_error = str(exc)
                 ensure_data_dirs(self.cfg)
                 archive_migration_needed = legacy_archive_backfill_needed(
                     self.cfg.db_path
@@ -166,8 +180,12 @@ class ApplicationService:
                 outbound_migration_needed = outbound_mail_migration_needed(
                     self.cfg.db_path
                 )
-                if archive_migration_needed or outbound_migration_needed:
-                    create_database_backup(self.cfg, label="before_mail_models")
+                v13_migration_needed = v13_mail_migration_needed(self.cfg.db_path)
+                if archive_migration_needed or outbound_migration_needed or v13_migration_needed:
+                    create_database_backup(
+                        self.cfg,
+                        label="before_v1_3_models" if v13_migration_needed else "before_mail_models",
+                    )
                 init_db(self.cfg.db_path)
                 if archive_migration_needed:
                     migration = backfill_legacy_mail_packages(self.cfg)
@@ -176,15 +194,44 @@ class ApplicationService:
                             self.cfg.db_path, "WARNING", "db",
                             f"旧邮件归档迁移部分完成：成功 {migration.get('migrated', 0)}，失败 {migration.get('failed', 0)}",
                         )
+                if v13_migration_needed:
+                    contacts = backfill_mail_contact_facts(self.cfg)
+                    if contacts.get("failed"):
+                        log_event(
+                            self.cfg.db_path,
+                            "WARNING",
+                            "db",
+                            "旧邮件联系人事实回填部分完成："
+                            f"成功 {contacts.get('migrated', 0)}，失败 {contacts.get('failed', 0)}",
+                        )
                 setup_logging(self.cfg.logs_dir, self.cfg.log_level)
                 configure_app_event_retention(
                     self.cfg.db_path, max_count=self.cfg.app_event_max_count
                 )
                 self._ready = True
                 initialized_now = True
+                if receive_rule_migration_error:
+                    log_event(
+                        self.cfg.db_path,
+                        "WARNING",
+                        "config",
+                        "收件规则迁移标记保存失败，旧配置文件已保留",
+                    )
         if initialized_now:
             self.schedule_event_maintenance(force=True)
-        return ServiceResult(OperationStatus.SUCCESS, message="初始化完成")
+        return ServiceResult(
+            OperationStatus.PARTIAL if receive_rule_migration_error else OperationStatus.SUCCESS,
+            error_code=(
+                "receive_rule_migration_save_failed"
+                if receive_rule_migration_error
+                else None
+            ),
+            message=(
+                "初始化完成；收件规则迁移标记暂未保存"
+                if receive_rule_migration_error
+                else "初始化完成"
+            ),
+        )
 
     def get_credential_status(self) -> ServiceResult:
         """只返回已配置状态，不返回任何秘密值。"""
@@ -382,6 +429,147 @@ class ApplicationService:
             process_lock.release()
             self._receive_lock.release()
 
+    def historical_rescan(
+        self,
+        *,
+        date_from: datetime | str,
+        date_to: datetime | str,
+        apply_receive_rule: bool = True,
+        cancel_event: threading.Event | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        page_size: int = 100,
+        scan_cap: int = 5000,
+    ) -> ReceiveResult:
+        """显式历史补扫；范围、锁、取消和统计均独立于普通增量收件。"""
+        self.initialize()
+        backend = _effective_receive_backend(self.cfg)
+        try:
+            start = _coerce_rescan_datetime(date_from, end_of_day=False)
+            end = _coerce_rescan_datetime(date_to, end_of_day=True)
+            if start > end:
+                raise ValueError("历史补扫开始时间不能晚于结束时间")
+            if end - start > timedelta(days=366):
+                raise ValueError("单次历史补扫范围不能超过 366 天")
+            if int(page_size) <= 0 or int(page_size) > 500:
+                raise ValueError("历史补扫 page_size 必须在 1 到 500 之间")
+            if int(scan_cap) <= 0 or int(scan_cap) > 10_000:
+                raise ValueError("历史补扫 scan_cap 必须在 1 到 10000 之间")
+        except (TypeError, ValueError) as exc:
+            return ReceiveResult(
+                OperationStatus.FAILED,
+                backend=backend,
+                error_code="invalid_history_range",
+                message=str(exc),
+            )
+        if not self._receive_lock.acquire(blocking=False):
+            return ReceiveResult(
+                OperationStatus.CANCELLED,
+                backend=backend,
+                error_code="receive_busy",
+                message="已有收件或历史补扫任务正在运行",
+                cancelled=True,
+            )
+        process_lock = ProcessLock(self.cfg.data_root_path / ".locks" / "receive.lock")
+        if not process_lock.acquire(timeout=0.0):
+            self._receive_lock.release()
+            return ReceiveResult(
+                OperationStatus.CANCELLED,
+                backend=backend,
+                error_code="sync_in_progress",
+                message="其他进程正在同步邮件",
+                cancelled=True,
+            )
+        try:
+            if backend == "gmail_api":
+                oauth = get_oauth_state(self.cfg)
+                if oauth["state"] not in {"READY", "TOKEN_EXPIRED_REFRESHABLE"}:
+                    return ReceiveResult(
+                        OperationStatus.AUTH_REQUIRED,
+                        backend=backend,
+                        error_code=oauth["state"].lower(),
+                        message=oauth["message"],
+                        needs_auth=True,
+                    )
+            try:
+                require_receive_config(self.cfg)
+                raw = historical_rescan_mails(
+                    self.cfg,
+                    date_from=start,
+                    date_to=end,
+                    apply_receive_rule=bool(apply_receive_rule),
+                    cancel_check=(cancel_event.is_set if cancel_event else None),
+                    progress_callback=progress_callback,
+                    page_size=int(page_size),
+                    scan_cap=int(scan_cap),
+                )
+            except ConfigError as exc:
+                return ReceiveResult(
+                    OperationStatus.FAILED,
+                    backend=backend,
+                    error_code="config_error",
+                    message=str(exc),
+                )
+            except Exception as exc:  # noqa: BLE001
+                return ReceiveResult(
+                    OperationStatus.FAILED,
+                    backend=backend,
+                    error_code="history_rescan_failed",
+                    message=str(exc),
+                    failed=1,
+                    errors=[str(exc)],
+                )
+            failed = int(raw.get("failed") or 0)
+            saved = int(raw.get("saved") or 0)
+            cancelled = bool(raw.get("cancelled"))
+            truncated = bool(raw.get("truncated"))
+            if raw.get("global_error") or not raw.get("ok", True):
+                status = OperationStatus.FAILED
+            elif cancelled:
+                status = OperationStatus.CANCELLED
+            elif failed or truncated:
+                status = OperationStatus.PARTIAL
+            elif saved == 0:
+                status = OperationStatus.NO_CHANGES
+            else:
+                status = OperationStatus.SUCCESS
+            message = (
+                "历史补扫已取消，已完成的结果已保留"
+                if cancelled
+                else "历史补扫达到安全扫描上限，已保留当前结果"
+                if truncated
+                else f"历史补扫完成：新增 {saved} 封，重复 {int(raw.get('duplicates') or 0)} 封"
+            )
+            return ReceiveResult(
+                status,
+                backend=backend,
+                scanned=int(raw.get("fetched") or 0),
+                matched=int(raw.get("matched") or 0),
+                accepted=int(raw.get("accepted") or saved),
+                saved=saved,
+                skipped=int(raw.get("skipped") or 0),
+                rule_skipped=int(raw.get("rule_skipped") or 0),
+                duplicates=int(raw.get("duplicates") or 0),
+                failed=failed,
+                attachments=int(raw.get("attachments") or 0),
+                saved_files=list(raw.get("saved_files") or []),
+                errors=list(raw.get("errors") or []),
+                pending_retries=int(raw.get("pending_retries") or 0),
+                needs_attention=int(raw.get("needs_attention") or 0),
+                cancelled=cancelled,
+                truncated=truncated,
+                scan_id=str(raw.get("scan_id") or ""),
+                error_code=(
+                    "history_rescan_cancelled" if cancelled
+                    else "history_rescan_truncated" if truncated
+                    else "partial_history_rescan" if failed
+                    else None
+                ),
+                message=message,
+            )
+        finally:
+            process_lock.release()
+            self._receive_lock.release()
+
     def get_auto_receive_state(self) -> ServiceResult:
         """供 GUI 展示真实持久化调度与坏邮件隔离状态。"""
         self.initialize()
@@ -538,6 +726,7 @@ class ApplicationService:
     def send_user_selected_mail(
         self,
         *,
+        recipient: str | None = None,
         subject: str | None,
         body_text: str,
         attachment_paths: list[str | Path],
@@ -551,6 +740,7 @@ class ApplicationService:
             attachment_paths=attachment_paths,
             links=links,
             cfg=self.cfg,
+            recipient=recipient,
             source_origin="manual_gui",
         )
         status_map = {
@@ -563,7 +753,7 @@ class ApplicationService:
             outbound_id=str(raw.get("outbound_id") or ""),
             send_status=str(raw.get("send_status") or "not_sent"),
             subject=str(raw.get("subject") or subject or ""),
-            to_email=str(raw.get("to") or self.cfg.owner_gmail),
+            to_email=str(raw.get("to") or recipient or self.cfg.owner_gmail),
             sent_at=str(raw.get("sent_at") or ""),
             attachment_count=int(raw.get("attachment_count") or 0),
             link_count=int(raw.get("link_count") or 0),
@@ -2114,7 +2304,14 @@ def _mail_search_summary(row: dict[str, Any]) -> dict[str, Any]:
         "package_id": package_id,
         "subject": str(row.get("subject") or ""),
         "from": str(row.get("from") or ""),
+        "from_display": str(row.get("from_display") or ""),
+        "from_address": str(row.get("from_address") or ""),
+        "from_addresses": list(row.get("from_addresses") or []),
         "to": list(row.get("to") or []),
+        "to_addresses": list(row.get("to_addresses") or []),
+        "cc_addresses": list(row.get("cc_addresses") or []),
+        "bcc_addresses": list(row.get("bcc_addresses") or []),
+        "reply_to": list(row.get("reply_to") or []),
         "sent_at": row.get("sent_at"),
         "received_at": row.get("received_at"),
         "saved_at": row.get("saved_at"),
@@ -2194,6 +2391,24 @@ def _parse_datetime(value: Any) -> datetime | None:
         return datetime.fromisoformat(text.replace("Z", "+00:00")).replace(tzinfo=None)
     except ValueError:
         return None
+
+
+def _coerce_rescan_datetime(value: datetime | str, *, end_of_day: bool) -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("历史补扫日期不能为空")
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+            parsed = datetime.strptime(text, "%Y-%m-%d")
+            if end_of_day:
+                parsed = parsed.replace(hour=23, minute=59, second=59, microsecond=999999)
+        else:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone().replace(tzinfo=None)
+    return parsed
 
 
 def _redact_text(value: str, cfg: AppConfig) -> str:

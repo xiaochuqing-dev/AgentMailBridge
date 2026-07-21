@@ -18,11 +18,12 @@ import email
 import imaplib
 import mimetypes
 import re
-from datetime import timedelta
+import uuid
+from datetime import datetime, timedelta
 from email.message import Message
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from agent_mail_bridge.config import AppConfig
 from agent_mail_bridge.database import (
@@ -35,6 +36,7 @@ from agent_mail_bridge.database import (
     query_due_receive_retries,
     receive_retry_is_due,
     record_receive_failure,
+    record_receive_rule_evaluation,
 )
 from agent_mail_bridge.logging_setup import get_logger
 from agent_mail_bridge.mail_common import (
@@ -44,6 +46,8 @@ from agent_mail_bridge.mail_common import (
     normalized_mail_from_raw,
 )
 from agent_mail_bridge.mail_processing import process_normalized_mail
+from agent_mail_bridge.mail_archive import stable_account_ref
+from agent_mail_bridge.receive_rules import receive_rule_fingerprint
 from agent_mail_bridge.security import (
     is_attachment_allowed,
     is_dangerous,
@@ -136,6 +140,54 @@ def receive_gmail_api(
     )
 
 
+def historical_rescan_mails(
+    cfg: AppConfig,
+    *,
+    date_from: datetime,
+    date_to: datetime,
+    apply_receive_rule: bool = True,
+    cancel_check: Callable[[], bool] | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    scan_id: str | None = None,
+    page_size: int = 100,
+    scan_cap: int = 5000,
+) -> dict[str, Any]:
+    """按用户指定范围重扫历史邮件，完全独立于普通增量 lookback。"""
+    from agent_mail_bridge.config import _effective_receive_backend
+
+    backend = _effective_receive_backend(cfg)
+    stable_scan_id = scan_id or f"scan_{uuid.uuid4().hex}"
+    if backend == "gmail_api":
+        from agent_mail_bridge.gmail_api_receive import rescan_gmail_api_messages
+
+        result = rescan_gmail_api_messages(
+            cfg,
+            date_from=date_from,
+            date_to=date_to,
+            apply_receive_rule=apply_receive_rule,
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
+            scan_id=stable_scan_id,
+            page_size=page_size,
+            scan_cap=scan_cap,
+        )
+    else:
+        result = _rescan_via_imap(
+            cfg,
+            date_from=date_from,
+            date_to=date_to,
+            apply_receive_rule=apply_receive_rule,
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
+            scan_id=stable_scan_id,
+            page_size=page_size,
+            scan_cap=scan_cap,
+        )
+    result["backend"] = backend
+    result["scan_id"] = stable_scan_id
+    return result
+
+
 # ============================================================
 # IMAP 后端（原有逻辑，完整保留）
 # ============================================================
@@ -192,8 +244,6 @@ def _receive_via_imap(
         "global_error": False,
         "retry_deferred": 0,
     }
-
-    gmail_addr = cfg.gmail_address.lower().strip()
 
     if not automatic:
         log_event(cfg.db_path, "INFO", "receive", f"开始收取邮件（limit={limit}）")
@@ -302,6 +352,168 @@ def _receive_via_imap(
             pass
 
 
+def _rescan_via_imap(
+    cfg: AppConfig,
+    *,
+    date_from: datetime,
+    date_to: datetime,
+    apply_receive_rule: bool,
+    cancel_check: Callable[[], bool] | None,
+    progress_callback: Callable[[dict[str, Any]], None] | None,
+    scan_id: str,
+    page_size: int,
+    scan_cap: int,
+) -> dict[str, Any]:
+    """IMAP 历史补扫使用 UID SEARCH + BODY.PEEK，不误标已读。"""
+    from agent_mail_bridge.config import require_receive_config
+
+    require_receive_config(cfg)
+    safe_page_size = max(1, min(int(page_size), 500))
+    safe_scan_cap = max(1, min(int(scan_cap), 10_000))
+    result: dict[str, Any] = {
+        "ok": True,
+        "fetched": 0,
+        "saved": 0,
+        "skipped": 0,
+        "rule_skipped": 0,
+        "matched": 0,
+        "attachments": 0,
+        "accepted": 0,
+        "duplicates": 0,
+        "failed": 0,
+        "saved_files": [],
+        "errors": [],
+        "global_error": False,
+        "cancelled": False,
+        "truncated": False,
+        "scan_id": scan_id,
+    }
+    log_event(
+        cfg.db_path,
+        "INFO",
+        "receive_history",
+        f"历史补扫开始：backend=imap，scan_id={scan_id}",
+    )
+    try:
+        conn = _connect_imap(cfg)
+    except Exception as exc:  # noqa: BLE001
+        result.update(ok=False, global_error=True)
+        result["errors"].append(f"IMAP 历史补扫连接失败：{type(exc).__name__}")
+        return result
+    fingerprint = receive_rule_fingerprint(cfg) if apply_receive_rule else "all_scanned_override"
+    account_ref = stable_account_ref(cfg)
+    try:
+        conn.select("INBOX")
+        end_exclusive = date_to.date() + timedelta(days=1)
+        typ, data = conn.uid(
+            "search", None,
+            "SINCE", _imap_date(date_from),
+            "BEFORE", _imap_date(end_exclusive),
+        )
+        if typ != "OK":
+            result.update(ok=False, global_error=True)
+            result["errors"].append(f"IMAP 历史搜索失败：{typ}")
+            return result
+        all_uids = [uid for uid in (data[0] or b"").split() if uid]
+        if len(all_uids) > safe_scan_cap:
+            all_uids = all_uids[-safe_scan_cap:]
+            result["truncated"] = True
+        for page_start in range(0, len(all_uids), safe_page_size):
+            for uid in all_uids[page_start:page_start + safe_page_size]:
+                if cancel_check and cancel_check():
+                    result["cancelled"] = True
+                    break
+                provider_id = uid.decode("ascii", errors="replace")
+                result["fetched"] += 1
+                try:
+                    single = _process_one_unified(
+                        conn,
+                        uid,
+                        cfg,
+                        False,
+                        result,
+                        apply_receive_rule=apply_receive_rule,
+                        date_from=date_from,
+                        date_to=date_to,
+                    )
+                    status = str(single.get("status") or "")
+                    if status == "skipped":
+                        result["rule_skipped"] += 1
+                        evaluation_result = "rule_skipped"
+                    elif status == "duplicate":
+                        result["matched"] += 1
+                        evaluation_result = "duplicate"
+                    elif status == "out_of_range":
+                        evaluation_result = "out_of_range"
+                    else:
+                        result["matched"] += 1
+                        evaluation_result = status or "saved"
+                    record_receive_rule_evaluation(
+                        cfg.db_path,
+                        account_ref=account_ref,
+                        backend="imap",
+                        provider_message_id=provider_id,
+                        message_id=str(single.get("message_id") or "") or None,
+                        result=evaluation_result,
+                        reason=str(single.get("reason") or "matched"),
+                        rule_fingerprint=fingerprint,
+                        scan_id=scan_id,
+                    )
+                    clear_receive_retry(cfg.db_path, "imap", provider_id)
+                except Exception as exc:  # noqa: BLE001
+                    is_partial = isinstance(exc, MailArchivePartialError)
+                    if is_partial:
+                        result["matched"] += 1
+                    result["failed"] += 1
+                    result["errors"].append(
+                        f"IMAP 历史邮件处理失败：{type(exc).__name__}"
+                    )
+                    record_receive_failure(
+                        cfg.db_path,
+                        backend="imap",
+                        resource_id=provider_id,
+                        message_id=str(getattr(exc, "message_id", provider_id)),
+                        error=str(exc),
+                    )
+                    record_receive_rule_evaluation(
+                        cfg.db_path,
+                        account_ref=account_ref,
+                        backend="imap",
+                        provider_message_id=provider_id,
+                        message_id=str(getattr(exc, "message_id", "")) or None,
+                        result="partial" if is_partial else "failed",
+                        reason=type(exc).__name__,
+                        rule_fingerprint=fingerprint,
+                        scan_id=scan_id,
+                    )
+                if progress_callback:
+                    try:
+                        progress_callback(dict(result))
+                    except Exception:  # noqa: BLE001 - 进度展示失败不能中断邮件归档
+                        logger.warning("历史补扫进度回调失败", exc_info=True)
+            if result["cancelled"]:
+                break
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
+    retry_counts = count_receive_retries(cfg.db_path)
+    result.update(
+        pending_retries=retry_counts["pending"],
+        needs_attention=retry_counts["needs_attention"],
+    )
+    log_event(
+        cfg.db_path,
+        "WARNING" if result["failed"] or result["truncated"] else "SUCCESS",
+        "receive_history",
+        f"历史补扫完成：scan_id={scan_id}，扫描 {result['fetched']}，"
+        f"新增 {result['saved']}，重复 {result['duplicates']}，"
+        f"规则跳过 {result['rule_skipped']}，失败 {result['failed']}",
+    )
+    return result
+
+
 # ============================================================
 # 内部：连接
 # ============================================================
@@ -330,147 +542,17 @@ def _connect_imap(cfg: AppConfig) -> imaplib.IMAP4_SSL:
 # 内部：单封邮件处理
 # ============================================================
 
-def _process_one(
-    conn: imaplib.IMAP4_SSL,
-    uid: bytes,
-    cfg: AppConfig,
-    gmail_addr: str,
-    mark_seen: bool,
-    result: dict[str, Any],
-) -> None:
-    """抓取并处理单封邮件。"""
-    # 抓取邮件原始内容
-    fetch_typ, fetch_data = conn.fetch(uid, "(RFC822)")
-    if fetch_typ != "OK" or not fetch_data or not fetch_data[0]:
-        logger.warning("无法抓取邮件 uid=%s", uid)
-        return
-
-    raw = fetch_data[0][1]
-    msg = email.message_from_bytes(raw)
-
-    message_id = (msg.get("Message-ID") or "").strip()
-    if not message_id:
-        # 无 Message-ID 时用部分原始内容生成稳定 id，避免重复
-        message_id = f"<generated-{sha256_of_bytes(raw)[:16]}@local>"
-
-    # 去重
-    if message_id_exists(cfg.db_path, message_id):
-        result["skipped"] += 1
-        logger.debug("跳过已记录邮件：%s", message_id)
-        return
-
-    # 解析发件 / 收件
-    from_email = _extract_email_address(msg.get("From", ""))
-    to_raw = msg.get("To", "")
-    to_emails = _extract_email_addresses(to_raw)
-    subject = decode_mime_header(msg.get("Subject", ""))
-
-    # 只收自发自收邮件（from == gmail 且 to 含 gmail）
-    if cfg.auto_receive_only_self_mail:
-        if from_email.lower() != gmail_addr:
-            logger.debug("跳过非自发自收邮件（from 不匹配）：%s", from_email)
-            return
-        if gmail_addr not in [e.lower() for e in to_emails]:
-            logger.debug("跳过非自发自收邮件（to 不含本人）：%s", to_raw)
-            return
-
-    # 解析时间
-    received_dt = now_local()
-    received_at = fmt_datetime(received_dt)
-
-    # 提取正文与附件
-    body_text, attachments = _parse_parts(msg, cfg, received_dt)
-
-    # 保存正文
-    body_path = build_body_path(cfg, subject, received_dt)
-    body_md = _compose_body_md(
-        message_id=message_id,
-        from_email=from_email,
-        to_raw=to_raw,
-        subject=subject,
-        received_at=received_at,
-        body_text=body_text,
-        attachments=attachments,
-    )
-    write_text(body_path, body_md)
-    body_sha = sha256_of_file(body_path)
-
-    saved_date = received_dt.strftime("%Y-%m-%d")
-
-    # 写入收件主记录
-    insert_received_message(
-        cfg.db_path,
-        message_id=message_id,
-        gmail_uid=uid.decode(errors="replace"),
-        subject=subject,
-        from_email=from_email,
-        to_email=to_raw,
-        received_at=received_at,
-        saved_date=saved_date,
-        body_file_path=str(body_path),
-        body_sha256=body_sha,
-        has_attachments=len(attachments) > 0,
-        status="saved",
-        source="gmail",
-        backend="imap",
-    )
-
-    # 写入正文文件记录
-    insert_received_file(
-        cfg.db_path,
-        message_id=message_id,
-        file_type="body",
-        original_filename=subject or "无标题邮件",
-        saved_filename=body_path.name,
-        saved_path=str(body_path),
-        sha256=body_sha,
-        size_bytes=body_path.stat().st_size,
-        mime_type="text/markdown",
-        saved_date=saved_date,
-        status="normal",
-    )
-
-    # 写入附件文件记录
-    for att in attachments:
-        insert_received_file(
-            cfg.db_path,
-            message_id=message_id,
-            file_type="attachment",
-            original_filename=att["original_filename"],
-            saved_filename=att["saved_filename"],
-            saved_path=str(att["saved_path"]),
-            sha256=att["sha256"],
-            size_bytes=att["size_bytes"],
-            mime_type=att["mime_type"],
-            saved_date=saved_date,
-            status="normal",
-        )
-        result["attachments"] += 1
-
-    # 可选标记已读
-    if mark_seen:
-        try:
-            conn.store(uid, "+FLAGS", "\\Seen")
-        except Exception:
-            logger.warning("标记已读失败 uid=%s", uid)
-
-    result["saved"] += 1
-    log_event(
-        cfg.db_path,
-        "SUCCESS",
-        "receive",
-        f"已保存邮件：{subject or '(无标题)'} | 附件 {len(attachments)} 个",
-    )
-    logger.info("已保存邮件：%s（附件 %d 个）", subject, len(attachments))
-
-
 def _process_one_unified(
     conn: imaplib.IMAP4_SSL,
     uid: bytes,
     cfg: AppConfig,
     mark_seen: bool,
     result: dict[str, Any],
-) -> None:
+    *,
+    apply_receive_rule: bool = True,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+) -> dict[str, Any]:
     """把 IMAP 原始邮件转换后交给统一业务流程。"""
     fetch_typ, fetch_data = conn.uid("fetch", uid, "(BODY.PEEK[])")
     if fetch_typ != "OK" or not fetch_data or not fetch_data[0]:
@@ -489,7 +571,23 @@ def _process_one_unified(
         max_attachment_bytes=cfg.max_attachment_bytes,
         mailbox_ref="imap:INBOX",
     )
-    single = process_normalized_mail(cfg, normalized)
+    if date_from is not None or date_to is not None:
+        normalized_at = datetime.fromisoformat(normalized.received_at)
+        if (
+            date_from is not None and normalized_at < date_from
+        ) or (
+            date_to is not None and normalized_at > date_to
+        ):
+            return {
+                "status": "out_of_range",
+                "reason": "provider_date_overlap",
+                "message_id": normalized.message_id,
+                "saved_files": [],
+            }
+    single = process_normalized_mail(
+        cfg, normalized, apply_receive_rule=apply_receive_rule
+    )
+    single.setdefault("message_id", normalized.message_id)
     status = single["status"]
     if status in {"saved", "partial"}:
         result["accepted"] += 1
@@ -508,6 +606,7 @@ def _process_one_unified(
         result["skipped"] += 1
     if mark_seen and status in {"saved", "duplicate"}:
         conn.uid("store", uid, "+FLAGS", "\\Seen")
+    return single
 
 
 def _imap_date(value) -> str:

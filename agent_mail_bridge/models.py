@@ -60,6 +60,11 @@ class ReceiveResult(ServiceResult):
     errors: list[str] = field(default_factory=list)
     pending_retries: int = 0
     needs_attention: int = 0
+    matched: int = 0
+    rule_skipped: int = 0
+    cancelled: bool = False
+    truncated: bool = False
+    scan_id: str = ""
 
 
 @dataclass

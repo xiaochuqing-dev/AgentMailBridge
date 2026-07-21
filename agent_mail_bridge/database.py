@@ -182,6 +182,15 @@ CREATE TABLE IF NOT EXISTS mail_packages (
     to_emails TEXT,
     cc_emails TEXT,
     bcc_emails TEXT,
+    from_raw_header TEXT,
+    to_raw_header TEXT,
+    cc_raw_header TEXT,
+    bcc_raw_header TEXT,
+    reply_to_raw_header TEXT,
+    contacts_json TEXT,
+    outbound_origin TEXT,
+    outbound_id TEXT,
+    local_outbound INTEGER NOT NULL DEFAULT 0,
     sent_at TEXT,
     received_at TEXT,
     saved_at TEXT,
@@ -332,6 +341,22 @@ CREATE TABLE IF NOT EXISTS receive_retries (
     UNIQUE (backend, resource_id, attachment_id)
 );
 
+CREATE TABLE IF NOT EXISTS receive_rule_evaluations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_ref TEXT NOT NULL,
+    backend TEXT NOT NULL,
+    provider_message_id TEXT NOT NULL,
+    message_id TEXT,
+    evaluated_at TEXT NOT NULL,
+    result TEXT NOT NULL,
+    reason TEXT,
+    rule_fingerprint TEXT NOT NULL,
+    scan_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (account_ref, backend, provider_message_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_received_messages_saved_date
     ON received_messages(saved_date);
 CREATE INDEX IF NOT EXISTS idx_received_files_saved_date
@@ -372,6 +397,8 @@ CREATE INDEX IF NOT EXISTS idx_mcp_audit_tool
     ON mcp_audit_events(tool_name, called_at DESC);
 CREATE INDEX IF NOT EXISTS idx_receive_retries_next_retry
     ON receive_retries(next_retry_at);
+CREATE INDEX IF NOT EXISTS idx_receive_rule_evaluations_time
+    ON receive_rule_evaluations(evaluated_at DESC, id DESC);
 """
 
 
@@ -417,6 +444,21 @@ _MCP_CALLS_NEW_COLUMNS = {
     "staging_failure_reason": "TEXT",
 }
 
+_MAIL_PACKAGES_V13_COLUMNS = {
+    # 早期试验库可能已有 mail_packages 但尚无 provider id；正式 v1.2.1
+    # 已包含该列。把它纳入幂等迁移，保证后续唯一索引始终安全创建。
+    "provider_message_id": "TEXT",
+    "from_raw_header": "TEXT",
+    "to_raw_header": "TEXT",
+    "cc_raw_header": "TEXT",
+    "bcc_raw_header": "TEXT",
+    "reply_to_raw_header": "TEXT",
+    "contacts_json": "TEXT",
+    "outbound_origin": "TEXT",
+    "outbound_id": "TEXT",
+    "local_outbound": "INTEGER NOT NULL DEFAULT 0",
+}
+
 RECEIVE_RETRY_DELAYS_SECONDS = (60, 300, 1800, 7200)
 RECEIVE_RETRY_TERMINAL_COUNT = 5
 
@@ -430,14 +472,34 @@ def init_db(db_path: Path | str) -> None:
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with _get_conn(db_path) as conn:
-        conn.executescript(SCHEMA_SQL)
-        _migrate_received_messages(conn)
-        _migrate_received_files(conn)
-        _migrate_sent_files(conn)
-        _migrate_mcp_calls(conn)
-        _ensure_unique_indexes(conn)
-        _backfill_legacy_outbound_messages(conn)
-        conn.commit()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            _execute_schema(conn)
+            _migrate_received_messages(conn)
+            _migrate_received_files(conn)
+            _migrate_sent_files(conn)
+            _migrate_mcp_calls(conn)
+            _migrate_mail_packages_v13(conn)
+            _ensure_unique_indexes(conn)
+            _backfill_legacy_outbound_messages(conn)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def _execute_schema(conn: sqlite3.Connection) -> None:
+    """逐条执行建表脚本，使建表与增量 ALTER 处于同一可回滚事务。"""
+    pending: list[str] = []
+    for line in SCHEMA_SQL.splitlines():
+        pending.append(line)
+        statement = "\n".join(pending).strip()
+        if not statement or not sqlite3.complete_statement(statement):
+            continue
+        conn.execute(statement)
+        pending.clear()
+    if "\n".join(pending).strip():
+        raise sqlite3.OperationalError("数据库建表脚本不完整")
 
 
 def _migrate_received_messages(conn: sqlite3.Connection) -> None:
@@ -486,6 +548,16 @@ def _migrate_mcp_calls(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE mcp_calls ADD COLUMN {col} {col_type}")
 
 
+def _migrate_mail_packages_v13(conn: sqlite3.Connection) -> None:
+    """增量补充联系人 raw/decoded 事实与精确 outbound 回流标识。"""
+    existing = {
+        row["name"] for row in conn.execute("PRAGMA table_info(mail_packages)").fetchall()
+    }
+    for col, col_type in _MAIL_PACKAGES_V13_COLUMNS.items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE mail_packages ADD COLUMN {col} {col_type}")
+
+
 def _ensure_unique_indexes(conn: sqlite3.Connection) -> None:
     """数据库层阻止跨后端重复邮件和重复发送请求。"""
     try:
@@ -515,6 +587,11 @@ def _ensure_unique_indexes(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_received_files_resource "
         "ON received_files(resource_id) WHERE resource_id IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_mail_packages_provider_identity "
+        "ON mail_packages(account_ref, backend, provider_message_id) "
+        "WHERE provider_message_id IS NOT NULL AND provider_message_id != ''"
     )
 
 
@@ -1079,6 +1156,38 @@ def outbound_mail_migration_needed(db_path: Path | str) -> bool:
         connection.close()
 
 
+def v13_mail_migration_needed(db_path: Path | str) -> bool:
+    """v1.2.1 数据库缺联系人、回流或历史规则评估结构时要求先备份。"""
+    path = Path(db_path)
+    if not path.exists():
+        return False
+    connection = sqlite3.connect(str(path), timeout=5.0)
+    try:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "mail_packages" not in tables:
+            return False
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(mail_packages)")
+        }
+        if not set(_MAIL_PACKAGES_V13_COLUMNS).issubset(columns):
+            return True
+        if "receive_rule_evaluations" not in tables:
+            return True
+        return bool(
+            connection.execute(
+                "SELECT 1 FROM mail_packages "
+                "WHERE contacts_json IS NULL OR contacts_json = '' LIMIT 1"
+            ).fetchone()
+        )
+    finally:
+        connection.close()
+
+
 def query_legacy_messages_for_backfill(db_path: Path | str) -> list[dict[str, Any]]:
     """返回尚未关联 package_id 的旧邮件，不读取正文或附件内容。"""
     with _get_conn(db_path) as conn:
@@ -1093,17 +1202,38 @@ def query_legacy_messages_for_backfill(db_path: Path | str) -> list[dict[str, An
 
 
 def get_mail_package_by_identity(
-    db_path: Path | str, account_ref: str, message_id: str
+    db_path: Path | str,
+    account_ref: str,
+    message_id: str,
+    *,
+    backend: str | None = None,
+    provider_message_id: str | None = None,
 ) -> dict[str, Any] | None:
+    """按 RFC Message-ID 或同一后端 provider id 查找正式归档。"""
+    provider = str(provider_message_id or "").strip()
     with _get_conn(db_path) as conn:
-        row = conn.execute(
-            """
-            SELECT * FROM mail_packages
-            WHERE account_ref = ? AND message_id = ? COLLATE NOCASE
-            LIMIT 1
-            """,
-            (account_ref, message_id),
-        ).fetchone()
+        if provider and backend:
+            row = conn.execute(
+                """
+                SELECT * FROM mail_packages
+                WHERE account_ref = ? AND (
+                    message_id = ? COLLATE NOCASE
+                    OR (backend = ? AND provider_message_id = ?)
+                )
+                ORDER BY CASE WHEN message_id = ? COLLATE NOCASE THEN 0 ELSE 1 END
+                LIMIT 1
+                """,
+                (account_ref, message_id, backend, provider, message_id),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT * FROM mail_packages
+                WHERE account_ref = ? AND message_id = ? COLLATE NOCASE
+                LIMIT 1
+                """,
+                (account_ref, message_id),
+            ).fetchone()
         return dict(row) if row else None
 
 
@@ -1114,6 +1244,72 @@ def get_mail_package(db_path: Path | str, package_id: str) -> dict[str, Any] | N
             (package_id,),
         ).fetchone()
         return dict(row) if row else None
+
+
+def query_mail_packages_missing_contacts(
+    db_path: Path | str, *, limit: int = 10_000
+) -> list[dict[str, Any]]:
+    """列出尚未生成结构化联系人事实的邮件，供一次性无损回填。"""
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM mail_packages
+            WHERE contacts_json IS NULL OR contacts_json = ''
+            ORDER BY id ASC LIMIT ?
+            """,
+            (max(1, min(int(limit), 100_000)),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def update_mail_package_contact_facts(
+    db_path: Path | str,
+    package_id: str,
+    *,
+    from_email: str,
+    to_emails: str,
+    cc_emails: str,
+    bcc_emails: str,
+    from_raw_header: str,
+    to_raw_header: str,
+    cc_raw_header: str,
+    bcc_raw_header: str,
+    reply_to_raw_header: str,
+    contacts_json: str,
+    outbound_origin: str = "",
+    outbound_id: str = "",
+    local_outbound: bool = False,
+) -> None:
+    with _get_conn(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE mail_packages
+            SET from_email = ?, to_emails = ?, cc_emails = ?, bcc_emails = ?,
+                from_raw_header = ?, to_raw_header = ?, cc_raw_header = ?,
+                bcc_raw_header = ?, reply_to_raw_header = ?, contacts_json = ?,
+                outbound_origin = ?, outbound_id = ?, local_outbound = ?,
+                updated_at = ?
+            WHERE package_id = ?
+            """,
+            (
+                from_email, to_emails, cc_emails, bcc_emails,
+                from_raw_header, to_raw_header, cc_raw_header, bcc_raw_header,
+                reply_to_raw_header, contacts_json, outbound_origin,
+                outbound_id, 1 if local_outbound else 0, _now(), package_id,
+            ),
+        )
+        conn.commit()
+
+
+def outbound_message_exists(db_path: Path | str, outbound_id: str) -> bool:
+    if not str(outbound_id or "").strip():
+        return False
+    with _get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM outbound_messages WHERE outbound_id = ? LIMIT 1",
+            (str(outbound_id).strip(),),
+        ).fetchone()
+        return row is not None
 
 
 def query_mail_resources(
@@ -1166,15 +1362,29 @@ def store_mail_archive_atomically(
                 INSERT INTO mail_packages
                     (package_id, account_ref, mailbox_ref, backend, message_id,
                      provider_message_id, thread_ref, subject, from_email,
-                     to_emails, cc_emails, bcc_emails, sent_at, received_at,
+                     to_emails, cc_emails, bcc_emails, from_raw_header,
+                     to_raw_header, cc_raw_header, bcc_raw_header,
+                     reply_to_raw_header, contacts_json, outbound_origin,
+                     outbound_id, local_outbound, sent_at, received_at,
                      saved_at, package_root, raw_eml_path, raw_eml_sha256,
                      raw_eml_status, body_plain_path, body_html_path,
                      body_readable_path, body_text_sha256, search_text,
                      resource_count, attachment_count, inline_image_count,
                      link_count, downloaded_count, archive_status, parse_status,
                      last_error, legacy, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (:package_id, :account_ref, :mailbox_ref, :backend,
+                        :message_id, :provider_message_id, :thread_ref, :subject,
+                        :from_email, :to_emails, :cc_emails, :bcc_emails,
+                        :from_raw_header, :to_raw_header, :cc_raw_header,
+                        :bcc_raw_header, :reply_to_raw_header, :contacts_json,
+                        :outbound_origin, :outbound_id, :local_outbound,
+                        :sent_at, :received_at, :saved_at, :package_root,
+                        :raw_eml_path, :raw_eml_sha256, :raw_eml_status,
+                        :body_plain_path, :body_html_path, :body_readable_path,
+                        :body_text_sha256, :search_text, :resource_count,
+                        :attachment_count, :inline_image_count, :link_count,
+                        :downloaded_count, :archive_status, :parse_status,
+                        :last_error, :legacy, :created_at, :updated_at)
                 ON CONFLICT(package_id) DO UPDATE SET
                     mailbox_ref=excluded.mailbox_ref,
                     backend=excluded.backend,
@@ -1185,6 +1395,15 @@ def store_mail_archive_atomically(
                     to_emails=excluded.to_emails,
                     cc_emails=excluded.cc_emails,
                     bcc_emails=excluded.bcc_emails,
+                    from_raw_header=excluded.from_raw_header,
+                    to_raw_header=excluded.to_raw_header,
+                    cc_raw_header=excluded.cc_raw_header,
+                    bcc_raw_header=excluded.bcc_raw_header,
+                    reply_to_raw_header=excluded.reply_to_raw_header,
+                    contacts_json=excluded.contacts_json,
+                    outbound_origin=excluded.outbound_origin,
+                    outbound_id=excluded.outbound_id,
+                    local_outbound=excluded.local_outbound,
                     sent_at=excluded.sent_at,
                     received_at=excluded.received_at,
                     saved_at=excluded.saved_at,
@@ -1208,28 +1427,52 @@ def store_mail_archive_atomically(
                     legacy=excluded.legacy,
                     updated_at=excluded.updated_at
                 """,
-                (
-                    package["package_id"], package["account_ref"],
-                    package["mailbox_ref"], package["backend"],
-                    package["message_id"], package.get("provider_message_id"),
-                    package.get("thread_ref"), package.get("subject", ""),
-                    package.get("from_email", ""), package.get("to_emails", ""),
-                    package.get("cc_emails", ""), package.get("bcc_emails", ""),
-                    package.get("sent_at"), package.get("received_at"),
-                    package.get("saved_at") or now, package["package_root"],
-                    package.get("raw_eml_path"), package.get("raw_eml_sha256"),
-                    package["raw_eml_status"], package.get("body_plain_path"),
-                    package.get("body_html_path"), package.get("body_readable_path"),
-                    package.get("body_text_sha256"), package.get("search_text", ""),
-                    int(package.get("resource_count") or 0),
-                    int(package.get("attachment_count") or 0),
-                    int(package.get("inline_image_count") or 0),
-                    int(package.get("link_count") or 0),
-                    int(package.get("downloaded_count") or 0),
-                    package["archive_status"], package["parse_status"],
-                    package.get("last_error"), 1 if package.get("legacy") else 0,
-                    created_at, now,
-                ),
+                {
+                    "package_id": package["package_id"],
+                    "account_ref": package["account_ref"],
+                    "mailbox_ref": package["mailbox_ref"],
+                    "backend": package["backend"],
+                    "message_id": package["message_id"],
+                    "provider_message_id": package.get("provider_message_id"),
+                    "thread_ref": package.get("thread_ref"),
+                    "subject": package.get("subject", ""),
+                    "from_email": package.get("from_email", ""),
+                    "to_emails": package.get("to_emails", ""),
+                    "cc_emails": package.get("cc_emails", ""),
+                    "bcc_emails": package.get("bcc_emails", ""),
+                    "from_raw_header": package.get("from_raw_header"),
+                    "to_raw_header": package.get("to_raw_header"),
+                    "cc_raw_header": package.get("cc_raw_header"),
+                    "bcc_raw_header": package.get("bcc_raw_header"),
+                    "reply_to_raw_header": package.get("reply_to_raw_header"),
+                    "contacts_json": package.get("contacts_json", "{}"),
+                    "outbound_origin": package.get("outbound_origin"),
+                    "outbound_id": package.get("outbound_id"),
+                    "local_outbound": 1 if package.get("local_outbound") else 0,
+                    "sent_at": package.get("sent_at"),
+                    "received_at": package.get("received_at"),
+                    "saved_at": package.get("saved_at") or now,
+                    "package_root": package["package_root"],
+                    "raw_eml_path": package.get("raw_eml_path"),
+                    "raw_eml_sha256": package.get("raw_eml_sha256"),
+                    "raw_eml_status": package["raw_eml_status"],
+                    "body_plain_path": package.get("body_plain_path"),
+                    "body_html_path": package.get("body_html_path"),
+                    "body_readable_path": package.get("body_readable_path"),
+                    "body_text_sha256": package.get("body_text_sha256"),
+                    "search_text": package.get("search_text", ""),
+                    "resource_count": int(package.get("resource_count") or 0),
+                    "attachment_count": int(package.get("attachment_count") or 0),
+                    "inline_image_count": int(package.get("inline_image_count") or 0),
+                    "link_count": int(package.get("link_count") or 0),
+                    "downloaded_count": int(package.get("downloaded_count") or 0),
+                    "archive_status": package["archive_status"],
+                    "parse_status": package["parse_status"],
+                    "last_error": package.get("last_error"),
+                    "legacy": 1 if package.get("legacy") else 0,
+                    "created_at": created_at,
+                    "updated_at": now,
+                },
             )
 
             for resource in resources:
@@ -2265,6 +2508,70 @@ def record_receive_failure(
             )
         conn.commit()
     return get_receive_retry(db_path, backend, resource_id, attachment_id) or {}
+
+
+def record_receive_rule_evaluation(
+    db_path: Path | str,
+    *,
+    account_ref: str,
+    backend: str,
+    provider_message_id: str,
+    message_id: str | None,
+    result: str,
+    reason: str,
+    rule_fingerprint: str,
+    scan_id: str | None = None,
+    evaluated_at: datetime | None = None,
+) -> None:
+    """记录最近一次规则判断；该表只供审计，绝不参与去重或压制重扫。"""
+    now_text = fmt_datetime(evaluated_at or now_local())
+    with _get_conn(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO receive_rule_evaluations
+                (account_ref, backend, provider_message_id, message_id,
+                 evaluated_at, result, reason, rule_fingerprint, scan_id,
+                 created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(account_ref, backend, provider_message_id) DO UPDATE SET
+                message_id=excluded.message_id,
+                evaluated_at=excluded.evaluated_at,
+                result=excluded.result,
+                reason=excluded.reason,
+                rule_fingerprint=excluded.rule_fingerprint,
+                scan_id=excluded.scan_id,
+                updated_at=excluded.updated_at
+            """,
+            (
+                account_ref, backend, provider_message_id, message_id,
+                now_text, result, reason, rule_fingerprint, scan_id,
+                now_text, now_text,
+            ),
+        )
+        conn.commit()
+
+
+def query_receive_rule_evaluations(
+    db_path: Path | str, *, scan_id: str | None = None, limit: int = 100
+) -> list[dict[str, Any]]:
+    with _get_conn(db_path) as conn:
+        if scan_id:
+            rows = conn.execute(
+                """
+                SELECT * FROM receive_rule_evaluations
+                WHERE scan_id = ? ORDER BY evaluated_at DESC, id DESC LIMIT ?
+                """,
+                (scan_id, max(1, min(int(limit), 1000))),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM receive_rule_evaluations
+                ORDER BY evaluated_at DESC, id DESC LIMIT ?
+                """,
+                (max(1, min(int(limit), 1000)),),
+            ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def clear_receive_retry(

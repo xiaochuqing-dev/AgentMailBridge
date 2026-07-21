@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from email.utils import getaddresses
 from typing import Any, Iterable
@@ -148,3 +149,23 @@ def match_receive_rule(cfg: Any, mail: Any) -> tuple[bool, str]:
 def serialize_rule_items(values: Iterable[str]) -> str:
     """配置文件使用 JSON，避免主题关键词中的普通空格被破坏。"""
     return json.dumps(list(values), ensure_ascii=False, separators=(",", ":"))
+
+
+def receive_rule_fingerprint(cfg: Any) -> str:
+    """生成非敏感、稳定的规则指纹，用于历史重扫审计而非去重。"""
+    payload = {
+        "mode": str(getattr(cfg, "receive_rule_mode", "") or ALL_SCANNED),
+        "senders": list(normalize_sender_rules(getattr(cfg, "receive_rule_senders", ()))),
+        "keywords": list(
+            normalize_subject_keywords(
+                getattr(cfg, "receive_rule_subject_keywords", ())
+            )
+        ),
+        "require_attachment": bool(
+            getattr(cfg, "receive_rule_require_attachment", False)
+        ),
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()

@@ -169,11 +169,14 @@ class AppConfig:
     qq_smtp_socks5_port: int = 0
     qq_smtp_socks5_remote_dns: bool = False
 
-    # --- 固定收件人 ---
+    # --- MCP / Agent 固定结果收件人（GUI 手动发件可显式覆盖） ---
     owner_gmail: str = ""
 
     # --- 本地数据目录 ---
     data_root: Path = field(default_factory=lambda: get_runtime_paths().data_root)
+    loaded_env_path: Path = field(
+        default_factory=lambda: get_runtime_paths().config_file, repr=False
+    )
     # 允许应用服务读取并发送文件的额外目录；默认只允许 DATA_ROOT。
     allowed_send_roots: list[Path] = field(default_factory=list)
 
@@ -183,8 +186,11 @@ class AppConfig:
     mcp_mail_freshness_seconds: int = 90
 
     # --- 收件规则 ---
-    auto_receive_only_self_mail: bool = True
+    auto_receive_only_self_mail: bool = False
     receive_rule_mode: str = ""
+    receive_rule_config_version: int = 2
+    receive_rule_mode_source: str = "new_default"
+    receive_rule_migration_needed: bool = field(default=False, repr=False)
     receive_rule_senders: tuple[str, ...] = field(default_factory=tuple)
     receive_rule_subject_keywords: tuple[str, ...] = field(default_factory=tuple)
     receive_rule_require_attachment: bool = False
@@ -208,7 +214,7 @@ class AppConfig:
     app_event_max_count: int = 10_000
 
     def __post_init__(self) -> None:
-        """旧布尔配置无损映射到新模式，并归一化非敏感规则。"""
+        """兼容直接构造的旧布尔配置，并归一化非敏感规则。"""
         if not self.receive_rule_mode:
             self.receive_rule_mode = (
                 SELF_ONLY if self.auto_receive_only_self_mail else ALL_SCANNED
@@ -332,6 +338,8 @@ class AppConfig:
             "mcp_mail_freshness_seconds": self.mcp_mail_freshness_seconds,
             "auto_receive_only_self_mail": self.auto_receive_only_self_mail,
             "receive_rule_mode": self.receive_rule_mode,
+            "receive_rule_config_version": self.receive_rule_config_version,
+            "receive_rule_mode_source": self.receive_rule_mode_source,
             "receive_rule_senders": list(self.receive_rule_senders),
             "receive_rule_subject_keywords": list(self.receive_rule_subject_keywords),
             "receive_rule_require_attachment": self.receive_rule_require_attachment,
@@ -419,8 +427,27 @@ def load_config(env_path: Path | str | None = None) -> AppConfig:
 
     legacy_only_self = _as_bool(os.getenv("AUTO_RECEIVE_ONLY_SELF_MAIL"), True)
     receive_rule_mode = os.getenv("RECEIVE_RULE_MODE", "").strip().lower()
-    if not receive_rule_mode:
-        receive_rule_mode = SELF_ONLY if legacy_only_self else ALL_SCANNED
+    raw_rule_version = os.getenv("RECEIVE_RULE_CONFIG_VERSION", "").strip()
+    if raw_rule_version:
+        try:
+            receive_rule_config_version = int(raw_rule_version)
+        except ValueError as exc:
+            raise ConfigError("RECEIVE_RULE_CONFIG_VERSION 必须是整数") from exc
+        if receive_rule_config_version < 1:
+            raise ConfigError("RECEIVE_RULE_CONFIG_VERSION 必须大于 0")
+    else:
+        receive_rule_config_version = 1
+    receive_rule_mode_source = os.getenv("RECEIVE_RULE_MODE_SOURCE", "").strip()
+    receive_rule_migration_needed = receive_rule_config_version < 2
+    if receive_rule_mode:
+        # v1.2 已经持久化 RECEIVE_RULE_MODE；其 self_only/custom 属于明确偏好。
+        receive_rule_mode_source = receive_rule_mode_source or "legacy_explicit_mode"
+    else:
+        # 缺少显式模式时，旧 True 只是历史默认，不能继续把外部来信全部过滤。
+        # legacy False 与新默认均落到 ALL_SCANNED；旧自定义字段不被擅自猜测。
+        receive_rule_mode = ALL_SCANNED
+        receive_rule_mode_source = "migrated_implicit_default"
+        receive_rule_migration_needed = True
 
     cfg = AppConfig(
         gmail_address=os.getenv("GMAIL_ADDRESS", "").strip(),
@@ -484,6 +511,7 @@ def load_config(env_path: Path | str | None = None) -> AppConfig:
         ),
         owner_gmail=os.getenv("OWNER_GMAIL", "").strip(),
         data_root=data_root,
+        loaded_env_path=env_file,
         allowed_send_roots=allowed_send_roots,
         mcp_mail_read_enabled=_as_bool(os.getenv("MCP_MAIL_READ_ENABLED"), False),
         mcp_mail_freshness_seconds=max(
@@ -499,6 +527,9 @@ def load_config(env_path: Path | str | None = None) -> AppConfig:
         ),
         auto_receive_only_self_mail=legacy_only_self,
         receive_rule_mode=receive_rule_mode,
+        receive_rule_config_version=max(2, receive_rule_config_version),
+        receive_rule_mode_source=receive_rule_mode_source,
+        receive_rule_migration_needed=receive_rule_migration_needed,
         receive_rule_senders=normalize_sender_rules(
             os.getenv("RECEIVE_RULE_SENDERS", "")
         ),
@@ -607,14 +638,14 @@ def _effective_receive_backend(cfg: AppConfig) -> str:
     return backend
 
 
-def require_send_config(cfg: AppConfig) -> None:
+def require_send_config(cfg: AppConfig, *, require_owner: bool = True) -> None:
     """发件前校验必需配置，缺失时给出明确错误。"""
     missing: list[str] = []
     if not cfg.qq_email:
         missing.append("QQ_EMAIL")
     if not cfg.qq_auth_code:
         missing.append("QQ_AUTH_CODE")
-    if not cfg.owner_gmail:
+    if require_owner and not cfg.owner_gmail:
         missing.append("OWNER_GMAIL")
     if missing:
         raise ConfigError(

@@ -27,6 +27,8 @@ def isolate_local_secrets(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         "MCP_MAIL_READ_ENABLED", "MCP_MAIL_FRESHNESS_SECONDS",
         "RECEIVE_RULE_MODE", "RECEIVE_RULE_SENDERS",
         "RECEIVE_RULE_SUBJECT_KEYWORDS", "RECEIVE_RULE_REQUIRE_ATTACHMENT",
+        "RECEIVE_RULE_CONFIG_VERSION", "RECEIVE_RULE_MODE_SOURCE",
+        "AUTO_RECEIVE_ONLY_SELF_MAIL",
     )
     for name in sensitive_names:
         monkeypatch.delenv(name, raising=False)
