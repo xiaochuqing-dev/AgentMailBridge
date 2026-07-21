@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -24,6 +26,29 @@ from agent_mail_bridge.ui.settings_store import (
     import_legacy_env,
     save_env_values,
 )
+
+
+def test_core_settings_store_import_does_not_require_qt() -> None:
+    code = """
+import builtins
+original_import = builtins.__import__
+def guarded_import(name, *args, **kwargs):
+    if name.startswith('PySide6'):
+        raise ModuleNotFoundError('Qt intentionally unavailable')
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = guarded_import
+from agent_mail_bridge.ui.settings_store import persist_receive_rule_migration
+assert callable(persist_receive_rule_migration)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_runtime_paths_source_mode_keep_developer_layout(tmp_path: Path):
