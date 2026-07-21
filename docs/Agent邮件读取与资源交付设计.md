@@ -2,7 +2,7 @@
 
 ## 产品边界
 
-AgentMailBridge v1.2.1 保留 v1.2.0 引入的通用 Agent 邮件读取能力，让本机兼容 stdio MCP 的 Agent 直接读取已由后台收件形成的规范归档。GUI 用于一次性授权、工作区配置和审计观察，不参与每次读件。功能仍是本地单用户邮箱桥接，不扩展为通用邮件客户端、SaaS、Agent 编排或知识管理系统。
+AgentMailBridge v1.3.0 保留 v1.2.0 引入的通用 Agent 邮件读取能力，让本机兼容 stdio MCP 的 Agent 直接读取已由后台收件形成的规范归档。联系人字段增加 decoded 结构，`ensure_fresh` 仍只触发当前增量同步，不替代 GUI 历史补扫。GUI 用于一次性授权、工作区配置和审计观察，不参与每次读件。功能仍是本地单用户邮箱桥接，不扩展为通用邮件客户端、SaaS、Agent 编排或知识管理系统。
 
 ## 数据流
 
@@ -32,6 +32,6 @@ AgentMailBridge v1.2.1 保留 v1.2.0 引入的通用 Agent 邮件读取能力，
 
 ## 审计与兼容
 
-`mcp_audit_events` 统一审计 search、get、read、prepare、workspace、sync 和 send，并与旧 `mcp_calls` 合并查询。正文全文、附件内容、凭据和 OAuth 不进入审计。`submit_result` 的输入、幂等 request_id、固定收件人、白名单、原子 staging 和四段 Hash 链保持兼容。
+`mcp_audit_events` 统一审计 search、get、read、prepare、workspace、sync 和 send，并与旧 `mcp_calls` 合并查询。正文全文、附件内容、凭据和 OAuth 不进入审计。`submit_result` 的输入、幂等 request_id、`OWNER_GMAIL` 固定目标、白名单、原子 staging 和四段 Hash 链保持兼容；GUI 用户手动填写 To 不会扩大 MCP 权限。
 
 Route B 多邮箱、远程 MCP、任意收件人、邮箱修改、普通网页抓取和附件执行均不在 v1.2.0 范围内。

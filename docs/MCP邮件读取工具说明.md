@@ -2,11 +2,11 @@
 
 ## search_mails
 
-输入支持 query、time_scope、recent_days、date_from/date_to、subject、sender、recipient、has_attachments、status、sort、limit、offset、ensure_fresh、allow_cached、account_ref 和 mailbox_ref。time_scope 取 latest、today、yesterday、recent_days、date_range 或 all；limit 为 1 至 100。输出包含唯一邮件摘要、result_count、分页、cached、sync_triggered、sync_error 和同步状态。
+输入支持 query、time_scope、recent_days、date_from/date_to、subject、sender、recipient、has_attachments、status、sort、limit、offset、ensure_fresh、allow_cached、account_ref 和 mailbox_ref。time_scope 取 latest、today、yesterday、recent_days、date_range 或 all；limit 为 1 至 100。搜索覆盖解码后的联系人显示名与地址，输出保持唯一邮件摘要、分页和同步状态；`ensure_fresh` 只做当前增量同步，不替代 GUI 历史补扫。
 
 ## get_mail
 
-输入 mail_id 或 package_id，以及 offset 和 max_chars。输出邮件元数据、线程身份、archive 状态、有界正文、资源清单、分类计数和 raw.eml 描述。正文返回 character_count、offset、next_offset 和 has_more；不会一次返回无界正文。
+输入 mail_id 或 package_id，以及 offset 和 max_chars。输出邮件元数据、线程身份、archive 状态、有界正文、资源清单、分类计数和 raw.eml 描述。兼容旧 `from/to/cc/bcc`，同时提供结构化 decoded 联系人字段与独立 raw Header；正文返回 character_count、offset、next_offset 和 has_more。
 
 ## read_mail_resource
 
@@ -28,7 +28,7 @@
 
 ## submit_result
 
-输入与既有版本相同：file_path 必填，title 与稳定 request_id 可选。读取开关关闭不影响发送。成功、duplicate 和 SMTP 已接受但归档失败不会被客户端误判为协议错误；路径、类型、大小、配置、速率和 Hash 失败返回稳定业务状态。
+输入与既有版本相同：file_path 必填，title 与稳定 request_id 可选，不接受任意 recipient。读取开关关闭不影响发送，实际目标始终由 `OWNER_GMAIL` 控制。成功、duplicate 和 SMTP 已接受但归档失败不会被客户端误判为协议错误；路径、类型、大小、配置、速率和 Hash 失败返回稳定业务状态。
 
 ## 通用协议约定
 

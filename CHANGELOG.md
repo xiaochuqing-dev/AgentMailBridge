@@ -1,5 +1,17 @@
 # CHANGELOG
 
+## 1.3.0 收发语义、历史补扫、联系人解码与邮件详情统一整改 - 2026-07-21
+
+- 新配置默认使用 `all_scanned`，正常归档当前 Inbox 查询范围内的候选邮件；`self_only` 更名为“仅 Gmail 自发自收邮件（高级）”。显式旧模式和 custom 规则保留，旧隐式默认通过版本、来源标记一次性原子迁移，迁移幂等且失败保留旧配置。
+- Gmail API、IMAP、自动收件、立即收取和 MCP 新鲜度同步统一走 `match_receive_rule`，删除旧的发件人私自过滤；`rule_skipped` 只记录本次评估，不成为永久去重事实。
+- 新增可取消的“历史补扫”，支持最近 24 小时、7 天、30 天和自定义日期；按页查询当前后端，显示扫描、匹配、新增、重复、规则跳过和失败，使用 Message-ID/provider id 去重并延续有限重试。
+- 防回流从收件规则中解耦。产品发送增加无秘密 outbound Header，并结合本地 outbound 记录和实际发件身份精确标记；同一 QQ 地址从其他设备人工发送不会被粗暴过滤。
+- GUI 手动发件新增可编辑 To，默认 `OWNER_GMAIL`，发送前展示实际地址并拒绝空值、非法地址、多地址及 CRLF 注入；发送历史保存真实 To。MCP `submit_result` 参数和固定 owner 安全边界不变。
+- From、To、Cc、Bcc、Reply-To 统一解析 RFC 2047 显示名，保留 raw Header 和原始 `raw.eml`，增加结构化、可搜索、可供 GUI/MCP 使用的 decoded 联系人事实。
+- 邮件详情改为正文/资源纵向 QSplitter，正文最小高度 240px、默认约 380px且会话内记忆；图片、附件、链接与下载按非空内容动态分区，长文件名、真实 0 字节和完整 URL 均可理解。
+- 链接继续离线识别 plain HTTP/HTTPS、HTML href 和非 CID img，不依赖正文提示词；显示名综合 anchor、类型、provider、hostname 和路径，不再只显示 view/report。
+- SQLite 新增联系人、outbound origin 和规则评估事实，迁移与索引位于同一可回滚事务，旧库升级前自动备份；Python、GUI、MCP、EXE metadata、Inno Setup、installer 和 portable ZIP 统一升级为 1.3.0。
+
 ## 1.2.1 Gmail OAuth 首次配置可靠性与 GUI 无阻塞 Hotfix - 2026-07-18
 
 - Gmail OAuth 授权改为 QObject + QThread 后台会话；Gmail API、IMAP 和 QQ 连接测试使用后台任务，Qt GUI 主线程不再执行网络等待。

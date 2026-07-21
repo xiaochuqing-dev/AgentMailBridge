@@ -8,7 +8,8 @@ Do not expand the project into SaaS, multi-tenant infrastructure, a general emai
 
 ## Security invariants
 
-- The recipient is fixed by `OWNER_GMAIL`.
+- MCP / Agent result delivery recipient remains fixed and controlled by `OWNER_GMAIL`.
+- GUI manual send may target one explicit user-entered valid recipient; that freedom must never expand MCP send authority.
 - Gmail OAuth scope must remain exactly `gmail.readonly`.
 - OAuth and Gmail API network operations must never run on the Qt GUI thread.
 - OAuth authorization must be cancellable and time-bounded.
@@ -100,7 +101,7 @@ Use `runtime_paths.py`. Frozen program files are read-only under the install dir
 - Normal automatic no-change checks must not create permanent `app_events` noise; scheduler health belongs in `auto_receive_state`.
 - `app_events` retention may delete only technical events. It must never delete business history, outbound records, MCP audit, retry state, mail packages, resources, raw mail or attachments.
 - File-log rotation and SQLite event retention are separate mechanisms and must both remain bounded.
-- AgentMailBridge v1.2.1 is the current product version. Route B multi-mailbox remains future scope.
+- AgentMailBridge v1.3.0 is the current product version. Route B multi-mailbox remains future scope.
 
 ## History and managed-file invariants
 
