@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import QDate, QEvent, QObject, QPoint, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QFont, QIcon, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -19,6 +20,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDateEdit,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -66,6 +68,7 @@ from agent_mail_bridge.mail_summaries import (
     build_mail_list_tooltip,
     build_outbound_list_summary,
 )
+from agent_mail_bridge.mail_send import normalize_manual_recipient
 from agent_mail_bridge.receive_rules import (
     ALL_SCANNED,
     CUSTOM,
@@ -193,6 +196,62 @@ class _TaskRunner(QRunnable):
             result = self.operation()
         except Exception as exc:
             result = ServiceResult(OperationStatus.FAILED, message=str(exc))
+        self.signals.finished.emit(result)
+
+
+class _HistoryRescanSignals(QObject):
+    progress = Signal(object)
+    finished = Signal(object)
+
+
+class _HistoryRescanRunner(QRunnable):
+    """执行可取消的历史补扫，并把紧凑统计安全送回 GUI 线程。"""
+
+    _PROGRESS_KEYS = (
+        "fetched", "matched", "saved", "duplicates", "rule_skipped", "failed",
+    )
+
+    def __init__(
+        self,
+        service: ApplicationService,
+        *,
+        date_from: datetime,
+        date_to: datetime,
+        apply_receive_rule: bool,
+    ):
+        super().__init__()
+        self.service = service
+        self.date_from = date_from
+        self.date_to = date_to
+        self.apply_receive_rule = apply_receive_rule
+        self.cancel_event = threading.Event()
+        self.signals = _HistoryRescanSignals()
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+
+    def run(self) -> None:
+        def publish(payload: dict) -> None:
+            self.signals.progress.emit(
+                {key: int(payload.get(key) or 0) for key in self._PROGRESS_KEYS}
+            )
+
+        try:
+            result = self.service.historical_rescan(
+                date_from=self.date_from,
+                date_to=self.date_to,
+                apply_receive_rule=self.apply_receive_rule,
+                cancel_event=self.cancel_event,
+                progress_callback=publish,
+            )
+        except Exception as exc:  # noqa: BLE001
+            result = ReceiveResult(
+                OperationStatus.FAILED,
+                error_code="history_rescan_failed",
+                message=str(exc),
+                failed=1,
+                errors=[str(exc)],
+            )
         self.signals.finished.emit(result)
 
 
@@ -355,7 +414,7 @@ class BridgeWindow(QMainWindow):
         super().__init__()
         self.service = service
         self.task_active = False
-        self._active_runner: _TaskRunner | None = None
+        self._active_runner: _TaskRunner | _HistoryRescanRunner | None = None
         self._task_callback: Callable[[ServiceResult], None] | None = None
         self.closed = False
         self.thread_pool = QThreadPool(self)
@@ -386,6 +445,9 @@ class BridgeWindow(QMainWindow):
         self.send_links: list[dict[str, str]] = []
         self._detail_return_page = "inbox"
         self._mail_detail_return_widget: QWidget | None = None
+        self._mail_detail_splitter_sizes = [380, 260]
+        self._history_rescan_runner: _HistoryRescanRunner | None = None
+        self._history_rescan_dialog: QDialog | None = None
         self.last_refresh_at: datetime | None = None
         self.last_error_details = ""
         self._config_dirty = False
@@ -873,10 +935,16 @@ class BridgeWindow(QMainWindow):
         tools.addStretch(1)
         self.inbox_test_button = self._button("测试当前连接", self.test_connection)
         receive = self._button("立即收取", self.receive, primary=True, icon_kind="mail")
+        receive.setToolTip("检查当前增量范围；如需找回较早邮件，请使用历史补扫")
+        self.history_rescan_button = self._button(
+            "历史补扫", self.open_history_rescan_dialog, outline=True, icon_kind="clock"
+        )
+        self.history_rescan_button.setToolTip("按 24 小时、7 天、30 天或自定义日期重新扫描")
         self.receive_button = receive
-        self.task_buttons.extend((self.inbox_test_button, receive))
-        self.manual_receive_buttons.append(receive)
+        self.task_buttons.extend((self.inbox_test_button, self.history_rescan_button, receive))
+        self.manual_receive_buttons.extend((self.history_rescan_button, receive))
         tools.addWidget(self.inbox_test_button)
+        tools.addWidget(self.history_rescan_button)
         tools.addWidget(receive)
         layout.addLayout(tools)
 
@@ -994,7 +1062,7 @@ class BridgeWindow(QMainWindow):
     def _build_send_page(self) -> QWidget:
         page, layout = self._standard_page(
             "发邮件",
-            "主题、正文、多个附件和多个链接会组成一封邮件；收件人固定为绑定的 Gmail。",
+            "主题、正文、多个附件和多个链接会组成一封邮件；用户可明确填写一个合法收件人。",
         )
 
         # 旧版单文件控件继续作为程序兼容接口存在，但不再占用正式界面。
@@ -1028,9 +1096,17 @@ class BridgeWindow(QMainWindow):
         form.setSpacing(8)
 
         recipient_row = QHBoxLayout()
-        recipient_row.addWidget(QLabel("固定收件人"))
-        self.recipient_edit = QLineEdit(self.service.cfg.owner_gmail)
-        self.recipient_edit.setReadOnly(True)
+        recipient_row.addWidget(QLabel("收件人 To"))
+        self.recipient_edit = QLineEdit(
+            self.service.cfg.owner_gmail or self.service.cfg.gmail_address
+        )
+        self.recipient_edit.setPlaceholderText("name@example.com")
+        self.recipient_edit.setToolTip(
+            "GUI 手动发件可填写一个合法邮箱；Agent/MCP 仍固定发送到 OWNER_GMAIL"
+        )
+        self._recipient_user_edited = False
+        self.recipient_edit.textEdited.connect(self._mark_recipient_edited)
+        self.recipient_edit.textChanged.connect(self._update_send_action_state)
         recipient_row.addWidget(self.recipient_edit, 1)
         form.addLayout(recipient_row)
 
@@ -1948,29 +2024,53 @@ class BridgeWindow(QMainWindow):
         header_layout.addWidget(self.mail_detail_counts)
         layout.addWidget(header_card)
 
+        self.mail_detail_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.mail_detail_splitter.setObjectName("mailDetailSplitter")
+        self.mail_detail_splitter.setChildrenCollapsible(False)
+
+        body_pane = QFrame()
+        body_pane.setObjectName("card")
+        body_layout = QVBoxLayout(body_pane)
+        body_layout.setContentsMargins(14, 10, 14, 12)
+        body_layout.setSpacing(7)
         body_title = QLabel("邮件正文")
         body_title.setObjectName("sectionTitle")
-        layout.addWidget(body_title)
+        body_layout.addWidget(body_title)
         self.mail_detail_body = QTextEdit()
+        self.mail_detail_body.setObjectName("mailDetailBody")
         self.mail_detail_body.setReadOnly(True)
-        self.mail_detail_body.setMinimumHeight(190)
-        layout.addWidget(self.mail_detail_body)
+        self.mail_detail_body.setMinimumHeight(240)
+        body_layout.addWidget(self.mail_detail_body, 1)
+        body_pane.setMinimumHeight(270)
+        self.mail_detail_splitter.addWidget(body_pane)
 
-        resource_title = QLabel("邮件内容与附件")
-        resource_title.setObjectName("sectionTitle")
-        layout.addWidget(resource_title)
+        resource_pane = QFrame()
+        resource_pane.setObjectName("mailDetailResourcesPane")
+        resource_pane_layout = QVBoxLayout(resource_pane)
+        resource_pane_layout.setContentsMargins(0, 0, 0, 0)
+        resource_pane_layout.setSpacing(0)
+        resource_scroll = QScrollArea()
+        resource_scroll.setObjectName("mailDetailResourcesScroll")
+        resource_scroll.setWidgetResizable(True)
+        resource_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.mail_detail_resource_widget = QWidget()
+        self.mail_detail_resource_widget.setObjectName("mailDetailResourcesContent")
         self.mail_detail_resource_layout = QVBoxLayout(self.mail_detail_resource_widget)
-        self.mail_detail_resource_layout.setContentsMargins(0, 0, 0, 0)
+        self.mail_detail_resource_layout.setContentsMargins(2, 8, 8, 8)
         self.mail_detail_resource_layout.setSpacing(8)
-        layout.addWidget(self.mail_detail_resource_widget)
-        layout.addStretch(1)
-        scroll = QScrollArea()
-        scroll.setObjectName("pageScroll")
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setWidget(page)
-        return scroll
+        resource_scroll.setWidget(self.mail_detail_resource_widget)
+        resource_pane_layout.addWidget(resource_scroll)
+        resource_pane.setMinimumHeight(96)
+        self.mail_detail_resource_scroll = resource_scroll
+        self.mail_detail_splitter.addWidget(resource_pane)
+        self.mail_detail_splitter.setStretchFactor(0, 3)
+        self.mail_detail_splitter.setStretchFactor(1, 2)
+        self.mail_detail_splitter.setSizes(self._mail_detail_splitter_sizes)
+        self.mail_detail_splitter.splitterMoved.connect(
+            lambda _position, _index: self._remember_mail_detail_splitter()
+        )
+        layout.addWidget(self.mail_detail_splitter, 1)
+        return page
 
     def _build_mail_thread_page(self) -> QWidget:
         page, layout = self._standard_page(
@@ -2187,7 +2287,7 @@ class BridgeWindow(QMainWindow):
         tips_title.setObjectName("sectionTitle")
         layout.addWidget(tips_title)
         layout.addWidget(TipRow(provider_icon("gmail"), "收件范围可通过“编辑偏好”调整。", PURPLE))
-        layout.addWidget(TipRow(provider_icon("qq"), "QQ 发件固定发送到绑定的 Gmail。", "#329BC5"))
+        layout.addWidget(TipRow(provider_icon("qq"), "GUI 手动发件可填写一个明确收件人。", "#329BC5"))
         help_button = self._button("查看帮助文档", self._show_help, text_only=True)
         layout.addWidget(help_button, 0, Qt.AlignmentFlag.AlignLeft)
         scroll.setWidget(panel)
@@ -2488,6 +2588,8 @@ class BridgeWindow(QMainWindow):
                     "RECEIVE_RULE_SUBJECT_KEYWORDS": serialize_rule_items(target_keywords),
                     "RECEIVE_RULE_REQUIRE_ATTACHMENT": str(target_attachment).lower(),
                     "AUTO_RECEIVE_ONLY_SELF_MAIL": str(target_mode == SELF_ONLY).lower(),
+                    "RECEIVE_RULE_CONFIG_VERSION": "2",
+                    "RECEIVE_RULE_MODE_SOURCE": "user_explicit",
                     "GUI_AUTO_RECEIVE": str(self.auto_switch.isChecked()).lower(),
                     "GUI_AUTO_RECEIVE_INTERVAL_SECONDS": str(seconds),
                     "GUI_AUTO_RECEIVE_INTERVAL_MINUTES": str(max(1, seconds // 60)),
@@ -2501,6 +2603,9 @@ class BridgeWindow(QMainWindow):
         cfg.receive_rule_subject_keywords = target_keywords
         cfg.receive_rule_require_attachment = target_attachment
         cfg.auto_receive_only_self_mail = target_mode == SELF_ONLY
+        cfg.receive_rule_config_version = 2
+        cfg.receive_rule_mode_source = "user_explicit"
+        cfg.receive_rule_migration_needed = False
         self.self_mail_check.setChecked(cfg.auto_receive_only_self_mail)
         self._update_receive_preference_summary()
         self.show_message("收件规则已保存", "success")
@@ -2511,7 +2616,7 @@ class BridgeWindow(QMainWindow):
             return
         cfg = self.service.cfg
         if cfg.receive_rule_mode == SELF_ONLY:
-            summary = "当前：仅本人邮件"
+            summary = "当前：仅 Gmail 自发自收邮件（高级）"
         elif cfg.receive_rule_mode == ALL_SCANNED:
             summary = "当前：当前扫描范围内全部邮件"
         else:
@@ -2541,9 +2646,9 @@ class BridgeWindow(QMainWindow):
         title = QLabel("收件模式")
         title.setObjectName("sectionTitle")
         layout.addWidget(title)
-        only_self = QRadioButton("仅本人邮件")
-        only_self.setToolTip("只保存当前 Gmail 发给当前 Gmail 的可信邮件")
-        all_scanned = QRadioButton("当前扫描范围内全部邮件")
+        only_self = QRadioButton("仅 Gmail 自发自收邮件（高级）")
+        only_self.setToolTip("仅接收由当前 Gmail 自己发送并投递回同一 Gmail 的邮件")
+        all_scanned = QRadioButton("当前扫描范围内全部邮件（默认）")
         all_scanned.setToolTip("仍受查询范围、单次限制和去重规则约束")
         custom = QRadioButton("自定义规则")
         group = QButtonGroup(dialog)
@@ -2586,7 +2691,8 @@ class BridgeWindow(QMainWindow):
         layout.addWidget(custom_panel)
 
         note = QLabel(
-            "不同分类之间同时满足，同一分类内任一命中即可。手动、自动、Gmail API 与 Gmail IMAP 共用此规则。"
+            "仅 Gmail 自发自收是高级显式规则，不用于防止发件回流。不同分类之间同时满足，"
+            "同一分类内任一命中即可；手动、自动、Gmail API 与 Gmail IMAP 共用此规则。"
         )
         note.setObjectName("hint")
         note.setWordWrap(True)
@@ -2625,12 +2731,233 @@ class BridgeWindow(QMainWindow):
         sender = self.sender()
         button = sender if isinstance(sender, QPushButton) else None
         self._run_task(
-            "正在连接 Gmail 并检查新邮件",
+            "正在连接 Gmail 并检查当前增量范围",
             self.service.receive,
             self._show_receive_result,
             button=button,
             working_text="收取中…",
         )
+
+    def open_history_rescan_dialog(self) -> None:
+        """选择明确历史范围并启动可取消的后台补扫。"""
+        dialog = QDialog(self)
+        dialog.setObjectName("historyRescanDialog")
+        dialog.setWindowTitle("历史补扫")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(620)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
+
+        title = QLabel("重新扫描历史邮件")
+        title.setObjectName("sectionTitle")
+        description = QLabel(
+            "历史补扫会直接查询指定范围，不受日常增量回看窗口限制；已归档邮件只计为重复，不会再次保存。"
+        )
+        description.setObjectName("hint")
+        description.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(description)
+
+        form = QFormLayout()
+        range_combo = QComboBox()
+        range_combo.setObjectName("historyRescanRange")
+        range_combo.addItem("最近 24 小时", "24h")
+        range_combo.addItem("最近 7 天", "7d")
+        range_combo.addItem("最近 30 天", "30d")
+        range_combo.addItem("自定义日期范围", "custom")
+        form.addRow("扫描范围", range_combo)
+        layout.addLayout(form)
+
+        custom_panel = QFrame()
+        custom_panel.setObjectName("accountPanel")
+        custom_layout = QFormLayout(custom_panel)
+        custom_layout.setContentsMargins(14, 10, 14, 10)
+        start_date = QDateEdit(QDate.currentDate().addDays(-7))
+        start_date.setObjectName("historyRescanStartDate")
+        start_date.setCalendarPopup(True)
+        start_date.setDisplayFormat("yyyy-MM-dd")
+        end_date = QDateEdit(QDate.currentDate())
+        end_date.setObjectName("historyRescanEndDate")
+        end_date.setCalendarPopup(True)
+        end_date.setDisplayFormat("yyyy-MM-dd")
+        custom_layout.addRow("开始日期", start_date)
+        custom_layout.addRow("结束日期", end_date)
+        custom_panel.hide()
+        range_combo.currentIndexChanged.connect(
+            lambda _index: custom_panel.setVisible(range_combo.currentData() == "custom")
+        )
+        layout.addWidget(custom_panel)
+
+        apply_rule = QCheckBox("使用当前收件规则重新判断")
+        apply_rule.setObjectName("historyRescanApplyRule")
+        apply_rule.setChecked(True)
+        apply_rule.setToolTip("关闭后会接收指定扫描范围内全部候选邮件；本地去重仍然生效")
+        layout.addWidget(apply_rule)
+
+        progress = QProgressBar()
+        progress.setObjectName("historyRescanProgress")
+        progress.setRange(0, 1)
+        progress.setValue(0)
+        progress.hide()
+        stats = QLabel("尚未开始")
+        stats.setObjectName("historyRescanStats")
+        stats.setWordWrap(True)
+        layout.addWidget(progress)
+        layout.addWidget(stats)
+
+        safety = QLabel(
+            "补扫按页处理并可取消，不删除 Gmail 邮件；Gmail API 保持只读，IMAP 使用 BODY.PEEK 不标记已读。"
+        )
+        safety.setObjectName("hint")
+        safety.setWordWrap(True)
+        layout.addWidget(safety)
+
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        cancel_button = self._button("关闭", dialog.reject, outline=True)
+        cancel_button.setObjectName("historyRescanCancel")
+        start_button = self._button("开始补扫", primary=True)
+        start_button.setObjectName("historyRescanStart")
+        actions.addWidget(cancel_button)
+        actions.addWidget(start_button)
+        layout.addLayout(actions)
+
+        self._history_rescan_dialog = dialog
+        self._history_rescan_progress = progress
+        self._history_rescan_stats = stats
+        self._history_rescan_cancel_button = cancel_button
+        self._history_rescan_start_button = start_button
+
+        def selected_range() -> tuple[datetime, datetime]:
+            now = datetime.now()
+            preset = str(range_combo.currentData() or "24h")
+            if preset == "24h":
+                return now - timedelta(hours=24), now
+            if preset == "7d":
+                return now - timedelta(days=7), now
+            if preset == "30d":
+                return now - timedelta(days=30), now
+            start = datetime.strptime(start_date.date().toString("yyyy-MM-dd"), "%Y-%m-%d")
+            end = datetime.strptime(end_date.date().toString("yyyy-MM-dd"), "%Y-%m-%d")
+            return start, end.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+        def start_scan() -> None:
+            try:
+                range_start, range_end = selected_range()
+            except ValueError as exc:
+                QMessageBox.warning(dialog, "日期范围无效", str(exc))
+                return
+            if range_start > range_end:
+                QMessageBox.warning(dialog, "日期范围无效", "开始日期不能晚于结束日期")
+                return
+            self._start_history_rescan(
+                range_start,
+                range_end,
+                apply_receive_rule=apply_rule.isChecked(),
+            )
+
+        start_button.clicked.connect(start_scan)
+        cancel_button.clicked.disconnect()
+        cancel_button.clicked.connect(
+            lambda _checked=False: self._cancel_history_rescan()
+        )
+        dialog.finished.connect(lambda _code: self._cancel_history_rescan(close_dialog=False))
+        dialog.exec()
+
+    def _start_history_rescan(
+        self,
+        date_from: datetime,
+        date_to: datetime,
+        *,
+        apply_receive_rule: bool,
+    ) -> None:
+        if not self.accepting_tasks:
+            self.show_message("程序正在退出，不再启动新任务", "error")
+            return
+        if self.task_active:
+            self.show_message("已有任务正在运行，请等待完成后再补扫", "working")
+            return
+        self.task_active = True
+        self._sync_manual_receive_actions()
+        self._task_refresh_on_finish = True
+        self.status_var.set("正在分页重新扫描历史邮件")
+        self._active_task_button = self._history_rescan_start_button
+        self._active_task_button_text = self._history_rescan_start_button.text()
+        self._history_rescan_start_button.setEnabled(False)
+        self._history_rescan_start_button.setText("补扫中…")
+        self._history_rescan_cancel_button.setText("取消补扫")
+        self._history_rescan_cancel_button.setEnabled(True)
+        self._history_rescan_progress.setRange(0, 0)
+        self._history_rescan_progress.show()
+        self._history_rescan_stats.setText("正在查询指定历史范围…")
+        runner = _HistoryRescanRunner(
+            self.service,
+            date_from=date_from,
+            date_to=date_to,
+            apply_receive_rule=apply_receive_rule,
+        )
+        runner.signals.progress.connect(self._update_history_rescan_progress)
+        runner.signals.finished.connect(self._finish_task)
+        self._task_callback = self._show_history_rescan_result
+        self._history_rescan_runner = runner
+        self._active_runner = runner
+        self.thread_pool.start(runner)
+
+    @Slot(object)
+    def _update_history_rescan_progress(self, progress: dict) -> None:
+        if self.closed or not hasattr(self, "_history_rescan_stats"):
+            return
+        self._history_rescan_stats.setText(
+            "扫描 {fetched} 封，匹配 {matched} 封，新增 {saved} 封，"
+            "已归档 {duplicates} 封，规则不匹配 {rule_skipped} 封，失败 {failed} 封".format(
+                **{key: int(progress.get(key) or 0) for key in _HistoryRescanRunner._PROGRESS_KEYS}
+            )
+        )
+
+    def _cancel_history_rescan(self, *, close_dialog: bool = True) -> None:
+        runner = self._history_rescan_runner
+        if runner is not None and self.task_active:
+            runner.cancel()
+            if hasattr(self, "_history_rescan_cancel_button"):
+                self._history_rescan_cancel_button.setText("正在取消…")
+                self._history_rescan_cancel_button.setEnabled(False)
+            if hasattr(self, "_history_rescan_stats"):
+                self._history_rescan_stats.setText("已请求取消，正在安全结束当前邮件…")
+            return
+        if close_dialog and self._history_rescan_dialog is not None:
+            self._history_rescan_dialog.reject()
+
+    def _show_history_rescan_result(self, result: ServiceResult) -> None:
+        self._history_rescan_runner = None
+        if isinstance(result, ReceiveResult):
+            self._update_history_rescan_progress(
+                {
+                    "fetched": result.scanned,
+                    "matched": result.matched,
+                    "saved": result.saved,
+                    "duplicates": result.duplicates,
+                    "rule_skipped": result.rule_skipped,
+                    "failed": result.failed,
+                }
+            )
+        if hasattr(self, "_history_rescan_progress"):
+            self._history_rescan_progress.setRange(0, 1)
+            self._history_rescan_progress.setValue(1)
+        if hasattr(self, "_history_rescan_cancel_button"):
+            self._history_rescan_cancel_button.setText("关闭")
+            self._history_rescan_cancel_button.setEnabled(True)
+        if hasattr(self, "_history_rescan_start_button"):
+            self._history_rescan_start_button.setText("再次补扫")
+        if result.status == OperationStatus.CANCELLED:
+            kind = "warning"
+        elif result.status == OperationStatus.NO_CHANGES:
+            kind = "normal"
+        elif result.status == OperationStatus.PARTIAL:
+            kind = "warning"
+        else:
+            kind = "success" if result.ok else "error"
+        self.show_message(result.message or "历史补扫已结束", kind)
 
     def choose_and_send(self) -> None:
         if not self.choose_send_file():
@@ -2787,6 +3114,9 @@ class BridgeWindow(QMainWindow):
         )
         self.send_action_button.setEnabled(has_content and not self.task_active)
 
+    def _mark_recipient_edited(self, _value: str) -> None:
+        self._recipient_user_edited = True
+
     def send_composed_mail(self) -> None:
         if self.task_active:
             self.show_message("已有后台任务正在运行，请等待完成后再发送", "working")
@@ -2795,6 +3125,12 @@ class BridgeWindow(QMainWindow):
         body = self.send_body_edit.toPlainText()
         if not (subject or body.strip() or self.send_selections or self.send_links):
             self.show_message("邮件主题、正文、附件和链接不能同时为空", "error")
+            return
+        try:
+            recipient = normalize_manual_recipient(self.recipient_edit.text())
+        except ValueError as exc:
+            self.show_message(str(exc), "error")
+            self.recipient_edit.setFocus()
             return
         changed = [item.path.name for item in self.send_selections if not item.is_unchanged()]
         if changed:
@@ -2811,7 +3147,7 @@ class BridgeWindow(QMainWindow):
             f"正文：{'有' if body.strip() else '无'}\n"
             f"附件：{len(self.send_selections)} 个，共 {format_size(total_size)}\n"
             f"链接：{len(self.send_links)} 个\n"
-            f"固定收件人：{self.recipient_edit.text().strip() or '未配置'}\n\n"
+            f"实际收件人：{recipient}\n\n"
             "确认后才会连接 QQ SMTP。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
@@ -2826,7 +3162,9 @@ class BridgeWindow(QMainWindow):
         self.send_progress.show()
         self._run_task(
             "正在校验并发送这一封邮件，请勿重复点击",
-            lambda: self._send_composition_if_unchanged(subject, body, snapshots, links),
+            lambda: self._send_composition_if_unchanged(
+                recipient, subject, body, snapshots, links
+            ),
             self._show_send_result,
             button=self.send_action_button,
             working_text="正在发送…",
@@ -2834,6 +3172,7 @@ class BridgeWindow(QMainWindow):
 
     def _send_composition_if_unchanged(
         self,
+        recipient: str,
         subject: str,
         body: str,
         snapshots: list[SendFileSelection],
@@ -2846,6 +3185,7 @@ class BridgeWindow(QMainWindow):
                 message="确认后附件发生变化，已阻止发送",
             )
         return self.service.send_user_selected_mail(
+            recipient=recipient,
             subject=subject or None,
             body_text=body,
             attachment_paths=[item.path for item in snapshots],
@@ -2970,6 +3310,10 @@ class BridgeWindow(QMainWindow):
         if hasattr(self, "send_body_edit"):
             self.send_body_edit.clear()
         self.subject_edit.clear()
+        self._recipient_user_edited = False
+        self.recipient_edit.setText(
+            self.service.cfg.owner_gmail or self.service.cfg.gmail_address
+        )
         self._populate_send_links()
         self._clear_send_selection()
 
@@ -3449,7 +3793,8 @@ class BridgeWindow(QMainWindow):
                 self.receive_account_label.setText(cfg.gmail_address or "尚未配置 Gmail 收件账号")
             self.self_mail_check.setChecked(cfg.auto_receive_only_self_mail)
             self._update_receive_preference_summary()
-            self.recipient_edit.setText(cfg.owner_gmail or cfg.gmail_address)
+            if not getattr(self, "_recipient_user_edited", False):
+                self.recipient_edit.setText(cfg.owner_gmail or cfg.gmail_address)
             self._set_combo_data(self.network_combo, cfg.gmail_network_mode)
         finally:
             self._loading_controls = False
@@ -4428,6 +4773,11 @@ class BridgeWindow(QMainWindow):
         if package_id:
             self.show_mail_detail(package_id, "inbox")
 
+    def _remember_mail_detail_splitter(self) -> None:
+        sizes = self.mail_detail_splitter.sizes()
+        if len(sizes) == 2 and all(size > 0 for size in sizes):
+            self._mail_detail_splitter_sizes = [int(sizes[0]), int(sizes[1])]
+
     def show_mail_detail(self, package_id: str, return_page: str = "inbox") -> None:
         result = self.service.get_mail_message(package_id)
         if not result.ok:
@@ -4440,7 +4790,11 @@ class BridgeWindow(QMainWindow):
         )
         subject = str(details.get("subject") or "无主题邮件")
         sender = str(details.get("from") or "发件人未知")
-        recipients = "；".join(details.get("to") or []) or "未记录"
+        recipients = self._format_contact_items(
+            details.get("to_addresses"), details.get("to")
+        ) or "未记录"
+        cc = self._format_contact_items(details.get("cc_addresses"), details.get("cc"))
+        reply_to = self._format_contact_items(details.get("reply_to"), None)
         received_at = self._short_time(
             details.get("received_at") or details.get("saved_at"), include_date=True
         )
@@ -4449,9 +4803,16 @@ class BridgeWindow(QMainWindow):
             "imap": "Gmail IMAP",
         }.get(str(details.get("backend") or ""), "Gmail")
         self.mail_detail_subject.setText(subject)
-        self.mail_detail_meta.setText(
-            f"发件人：{sender}\n收件人：{recipients}\n收取时间：{received_at} · {backend}"
-        )
+        meta_lines = [f"发件人：{sender}", f"收件人：{recipients}"]
+        if cc:
+            meta_lines.append(f"抄送：{cc}")
+        if reply_to:
+            meta_lines.append(f"回复至：{reply_to}")
+        outbound = details.get("outbound_origin") or {}
+        if isinstance(outbound, dict) and outbound.get("is_local"):
+            meta_lines.append("来源：本机 AgentMailBridge 发件回流（已精确标记）")
+        meta_lines.append(f"收取时间：{received_at} · {backend}")
+        self.mail_detail_meta.setText("\n".join(meta_lines))
         counts = details.get("counts") or {}
         self.mail_detail_counts.setText(
             f"附件 {int(counts.get('attachments') or 0)} 个 · "
@@ -4463,9 +4824,29 @@ class BridgeWindow(QMainWindow):
         self.mail_detail_thread_button.setEnabled(bool(details.get("thread_ref")))
         self.mail_detail_archive_button.setEnabled(bool(details.get("package_root")))
         self._populate_mail_detail_resources(details.get("resources") or [])
+        self.mail_detail_splitter.setSizes(self._mail_detail_splitter_sizes)
+        self.mail_detail_resource_scroll.verticalScrollBar().setValue(0)
         self._show_secondary_page(
             self.mail_detail_page,
             return_page=(self._detail_return_page if return_page == "thread" else return_page),
+        )
+
+    @staticmethod
+    def _format_contact_items(items, fallback) -> str:
+        readable: list[str] = []
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            display = str(item.get("display_name") or "").strip()
+            address = str(item.get("address") or "").strip()
+            text = f"{display} <{address}>" if display and address else address or display
+            if text:
+                readable.append(text)
+        if readable:
+            return "；".join(readable)
+        fallback_values = [fallback] if isinstance(fallback, str) else (fallback or [])
+        return "；".join(
+            str(value) for value in fallback_values if str(value).strip()
         )
 
     def _mail_body_text(self, details: dict) -> str:
@@ -4498,12 +4879,31 @@ class BridgeWindow(QMainWindow):
         if not visible:
             empty = QLabel("此邮件没有图片、附件或链接。")
             empty.setObjectName("hint")
+            empty.setWordWrap(True)
             self.mail_detail_resource_layout.addWidget(empty)
             return
-        for resource in visible:
-            self.mail_detail_resource_layout.addWidget(
-                self._mail_resource_card(resource)
-            )
+        groups = (
+            ("邮件中的图片", [item for item in visible if item.get("internal_type") == "inline_image"]),
+            ("附件", [item for item in visible if item.get("internal_type") == "attachment"]),
+            (
+                "链接与下载",
+                [
+                    item for item in visible
+                    if item.get("internal_type") not in {"inline_image", "attachment"}
+                ],
+            ),
+        )
+        for section_name, section_resources in groups:
+            if not section_resources:
+                continue
+            title = QLabel(section_name)
+            title.setObjectName("sectionTitle")
+            title.setProperty("resourceSection", section_name)
+            self.mail_detail_resource_layout.addWidget(title)
+            for resource in section_resources:
+                self.mail_detail_resource_layout.addWidget(
+                    self._mail_resource_card(resource)
+                )
 
     def _mail_resource_card(self, resource: dict) -> QWidget:
         card = QFrame()
@@ -4534,10 +4934,18 @@ class BridgeWindow(QMainWindow):
         )
         title.setObjectName("minorTitle")
         title.setWordWrap(True)
-        detail = QLabel(
-            f"{resource.get('kind_display') or '邮件内容'} · "
-            f"{resource.get('status_display') or '已识别'}"
-        )
+        title.setToolTip(url or str(resource.get("display_name") or resource.get("original_name") or ""))
+        detail_parts = [str(resource.get("kind_display") or "邮件内容")]
+        mime_type = str(resource.get("mime_type") or "").strip()
+        if mime_type:
+            detail_parts.append(mime_type)
+        if resource.get("size_bytes") is not None:
+            detail_parts.append(format_size(int(resource.get("size_bytes") or 0)))
+        hostname = str(resource.get("hostname") or "").strip()
+        if hostname:
+            detail_parts.append(hostname)
+        detail_parts.append(str(resource.get("status_display") or "已识别"))
+        detail = QLabel(" · ".join(detail_parts))
         detail.setObjectName("hint")
         detail.setWordWrap(True)
         text.addWidget(title)
@@ -4562,7 +4970,14 @@ class BridgeWindow(QMainWindow):
                     lambda checked=False, value=path: self._open_received_file(value),
                 )
             )
-        elif url:
+        if url:
+            copy_button = self._button(
+                "复制 URL",
+                lambda checked=False, value=url: self._copy_mail_url(value),
+                text_only=True,
+            )
+            copy_button.setToolTip(url)
+            layout.addWidget(copy_button)
             layout.addWidget(
                 self._button(
                     "打开链接",
@@ -4571,6 +4986,10 @@ class BridgeWindow(QMainWindow):
                 )
             )
         return card
+
+    def _copy_mail_url(self, url: str) -> None:
+        QApplication.clipboard().setText(url)
+        self.show_message("完整 URL 已复制", "success")
 
     def _open_external_link(self, url: str) -> None:
         parsed = QUrl(url)
@@ -5765,6 +6184,8 @@ class BridgeWindow(QMainWindow):
         self.auto_timer.stop()
         self.auto_watchdog.stop()
         if self.task_active:
+            if self._history_rescan_runner is not None:
+                self._history_rescan_runner.cancel()
             self.pending_quit = True
             self.show_message("正在等待当前任务安全结束", "working")
             return

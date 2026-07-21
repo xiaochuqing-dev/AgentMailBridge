@@ -1240,7 +1240,7 @@ class QQAccountDialog(_AccountDialog):
 
 
 class AccountTypeDialog(QDialog):
-    """v1.2.1 的邮箱扩展说明，不复用已有账号编辑路由。"""
+    """v1.3.0 的邮箱扩展说明，不复用已有账号编辑路由。"""
 
     GMAIL = "gmail"
     QQ = "qq"
@@ -1280,7 +1280,7 @@ class AccountTypeDialog(QDialog):
         future_title.setObjectName("sectionTitle")
         future_layout.addWidget(future_title)
         future_layout.addWidget(QLabel("Outlook · 163 邮箱 · 企业邮箱 · 更多邮箱服务"))
-        future_note = QLabel("当前 v1.2.1 暂不支持新增第二个同类型账号或其他邮箱服务。")
+        future_note = QLabel("当前 v1.3.0 暂不支持新增第二个同类型账号或其他邮箱服务。")
         future_note.setObjectName("hint")
         future_note.setWordWrap(True)
         future_layout.addWidget(future_note)

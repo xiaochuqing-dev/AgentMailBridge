@@ -409,6 +409,7 @@ def build_stylesheet(theme: str = "light") -> str:
         selection-background-color: {PURPLE};
     }}
     QTextEdit {{ padding: 8px; }}
+    QTextEdit#mailDetailBody {{ min-height: 240px; }}
     QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{
         border: 1px solid #8E7AF4;
     }}
@@ -502,6 +503,10 @@ def build_stylesheet(theme: str = "light") -> str:
     QWidget#verticalResizeHandle {{ background: transparent; }}
     QWidget#verticalResizeHandle:hover {{ background: {PURPLE}; }}
     QScrollArea {{ border: none; background: #FFFFFF; }}
+    QFrame#mailDetailResourcesPane, QWidget#mailDetailResourcesContent {{
+        background: #FFFFFF;
+        border: none;
+    }}
     QProgressBar {{
         border: none;
         background: #EEEAFD;
@@ -527,6 +532,10 @@ def build_stylesheet(theme: str = "light") -> str:
     QMainWindow, QDialog, QWidget#windowRoot, QWidget#titleBar, QWidget#sidebar,
     QWidget#centralPanel, QWidget#rightPanelContent, QWidget#pageSurface,
     QWidget#bodySurface, QWidget#tabBar, QScrollArea {{ background: #171923; }}
+    QFrame#mailDetailResourcesPane, QWidget#mailDetailResourcesContent {{
+        background: #171923;
+        border: none;
+    }}
     QScrollArea#rightPanel, QWidget#rightPanelContent {{ background: #1C1E2A; border: none; }}
     QWidget#sidebar, QWidget#titleBar, QWidget#tabBar {{ border-color: #343746; }}
     QLabel#fieldLabel, QLabel#muted, QLabel#hint {{ color: #AEB4C5; }}
