@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## 1.4.0 Multi-Account Core 多邮箱架构地基 - 2026-07-22
+
+- 新增无秘密 `MailAccount` 一等实体、稳定 `account_id/data_namespace`、`Mailbox` 与 Provider Adapter 能力注册表；Gmail 继续复用现有 API/IMAP 收件归档，QQ 继续复用现有 SMTP 发件归档，Generic IMAP/SMTP 与 Microsoft 仅作未接通扩展边界。
+- SQLite 新增 `mail_accounts`、`mailboxes`、`account_sync_states`，并为收件、邮件 package、重试、规则评估、outbound 和 sent 事实补充账号归属；同一 Message-ID 可在不同账号独立存在，同类型账号的同步状态和发件事实互不串联。
+- v1.3.0 Gmail/QQ 配置与历史数据首次启动前自动备份，并在同一可回滚事务中幂等映射到正式账号；迁移不移动文件、不改写 `raw.eml` 或历史 Hash，失败保留旧库。
+- Mail Facts、邮件会话与 MCP `search_mails` 支持可选 `account_id`；省略时保持统一跨账号查询。统一 MCP 仍为七工具，`submit_result` 固定 `OWNER_GMAIL`、只读 Gmail scope、路径白名单和审计边界不变。
+- 左侧收敛为统一“邮箱账号”可滚动列表，账号卡显示当前真实能力；添加入口说明未来 Provider，尚不开放第二个同类型账号或 Gmail 发件、QQ 收件、163、Outlook。
+- manifest 升级为 v2 并写入稳定账号/邮箱目录身份；Python、GUI、MCP、EXE metadata 与 Inno Setup 版本统一升级为 1.4.0。
+
 ## 1.3.0 收发语义、历史补扫、联系人解码与邮件详情统一整改 - 2026-07-21
 
 - 新配置默认使用 `all_scanned`，正常归档当前 Inbox 查询范围内的候选邮件；`self_only` 更名为“仅 Gmail 自发自收邮件（高级）”。显式旧模式和 custom 规则保留，旧隐式默认通过版本、来源标记一次性原子迁移，迁移幂等且失败保留旧配置。

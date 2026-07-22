@@ -1,6 +1,10 @@
 # Windows 安装、升级与卸载
 
-运行 `AgentMailBridge-1.3.0-Setup.exe`。默认安装到 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需管理员权限。开始菜单和可选桌面快捷方式只指向 `AgentMailBridge.exe`；内部 `AgentMailBridgeMCP.exe` 不创建快捷方式或开机启动项。
+运行 `AgentMailBridge-1.4.0-Setup.exe`。默认安装到 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需管理员权限。开始菜单和可选桌面快捷方式只指向 `AgentMailBridge.exe`；内部 `AgentMailBridgeMCP.exe` 不创建快捷方式或开机启动项。
+
+从 v1.3.0 升级到 v1.4.0 前，正常退出主窗口和托盘，再运行新版安装器覆盖安装。首次启动会在需要迁移时创建并校验 `before_v1_4_multi_account` SQLite 在线备份，然后在同一可回滚事务中创建账号、邮箱目录和账号同步状态表，为 package、兼容收件行、重试、规则评估、outbound 与 sent 事实补充账号归属。旧 Gmail/QQ 配置映射成稳定账号；迁移不移动邮件目录、不改写 `raw.eml` 或历史 Hash，重复启动不会重复生成账号或邮箱目录。
+
+升级后应核对“邮箱账号”列表、Gmail/QQ 原配置、收件与发件历史、Agent/MCP 七工具，并运行数据库 quick_check。v1.4.0 只完成多账号核心地基，暂不开放新增第二个同类型账号，Generic IMAP/SMTP、163 和 Outlook/Microsoft 也未正式接通。
 
 从 v1.2.1 升级到 v1.3.0 前，正常退出主窗口和托盘，再运行新版安装器覆盖安装。程序文件会替换，`%LOCALAPPDATA%\AgentMailBridge` 下的 `.env`、OAuth credentials/token、SQLite、邮件 package、raw.eml、附件、工作区和日志不会删除，Windows Credential Manager 中的 Gmail IMAP/QQ SMTP secret 也不由安装器清理。
 
@@ -18,7 +22,7 @@
 
 从 Windows“已安装的应用”卸载时，程序、Qt、快捷方式、安装记录和失效开机启动值会删除；配置、OAuth、凭据和用户数据默认保留。重新安装后可继续识别。
 
-v1.3.0 发布验收覆盖完整 pytest、clean build、主 EXE packaged self-test、七工具 MCP packaged smoke、复杂邮件读取与资源 Hash、历史补扫、联系人解码、秘密扫描、v1.2.1 覆盖安装和数据保留。覆盖安装后还要验证 GUI/MCP 版本、复杂邮件仍可读、数据库 quick_check、桌面/开始菜单快捷方式只指向 GUI，以及 portable ZIP 可独立启动。
+v1.4.0 发布前验收覆盖完整 pytest、clean build、主 EXE packaged self-test、七工具 MCP packaged smoke、多账号模拟迁移与隔离、复杂邮件读取与资源 Hash、历史补扫、联系人解码、秘密扫描、覆盖安装和数据保留。覆盖安装后还要验证 GUI/MCP 版本、复杂邮件仍可读、数据库 quick_check、桌面/开始菜单快捷方式只指向 GUI，以及 portable ZIP 可独立启动。
 
 MCP packaged smoke 还必须以 UTF-8 向 `AgentMailBridgeMCP.exe` 写入 initialize、tools/list、每个 tools/call、malformed JSON、未知 method 和 EOF；验证读取开关关闭/开启、中文正文、附件、prepare Hash 和兼容 submit_result。不得通过修改控制台 code page 或手工 Copy-Item 规避问题。安装后桌面快捷方式仍只能指向 `AgentMailBridge.exe`，MCP EXE 不创建快捷方式。
 

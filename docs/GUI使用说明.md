@@ -1,8 +1,8 @@
 # AgentMailBridge GUI 使用说明
 
-AgentMailBridge 1.3.0 的用户入口只有 `AgentMailBridge.exe`。
+AgentMailBridge 1.4.0 的用户入口只有 `AgentMailBridge.exe`。
 
-顶部主工作区只有“收件”和“发件”。左侧已有 Gmail、QQ 账号卡片用于管理当前账号；“添加邮箱账号”只展示未来扩展和当前限制，不会修改已有账号。左侧下方的“Agent / MCP”“历史记录”“文件与数据”“设置”“关于”使用同一贴合导航卡，不留脱离其他页面的空隙。
+顶部主工作区只有“收件”和“发件”。左侧收敛为统一“邮箱账号”可滚动列表：Gmail 卡显示“收件、归档”，QQ 邮箱卡显示“发件”，并在 Tooltip 中提供稳定账号 ID 与数据命名空间。“添加邮箱账号”只展示未来 Provider 和当前限制，不会修改已有账号，也暂不开放第二个同类型账号。左侧下方的“Agent / MCP”“历史记录”“文件与数据”“设置”“关于”使用同一贴合导航卡，不留脱离其他页面的空隙。
 
 收件页以一封邮件一条紧凑记录展示主题、发件人、内容摘要、时间、状态和操作；资源数量优先显示在摘要首行，正文预览按实际列宽限制为约 36 个可读字符，行高稳定为约 74px。完整主题、较长正文预览和资源数量可通过 Tooltip 查看，完整正文仍在邮件详情中。双击整行任意非按钮区域或点击“查看邮件”均可进入详情。
 
@@ -15,7 +15,7 @@ AgentMailBridge 1.3.0 的用户入口只有 `AgentMailBridge.exe`。
 - 设置 > 高级设置：网络模式、Runtime Paths、配置迁移和脱敏高级诊断。
 - 关于：版本、产品定位、仓库、LICENSE、第三方说明和本地优先说明。
 
-Gmail API、Gmail IMAP 和 QQ SMTP 分别使用专属账号页。Gmail IMAP 密码和 QQ 授权码保存在 Windows Credential Manager，界面只显示固定掩码。替换 OAuth 客户端配置需确认，不会静默删除 token。
+Gmail API、Gmail IMAP 和 QQ SMTP 分别使用专属账号页，保存后同步到统一账号模型。Gmail IMAP 密码和 QQ 授权码保存在 Windows Credential Manager，界面只显示固定掩码；账号表不保存密码、Token 或 Client Secret。替换 OAuth 客户端配置需确认，不会静默删除 token。
 
 Gmail API 页只接受 Google Cloud 的 Desktop app `credentials.json`。导入成功后会显示 Desktop app 类型、可用的项目 ID 和 Client ID 脱敏尾号；Web application JSON、非 Google 官方端点或非法回环地址会被明确拒绝。新文件验证或写入失败时，旧凭据和旧 Token 保持不变。
 

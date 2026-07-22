@@ -2,11 +2,11 @@
 
 ## 产品边界
 
-AgentMailBridge v1.3.0 保留 v1.2.0 引入的通用 Agent 邮件读取能力，让本机兼容 stdio MCP 的 Agent 直接读取已由后台收件形成的规范归档。联系人字段增加 decoded 结构，`ensure_fresh` 仍只触发当前增量同步，不替代 GUI 历史补扫。GUI 用于一次性授权、工作区配置和审计观察，不参与每次读件。功能仍是本地单用户邮箱桥接，不扩展为通用邮件客户端、SaaS、Agent 编排或知识管理系统。
+AgentMailBridge v1.4.0 保留 v1.2.0 引入的通用 Agent 邮件读取能力，并在同一个 MCP 中加入稳定账号归属与可选账号过滤。`search_mails` 省略 `account_id` 时读取统一本地视图，指定时只读取该账号；`ensure_fresh` 仍只触发当前已接通 Gmail 账号的增量同步，不替代 GUI 历史补扫。GUI 用于一次性授权、工作区配置和审计观察，不参与每次读件。功能仍是本地单用户邮箱桥接，不扩展为通用邮件客户端、SaaS、Agent 编排或知识管理系统。
 
 ## 数据流
 
-后台 Gmail API 或 IMAP 收件先完成 raw、正文、资源和 manifest 的原子 package。Agent 调用 `search_mails` 获取稳定 mail_id，再用 `get_mail` 读取有界正文和资源清单。文本与 CSV 可用 `read_mail_resource` 分页读取；图片和文档先获得安全描述，需要 Agent 自身能力处理时由 `prepare_mail_resources` 复制到授权项目工作区。任务结果仍通过兼容的 `submit_result` 回邮。
+Provider Adapter 复用现有 Gmail API/IMAP 收件实现，先完成带 `account_id/mailbox_id` 的 raw、正文、资源和 manifest 原子 package。Agent 调用 `search_mails` 获取稳定 mail_id，再用 `get_mail` 读取有界正文和资源清单。文本与 CSV 可用 `read_mail_resource` 分页读取；图片和文档先获得安全描述，需要 Agent 自身能力处理时由 `prepare_mail_resources` 复制到授权项目工作区。任务结果仍通过兼容的 `submit_result` 回邮。
 
 ## 授权模型
 

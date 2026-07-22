@@ -1,6 +1,6 @@
 # Gmail OAuth 配置与故障排查说明
 
-AgentMailBridge 1.3.0 继续只接受 Google Cloud 创建的 Desktop app OAuth Client。Web application JSON 不能用于本地回环授权；本次收件语义和历史补扫不改变 `gmail.readonly` scope 或 OAuth 交互安全边界。
+AgentMailBridge 1.4.0 继续只接受 Google Cloud 创建的 Desktop app OAuth Client。Web application JSON 不能用于本地回环授权；Multi-Account Core 只登记认证类型与账号归属，不把 Token 或 Client Secret 写入账号表，也不改变 `gmail.readonly` scope 或 OAuth 交互安全边界。
 
 ## 正确配置
 
