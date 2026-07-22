@@ -18,6 +18,7 @@ from agent_mail_bridge.mail_resource_access import resource_capabilities
 def list_mail_messages(
     db_path,
     *,
+    account_id: str | None = None,
     account_ref: str | None = None,
     mailbox_ref: str | None = None,
     date_from: str | None = None,
@@ -35,6 +36,7 @@ def list_mail_messages(
     safe_offset = max(0, int(offset))
     where: list[str] = []
     params: list[Any] = []
+    _equal_filter(where, params, "account_id", account_id)
     _equal_filter(where, params, "account_ref", account_ref)
     _equal_filter(where, params, "mailbox_ref", mailbox_ref)
     _equal_filter(where, params, "archive_status", status)
@@ -94,6 +96,7 @@ def list_mail_resources(db_path, package_id: str) -> list[dict[str, Any]]:
 def list_mail_threads(
     db_path,
     *,
+    account_id: str | None = None,
     account_ref: str | None = None,
     mailbox_ref: str | None = None,
     limit: int = 100,
@@ -101,15 +104,17 @@ def list_mail_threads(
 ) -> list[dict[str, Any]]:
     where = ["thread_ref IS NOT NULL", "thread_ref != ''"]
     params: list[Any] = []
+    _equal_filter(where, params, "account_id", account_id)
     _equal_filter(where, params, "account_ref", account_ref)
     _equal_filter(where, params, "mailbox_ref", mailbox_ref)
     connection = get_connection(db_path)
     rows = connection.execute(
-        "SELECT account_ref, mailbox_ref, thread_ref, COUNT(*) AS message_count, "
+        "SELECT account_id, account_ref, mailbox_id, mailbox_ref, thread_ref, "
+        "COUNT(*) AS message_count, "
         "MIN(COALESCE(received_at, saved_at)) AS first_at, "
         "MAX(COALESCE(received_at, saved_at)) AS last_at "
         f"FROM mail_packages WHERE {' AND '.join(where)} "
-        "GROUP BY account_ref, mailbox_ref, thread_ref "
+        "GROUP BY account_id, account_ref, mailbox_id, mailbox_ref, thread_ref "
         "ORDER BY last_at DESC LIMIT ? OFFSET ?",
         (*params, _limit(limit), max(0, int(offset))),
     ).fetchall()
@@ -120,10 +125,12 @@ def get_mail_thread(
     db_path,
     thread_ref: str,
     *,
+    account_id: str | None = None,
     account_ref: str | None = None,
 ) -> dict[str, Any] | None:
     where = ["thread_ref = ?"]
     params: list[Any] = [thread_ref]
+    _equal_filter(where, params, "account_id", account_id)
     _equal_filter(where, params, "account_ref", account_ref)
     connection = get_connection(db_path)
     rows = connection.execute(
@@ -136,6 +143,7 @@ def get_mail_thread(
     messages = [_package_dto(dict(row)) for row in rows]
     result = {
         "thread_ref": thread_ref,
+        "account_id": messages[0]["account_id"],
         "account_ref": messages[0]["account_ref"],
         "message_count": len(messages),
         "messages": messages,
@@ -147,6 +155,7 @@ def search_mail_facts(
     db_path,
     query: str,
     *,
+    account_id: str | None = None,
     account_ref: str | None = None,
     mailbox_ref: str | None = None,
     date_from: str | None = None,
@@ -190,6 +199,9 @@ def search_mail_facts(
         params.extend([pattern] * 14)
         params.extend(status_values)
         params.extend(status_values)
+    if account_id:
+        where.append("p.account_id = ?")
+        params.append(account_id)
     if account_ref:
         where.append("p.account_ref = ?")
         params.append(account_ref)
@@ -261,7 +273,9 @@ def _package_dto(row: dict[str, Any]) -> dict[str, Any]:
     )
     result = {
         "package_id": str(row.get("package_id") or ""),
+        "account_id": str(row.get("account_id") or ""),
         "account_ref": str(row.get("account_ref") or ""),
+        "mailbox_id": str(row.get("mailbox_id") or ""),
         "mailbox_ref": str(row.get("mailbox_ref") or ""),
         "backend": str(row.get("backend") or ""),
         "message_id": str(row.get("message_id") or ""),

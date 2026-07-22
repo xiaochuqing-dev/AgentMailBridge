@@ -119,8 +119,10 @@ def test_one_mail_has_one_complete_package_with_real_raw_and_relative_manifest(t
     assert inline["content_id"] == "logo-1"
     assert (root / inline["path"]).is_file()
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["schema_version"] == 1
+    assert manifest["schema_version"] == 2
     assert manifest["package_id"] == result["package_id"]
+    assert manifest["account_id"] == message["account_id"]
+    assert manifest["mailbox_id"] == message["mailbox_id"]
     assert manifest["raw_eml"]["path"] == "raw.eml"
     assert all(
         not Path(item["path"]).is_absolute()

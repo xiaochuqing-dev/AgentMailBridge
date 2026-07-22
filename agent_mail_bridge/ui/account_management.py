@@ -158,7 +158,14 @@ class AccountSettingsController:
         self.service.cfg.gmail_address = email
         self.service.cfg.owner_gmail = email
         self.service.cfg.gmail_receive_backend = backend
-        return ServiceResult(OperationStatus.SUCCESS, message="Gmail 收件账号已保存")
+        synced = self.service.synchronize_mail_accounts()
+        if not synced.ok:
+            return ServiceResult(
+                OperationStatus.PARTIAL,
+                error_code="account_model_sync_failed",
+                message="Gmail 配置已保存，账号模型将在下次启动时重试同步",
+            )
+        return ServiceResult(OperationStatus.SUCCESS, message="Gmail 邮箱账号已保存")
 
     def save_qq(self, email: str, new_secret: str = "") -> ServiceResult:
         email = email.strip()
@@ -193,7 +200,14 @@ class AccountSettingsController:
                 message=f"保存 QQ 发件账号失败：{exc}",
             )
         self.service.cfg.qq_email = email
-        return ServiceResult(OperationStatus.SUCCESS, message="QQ 发件账号已保存")
+        synced = self.service.synchronize_mail_accounts()
+        if not synced.ok:
+            return ServiceResult(
+                OperationStatus.PARTIAL,
+                error_code="account_model_sync_failed",
+                message="QQ 邮箱配置已保存，账号模型将在下次启动时重试同步",
+            )
+        return ServiceResult(OperationStatus.SUCCESS, message="QQ 邮箱账号已保存")
 
 
 class CredentialEditor(QFrame):
@@ -409,12 +423,12 @@ class GmailAccountDialog(_AccountDialog):
         self._authorized_unverified = False
         self._close_after_oauth = False
         self._oauth_timeout_seconds = 300.0
-        self.setWindowTitle("Gmail 收件账号")
+        self.setWindowTitle("Gmail 邮箱账号")
         root = QVBoxLayout(self)
         root.setContentsMargins(22, 20, 22, 18)
         root.setSpacing(12)
 
-        title = QLabel("Gmail 收件账号")
+        title = QLabel("Gmail 邮箱账号")
         title.setObjectName("pageTitle")
         subtitle = QLabel("选择一种清晰的连接方式；切换不会删除另一种方式已有的凭据或 OAuth 文件。")
         subtitle.setObjectName("hint")
@@ -1132,12 +1146,12 @@ class QQAccountDialog(_AccountDialog):
 
     def __init__(self, service: ApplicationService, parent: QWidget | None = None):
         super().__init__(service, parent)
-        self.setWindowTitle("QQ 发件账号")
+        self.setWindowTitle("QQ 邮箱账号")
         self.setMinimumSize(640, 480)
         root = QVBoxLayout(self)
         root.setContentsMargins(22, 20, 22, 18)
         root.setSpacing(12)
-        title = QLabel("QQ 发件账号")
+        title = QLabel("QQ 邮箱账号")
         title.setObjectName("pageTitle")
         subtitle = QLabel("发件身份、SMTP 授权码和连接测试统一在此管理。")
         subtitle.setObjectName("hint")
@@ -1240,7 +1254,7 @@ class QQAccountDialog(_AccountDialog):
 
 
 class AccountTypeDialog(QDialog):
-    """v1.3.0 的邮箱扩展说明，不复用已有账号编辑路由。"""
+    """v1.4.0 Provider 扩展说明，不复用已有账号编辑路由。"""
 
     GMAIL = "gmail"
     QQ = "qq"
@@ -1255,7 +1269,9 @@ class AccountTypeDialog(QDialog):
         layout.setSpacing(12)
         title = QLabel("添加邮箱账号")
         title.setObjectName("pageTitle")
-        hint = QLabel("这是未来邮箱扩展入口，不会修改当前 Gmail 或 QQ 邮箱账号。")
+        hint = QLabel(
+            "统一账号核心已就绪；这里是未来邮箱扩展入口，不会修改当前 Gmail 或 QQ 邮箱账号。"
+        )
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         layout.addWidget(title)
@@ -1268,8 +1284,8 @@ class AccountTypeDialog(QDialog):
         current_title = QLabel("当前已支持")
         current_title.setObjectName("sectionTitle")
         current_layout.addWidget(current_title)
-        current_layout.addWidget(QLabel("✓ Gmail 收件：通过左侧 Gmail 账号卡片管理已有账号"))
-        current_layout.addWidget(QLabel("✓ QQ 发件：通过左侧 QQ 账号卡片管理已有账号"))
+        current_layout.addWidget(QLabel("Gmail：当前支持收件与本地归档，通过左侧账号卡片管理"))
+        current_layout.addWidget(QLabel("QQ 邮箱：当前支持发件，通过左侧账号卡片管理"))
         layout.addWidget(current)
 
         future = QFrame()
@@ -1280,7 +1296,10 @@ class AccountTypeDialog(QDialog):
         future_title.setObjectName("sectionTitle")
         future_layout.addWidget(future_title)
         future_layout.addWidget(QLabel("Outlook · 163 邮箱 · 企业邮箱 · 更多邮箱服务"))
-        future_note = QLabel("当前 v1.3.0 暂不支持新增第二个同类型账号或其他邮箱服务。")
+        future_note = QLabel(
+            "当前 v1.4.0 已支持多个账号事实并存；暂不开放新增第二个同类型账号，"
+            "其他邮箱 Provider 也尚未正式接通。"
+        )
         future_note.setObjectName("hint")
         future_note.setWordWrap(True)
         future_layout.addWidget(future_note)

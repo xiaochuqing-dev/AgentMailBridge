@@ -44,6 +44,7 @@ from agent_mail_bridge.mail_common import (
 )
 from agent_mail_bridge.mail_processing import process_normalized_mail
 from agent_mail_bridge.mail_archive import stable_account_ref
+from agent_mail_bridge.mail_accounts import current_receive_account_id
 from agent_mail_bridge.receive_rules import receive_rule_fingerprint
 from agent_mail_bridge.security import (
     check_size_ok,
@@ -98,6 +99,7 @@ def receive_gmail_api_messages(
     """
     from agent_mail_bridge.config import require_receive_config
     require_receive_config(cfg)
+    account_id = current_receive_account_id(cfg)
 
     if limit is None:
         page_size = cfg.gmail_api_max_results
@@ -170,7 +172,7 @@ def receive_gmail_api_messages(
     messages = messages[:scan_cap]
     known_ids = {str(item.get("id", "")) for item in messages}
     for retry in query_due_receive_retries(
-        cfg.db_path, "gmail_api", limit=min(100, scan_cap)
+        cfg.db_path, "gmail_api", limit=min(100, scan_cap), account_id=account_id
     ):
         resource_id = str(retry.get("resource_id") or "")
         if resource_id and resource_id not in known_ids:
@@ -182,7 +184,7 @@ def receive_gmail_api_messages(
         gmail_message_id = item.get("id", "")
         gmail_thread_id = item.get("threadId", "")
         if not receive_retry_is_due(
-            cfg.db_path, "gmail_api", gmail_message_id
+            cfg.db_path, "gmail_api", gmail_message_id, account_id=account_id
         ):
             result["skipped"] += 1
             result["retry_deferred"] += 1
@@ -191,7 +193,9 @@ def receive_gmail_api_messages(
             _process_one_unified(
                 service, cfg, gmail_message_id, gmail_thread_id, result,
             )
-            clear_receive_retry(cfg.db_path, "gmail_api", gmail_message_id)
+            clear_receive_retry(
+                cfg.db_path, "gmail_api", gmail_message_id, account_id=account_id
+            )
         except Exception as exc:  # noqa: BLE001
             err = f"处理 Gmail API 邮件 id={gmail_message_id} 失败：{exc}"
             logger.warning("处理 Gmail API 邮件失败", exc_info=True)
@@ -205,9 +209,10 @@ def receive_gmail_api_messages(
                 resource_id=gmail_message_id,
                 message_id=str(getattr(exc, "message_id", gmail_message_id)),
                 error=str(exc),
+                account_id=account_id,
             )
 
-    retry_counts = count_receive_retries(cfg.db_path)
+    retry_counts = count_receive_retries(cfg.db_path, account_id=account_id)
     result["pending_retries"] = retry_counts["pending"]
     result["needs_attention"] = retry_counts["needs_attention"]
 
@@ -277,6 +282,7 @@ def rescan_gmail_api_messages(
     page_token: str | None = None
     fingerprint = receive_rule_fingerprint(cfg) if apply_receive_rule else "all_scanned_override"
     account_ref = stable_account_ref(cfg)
+    account_id = current_receive_account_id(cfg)
     while result["fetched"] < safe_scan_cap:
         if cancel_check and cancel_check():
             result["cancelled"] = True
@@ -324,6 +330,7 @@ def rescan_gmail_api_messages(
                 record_receive_rule_evaluation(
                     cfg.db_path,
                     account_ref=account_ref,
+                    account_id=account_id,
                     backend="gmail_api",
                     provider_message_id=provider_id,
                     message_id=str(single.get("message_id") or "") or None,
@@ -332,7 +339,9 @@ def rescan_gmail_api_messages(
                     rule_fingerprint=fingerprint,
                     scan_id=scan_id,
                 )
-                clear_receive_retry(cfg.db_path, "gmail_api", provider_id)
+                clear_receive_retry(
+                    cfg.db_path, "gmail_api", provider_id, account_id=account_id
+                )
             except Exception as exc:  # noqa: BLE001
                 is_partial = isinstance(exc, Exception) and type(exc).__name__ == "MailArchivePartialError"
                 if is_partial:
@@ -345,10 +354,12 @@ def rescan_gmail_api_messages(
                     resource_id=provider_id,
                     message_id=str(getattr(exc, "message_id", provider_id)),
                     error=str(exc),
+                    account_id=account_id,
                 )
                 record_receive_rule_evaluation(
                     cfg.db_path,
                     account_ref=account_ref,
+                    account_id=account_id,
                     backend="gmail_api",
                     provider_message_id=provider_id,
                     message_id=str(getattr(exc, "message_id", "")) or None,
@@ -371,7 +382,7 @@ def rescan_gmail_api_messages(
             break
     if page_token and result["fetched"] >= safe_scan_cap:
         result["truncated"] = True
-    retry_counts = count_receive_retries(cfg.db_path)
+    retry_counts = count_receive_retries(cfg.db_path, account_id=account_id)
     result.update(
         pending_retries=retry_counts["pending"],
         needs_attention=retry_counts["needs_attention"],

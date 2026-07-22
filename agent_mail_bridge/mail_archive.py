@@ -37,14 +37,18 @@ from agent_mail_bridge.mail_common import (
     parse_mail_address_header,
     parse_mailboxes,
 )
+from agent_mail_bridge.mail_accounts import (
+    current_receive_account_id,
+    stable_mailbox_id,
+)
 from agent_mail_bridge.mail_links import detect_mail_links
 from agent_mail_bridge.security import SecurityError, assert_within_root
 from agent_mail_bridge.trusted_downloads import download_trusted_url, is_host_trusted
 from agent_mail_bridge.utils import sanitize_filename, sha256_of_bytes, sha256_of_file, split_ext
 
 
-# v1 清单继续采用可选字段扩展，避免旧读取方因版本号变化拒绝已有契约。
-MANIFEST_SCHEMA_VERSION = 1
+# v2 增加稳定账号与邮箱目录身份；旧清单仍由可选字段兼容读取。
+MANIFEST_SCHEMA_VERSION = 2
 LEGACY_MIGRATION_KEY = "unified_mail_archive_v1"
 
 _locks_guard = threading.Lock()
@@ -75,6 +79,7 @@ def archive_normalized_mail(
 ) -> ArchiveResult:
     """保存一封已匹配收件规则的邮件；partial 重试复用同一目录。"""
     account_ref = stable_account_ref(cfg)
+    account_id = current_receive_account_id(cfg)
     package_id = stable_package_id(account_ref, message_id)
     lock = _lock_for(package_id)
     with lock:
@@ -295,10 +300,13 @@ def archive_normalized_mail(
             outbound_origin=mail.outbound_origin,
             outbound_id=mail.outbound_id,
         )
+        mailbox_ref = mail.mailbox_ref or _default_mailbox_ref(mail.backend)
         package = {
             "package_id": package_id,
             "account_ref": account_ref,
-            "mailbox_ref": mail.mailbox_ref or _default_mailbox_ref(mail.backend),
+            "account_id": account_id,
+            "mailbox_ref": mailbox_ref,
+            "mailbox_id": stable_mailbox_id(account_id, mailbox_ref),
             "backend": mail.backend,
             "message_id": message_id,
             "provider_message_id": mail.backend_message_id or mail.uid or None,
@@ -482,6 +490,7 @@ def backfill_legacy_mail_packages(cfg: AppConfig) -> dict[str, Any]:
 def _backfill_one_legacy(cfg: AppConfig, row: dict[str, Any]) -> None:
     message_id = str(row.get("message_id") or f"legacy:{row['id']}")
     account_ref = stable_account_ref(cfg)
+    account_id = current_receive_account_id(cfg)
     package_id = stable_package_id(account_ref, message_id)
     package_root = _package_root(
         cfg, package_id, str(row.get("subject") or "旧邮件"),
@@ -494,7 +503,9 @@ def _backfill_one_legacy(cfg: AppConfig, row: dict[str, Any]) -> None:
     work_root.mkdir(parents=True, exist_ok=True)
     for name in ("body", "inline", "attachments", "downloads"):
         (work_root / name).mkdir(parents=True, exist_ok=True)
-    files = query_received_files_by_message(cfg.db_path, message_id)
+    files = query_received_files_by_message(
+        cfg.db_path, message_id, account_id=row.get("account_id")
+    )
     if not files and row.get("body_file_path"):
         files = [{
             "id": None, "file_type": "body", "original_filename": row.get("subject") or "旧邮件",
@@ -559,10 +570,14 @@ def _backfill_one_legacy(cfg: AppConfig, row: dict[str, Any]) -> None:
             })
 
     saved_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    mailbox_ref = _default_mailbox_ref(str(row.get("backend") or "imap"))
     package = {
         "package_id": package_id,
+        "legacy_received_id": row["id"],
         "account_ref": account_ref,
-        "mailbox_ref": _default_mailbox_ref(str(row.get("backend") or "imap")),
+        "account_id": account_id,
+        "mailbox_ref": mailbox_ref,
+        "mailbox_id": stable_mailbox_id(account_id, mailbox_ref),
         "backend": str(row.get("backend") or row.get("source") or "legacy"),
         "message_id": message_id,
         "provider_message_id": row.get("gmail_message_id"),
@@ -742,7 +757,9 @@ def _manifest(
     return {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "package_id": package["package_id"],
+        "account_id": package.get("account_id"),
         "account_ref": package["account_ref"],
+        "mailbox_id": package.get("mailbox_id"),
         "mailbox_ref": package["mailbox_ref"],
         "message_id": package["message_id"],
         "thread_ref": package.get("thread_ref"),

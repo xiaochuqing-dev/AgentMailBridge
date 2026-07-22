@@ -47,6 +47,7 @@ from agent_mail_bridge.mail_common import (
 )
 from agent_mail_bridge.mail_processing import process_normalized_mail
 from agent_mail_bridge.mail_archive import stable_account_ref
+from agent_mail_bridge.mail_accounts import current_receive_account_id
 from agent_mail_bridge.receive_rules import receive_rule_fingerprint
 from agent_mail_bridge.security import (
     is_attachment_allowed,
@@ -230,6 +231,7 @@ def _receive_via_imap(
     if mark_seen is None:
         mark_seen = cfg.receive_mark_seen
 
+    account_id = current_receive_account_id(cfg)
     result: dict[str, Any] = {
         "ok": True,
         "fetched": 0,
@@ -300,7 +302,7 @@ def _receive_via_imap(
         uids = uids[-scan_cap:] if scan_cap and scan_cap > 0 else uids
         known_uids = {uid.decode(errors="replace") for uid in uids}
         for retry in query_due_receive_retries(
-            cfg.db_path, "imap", limit=min(100, scan_cap)
+            cfg.db_path, "imap", limit=min(100, scan_cap), account_id=account_id
         ):
             resource_id = str(retry.get("resource_id") or "")
             if resource_id and resource_id not in known_uids:
@@ -310,13 +312,17 @@ def _receive_via_imap(
 
         for uid in uids:
             resource_id = uid.decode(errors="replace")
-            if not receive_retry_is_due(cfg.db_path, "imap", resource_id):
+            if not receive_retry_is_due(
+                cfg.db_path, "imap", resource_id, account_id=account_id
+            ):
                 result["skipped"] += 1
                 result["retry_deferred"] += 1
                 continue
             try:
                 _process_one_unified(conn, uid, cfg, mark_seen, result)
-                clear_receive_retry(cfg.db_path, "imap", resource_id)
+                clear_receive_retry(
+                    cfg.db_path, "imap", resource_id, account_id=account_id
+                )
             except Exception as exc:  # noqa: BLE001
                 err = f"处理邮件 uid={resource_id} 失败：{exc}"
                 logger.warning("处理邮件失败", exc_info=True)
@@ -330,9 +336,10 @@ def _receive_via_imap(
                     resource_id=resource_id,
                     message_id=str(getattr(exc, "message_id", resource_id)),
                     error=str(exc),
+                    account_id=account_id,
                 )
 
-        retry_counts = count_receive_retries(cfg.db_path)
+        retry_counts = count_receive_retries(cfg.db_path, account_id=account_id)
         result["pending_retries"] = retry_counts["pending"]
         result["needs_attention"] = retry_counts["needs_attention"]
 
@@ -402,6 +409,7 @@ def _rescan_via_imap(
         return result
     fingerprint = receive_rule_fingerprint(cfg) if apply_receive_rule else "all_scanned_override"
     account_ref = stable_account_ref(cfg)
+    account_id = current_receive_account_id(cfg)
     try:
         conn.select("INBOX")
         end_exclusive = date_to.date() + timedelta(days=1)
@@ -451,6 +459,7 @@ def _rescan_via_imap(
                     record_receive_rule_evaluation(
                         cfg.db_path,
                         account_ref=account_ref,
+                        account_id=account_id,
                         backend="imap",
                         provider_message_id=provider_id,
                         message_id=str(single.get("message_id") or "") or None,
@@ -459,7 +468,9 @@ def _rescan_via_imap(
                         rule_fingerprint=fingerprint,
                         scan_id=scan_id,
                     )
-                    clear_receive_retry(cfg.db_path, "imap", provider_id)
+                    clear_receive_retry(
+                        cfg.db_path, "imap", provider_id, account_id=account_id
+                    )
                 except Exception as exc:  # noqa: BLE001
                     is_partial = isinstance(exc, MailArchivePartialError)
                     if is_partial:
@@ -474,10 +485,12 @@ def _rescan_via_imap(
                         resource_id=provider_id,
                         message_id=str(getattr(exc, "message_id", provider_id)),
                         error=str(exc),
+                        account_id=account_id,
                     )
                     record_receive_rule_evaluation(
                         cfg.db_path,
                         account_ref=account_ref,
+                        account_id=account_id,
                         backend="imap",
                         provider_message_id=provider_id,
                         message_id=str(getattr(exc, "message_id", "")) or None,
@@ -498,7 +511,7 @@ def _rescan_via_imap(
             conn.logout()
         except Exception:
             pass
-    retry_counts = count_receive_retries(cfg.db_path)
+    retry_counts = count_receive_retries(cfg.db_path, account_id=account_id)
     result.update(
         pending_retries=retry_counts["pending"],
         needs_attention=retry_counts["needs_attention"],

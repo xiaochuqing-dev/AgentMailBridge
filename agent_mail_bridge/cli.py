@@ -41,6 +41,7 @@ from agent_mail_bridge.file_index import (
     scan_file_status,
 )
 from agent_mail_bridge.logging_setup import get_logger, setup_logging
+from agent_mail_bridge.mail_accounts import legacy_accounts_from_config
 from agent_mail_bridge.mail_receive import receive_mails
 from agent_mail_bridge.mail_send import send_file_to_owner_gmail
 from agent_mail_bridge.storage import ensure_data_dirs
@@ -51,7 +52,7 @@ from agent_mail_bridge.version import __version__
 def _setup(cfg) -> None:
     """初始化日志 + 数据目录 + 数据库（命令前置步骤）。"""
     ensure_data_dirs(cfg)
-    init_db(cfg.db_path)
+    init_db(cfg.db_path, legacy_accounts=legacy_accounts_from_config(cfg))
     setup_logging(cfg.logs_dir, cfg.log_level)
 
 

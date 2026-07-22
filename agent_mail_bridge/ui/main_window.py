@@ -587,17 +587,38 @@ class BridgeWindow(QMainWindow):
         layout.addWidget(self.add_account_button)
         layout.addSpacing(3)
 
-        label = QLabel("我的邮箱账号")
+        label = QLabel("邮箱账号")
         label.setObjectName("fieldLabel")
         layout.addWidget(label)
-        self.gmail_card = AccountCard(provider_icon("gmail"), "Gmail（收件）", "未配置", "管理已有收件账号", "#EA4335")
-        self.qq_card = AccountCard(provider_icon("qq"), "QQ（发件）", "未配置", "管理已有发件账号", "#21A4E8")
+        account_list = QWidget()
+        account_list.setObjectName("accountList")
+        self.account_cards_layout = QVBoxLayout(account_list)
+        self.account_cards_layout.setContentsMargins(0, 0, 0, 0)
+        self.account_cards_layout.setSpacing(8)
+        self.gmail_card = AccountCard(
+            provider_icon("gmail"), "Gmail", "未配置",
+            "当前能力：收件 · 归档", "#EA4335"
+        )
+        self.qq_card = AccountCard(
+            provider_icon("qq"), "QQ 邮箱", "未配置",
+            "当前能力：发件", "#21A4E8"
+        )
         self.gmail_card.clicked.connect(lambda: self.open_account(AccountTypeDialog.GMAIL))
         self.qq_card.clicked.connect(lambda: self.open_account(AccountTypeDialog.QQ))
-        layout.addWidget(self.gmail_card)
-        layout.addWidget(self.qq_card)
+        self.account_cards_layout.addWidget(self.gmail_card)
+        self.account_cards_layout.addWidget(self.qq_card)
+        self.account_cards_layout.addStretch(1)
+        self.account_list_scroll = QScrollArea()
+        self.account_list_scroll.setObjectName("accountListScroll")
+        self.account_list_scroll.setWidgetResizable(True)
+        self.account_list_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.account_list_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.account_list_scroll.setWidget(account_list)
+        self.account_list_scroll.setMinimumHeight(252)
+        layout.addWidget(self.account_list_scroll, 1)
         layout.addSpacing(8)
-        layout.addStretch(1)
 
         self.nav_buttons: dict[str, NavButton] = {}
         nav_card = QFrame()
@@ -909,7 +930,7 @@ class BridgeWindow(QMainWindow):
     def _build_inbox_page(self) -> QWidget:
         page, layout = self._standard_page(
             "收件",
-            "日常收件工作台；邮箱地址、OAuth 和 IMAP 凭据请通过左侧 Gmail 账号卡片管理。",
+            "日常收件工作台；收件账号、认证方式与 Provider 能力请通过左侧账号卡片管理。",
         )
         # 高内容页在当前屏幕可用高度足够时整页显示，较矮窗口保留滚动兜底。
         layout.setContentsMargins(24, 20, 22, 24)
@@ -3789,8 +3810,27 @@ class BridgeWindow(QMainWindow):
             self.qq_card.email_label.setText(cfg.qq_email or "未配置")
             self.gmail_card.set_configured(bool(cfg.gmail_address))
             self.qq_card.set_configured(bool(cfg.qq_email))
+            accounts = list(status.get("mail_accounts") or [])
+            for card, provider, address in (
+                (self.gmail_card, "gmail", cfg.gmail_address),
+                (self.qq_card, "qq", cfg.qq_email),
+            ):
+                account = next(
+                    (
+                        item for item in accounts
+                        if item.get("provider") == provider
+                        and str(item.get("email_address") or "").casefold()
+                        == str(address or "").casefold()
+                    ),
+                    None,
+                )
+                if account:
+                    card.setToolTip(
+                        f"稳定账号 ID：{account.get('account_id')}\n"
+                        f"数据命名空间：{account.get('data_namespace')}"
+                    )
             if hasattr(self, "receive_account_label"):
-                self.receive_account_label.setText(cfg.gmail_address or "尚未配置 Gmail 收件账号")
+                self.receive_account_label.setText(cfg.gmail_address or "尚未配置具备收件能力的账号")
             self.self_mail_check.setChecked(cfg.auto_receive_only_self_mail)
             self._update_receive_preference_summary()
             if not getattr(self, "_recipient_user_edited", False):

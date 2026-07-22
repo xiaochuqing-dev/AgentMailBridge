@@ -39,7 +39,10 @@ class SetupWizard(QDialog):
 
         title = QLabel("欢迎使用 AgentMailBridge")
         title.setObjectName("pageTitle")
-        hint = QLabel("先配置 Gmail 收件账号；QQ 发件账号可以现在配置，也可以稍后从主界面左侧账号区添加。")
+        hint = QLabel(
+            "先配置一个具备收件能力的账号（当前阶段为 Gmail）；"
+            "QQ 邮箱发件能力可以现在配置，也可以稍后添加。"
+        )
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         layout.addWidget(title)
@@ -48,13 +51,13 @@ class SetupWizard(QDialog):
         self.gmail_status = QLabel()
         self.qq_status = QLabel()
         layout.addWidget(self.gmail_status)
-        gmail = QPushButton("配置 Gmail 收件账号")
+        gmail = QPushButton("配置 Gmail 邮箱账号")
         gmail.setObjectName("primaryButton")
         gmail.setMinimumHeight(48)
         gmail.clicked.connect(lambda: self.configure(AccountTypeDialog.GMAIL))
         layout.addWidget(gmail)
         layout.addWidget(self.qq_status)
-        qq = QPushButton("配置 QQ 发件账号（可选）")
+        qq = QPushButton("配置 QQ 邮箱账号（可选）")
         qq.setObjectName("outlinePurple")
         qq.setMinimumHeight(44)
         qq.clicked.connect(lambda: self.configure(AccountTypeDialog.QQ))
@@ -75,11 +78,11 @@ class SetupWizard(QDialog):
         gmail_ready = bool(self.cfg.gmail_address and self.cfg.owner_gmail)
         qq_ready = bool(self.cfg.qq_email and self.cfg.qq_auth_code)
         self.gmail_status.setText(
-            f"✓ Gmail 收件账号：{self.cfg.gmail_address}" if gmail_ready else "○ Gmail 收件账号：未配置（必需）"
+            f"Gmail 邮箱账号：{self.cfg.gmail_address}" if gmail_ready else "Gmail 邮箱账号：未配置（当前收件必需）"
         )
         self.gmail_status.setObjectName("successText" if gmail_ready else "hint")
         self.qq_status.setText(
-            f"✓ QQ 发件账号：{self.cfg.qq_email}" if qq_ready else "○ QQ 发件账号：未配置（可选）"
+            f"QQ 邮箱账号：{self.cfg.qq_email}" if qq_ready else "QQ 邮箱账号：未配置（可选）"
         )
         self.qq_status.setObjectName("successText" if qq_ready else "hint")
         for label in (self.gmail_status, self.qq_status):
@@ -113,6 +116,6 @@ class SetupWizard(QDialog):
 
     def accept(self) -> None:
         if not (self.cfg.gmail_address and self.cfg.owner_gmail):
-            QMessageBox.warning(self, "尚未完成", "请先配置 Gmail 收件账号。")
+            QMessageBox.warning(self, "尚未完成", "请先配置当前支持的 Gmail 收件能力。")
             return
         super().accept()

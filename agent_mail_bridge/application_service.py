@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import sqlite3
 import smtplib
 import ssl
 import platform
@@ -33,6 +34,7 @@ from agent_mail_bridge.credentials import (
 )
 from agent_mail_bridge.database import (
     app_event_overview,
+    close_connection,
     clear_all_app_events,
     clear_daily_check_events,
     configure_app_event_retention,
@@ -43,6 +45,7 @@ from agent_mail_bridge.database import (
     insert_mcp_call,
     insert_mcp_audit_event,
     legacy_archive_backfill_needed,
+    multi_account_migration_needed,
     outbound_mail_migration_needed,
     v13_mail_migration_needed,
     log_event,
@@ -62,6 +65,9 @@ from agent_mail_bridge.database import (
     delete_trusted_domain,
     upsert_trusted_domain,
     prune_app_events,
+    query_mail_accounts,
+    query_mailboxes,
+    sync_mail_accounts,
 )
 from agent_mail_bridge.file_index import list_received_files_for_date, scan_file_status
 from agent_mail_bridge.gmail_api_auth import get_oauth_state
@@ -80,6 +86,11 @@ from agent_mail_bridge.mail_facts import (
     search_mail_facts as query_mail_facts,
 )
 from agent_mail_bridge.mail_send import send_file_with_request, send_outbound_mail
+from agent_mail_bridge.mail_accounts import (
+    current_receive_account_id,
+    legacy_accounts_from_config,
+)
+from agent_mail_bridge.provider_adapters import list_provider_adapters
 from agent_mail_bridge.mail_resource_access import (
     MAX_TEXT_CHARS,
     MailAccessError,
@@ -177,16 +188,33 @@ class ApplicationService:
                 archive_migration_needed = legacy_archive_backfill_needed(
                     self.cfg.db_path
                 )
+                account_migration_needed = multi_account_migration_needed(
+                    self.cfg.db_path
+                )
                 outbound_migration_needed = outbound_mail_migration_needed(
                     self.cfg.db_path
                 )
                 v13_migration_needed = v13_mail_migration_needed(self.cfg.db_path)
-                if archive_migration_needed or outbound_migration_needed or v13_migration_needed:
+                if (
+                    archive_migration_needed
+                    or outbound_migration_needed
+                    or v13_migration_needed
+                    or account_migration_needed
+                ):
                     create_database_backup(
                         self.cfg,
-                        label="before_v1_3_models" if v13_migration_needed else "before_mail_models",
+                        label=(
+                            "before_v1_4_multi_account"
+                            if account_migration_needed
+                            else "before_v1_3_models"
+                            if v13_migration_needed
+                            else "before_mail_models"
+                        ),
                     )
-                init_db(self.cfg.db_path)
+                init_db(
+                    self.cfg.db_path,
+                    legacy_accounts=legacy_accounts_from_config(self.cfg),
+                )
                 if archive_migration_needed:
                     migration = backfill_legacy_mail_packages(self.cfg)
                     if migration.get("failed"):
@@ -392,7 +420,10 @@ class ApplicationService:
             failures = int(raw.get("failed", len(raw.get("errors", []))))
             saved = int(raw.get("saved", 0))
             errors = list(raw.get("errors", []))
-            retry_counts = count_receive_retries(self.cfg.db_path)
+            retry_counts = count_receive_retries(
+                self.cfg.db_path,
+                account_id=current_receive_account_id(self.cfg),
+            )
             if raw.get("global_error") or not raw.get("ok", True):
                 status = OperationStatus.FAILED
             elif failures:
@@ -573,18 +604,70 @@ class ApplicationService:
     def get_auto_receive_state(self) -> ServiceResult:
         """供 GUI 展示真实持久化调度与坏邮件隔离状态。"""
         self.initialize()
-        state = get_auto_receive_state(self.cfg.db_path)
+        account_id = current_receive_account_id(self.cfg)
+        state = get_auto_receive_state(self.cfg.db_path, account_id=account_id)
         state["enabled"] = bool(state.get("enabled"))
-        state.update(count_receive_retries(self.cfg.db_path))
+        state.update(count_receive_retries(self.cfg.db_path, account_id=account_id))
         return ServiceResult(OperationStatus.SUCCESS, details=state)
 
     def save_auto_receive_state(self, **changes: Any) -> ServiceResult:
         """由 GUI 调度器原子更新可恢复状态。"""
         self.initialize()
-        state = save_auto_receive_state(self.cfg.db_path, **changes)
+        account_id = current_receive_account_id(self.cfg)
+        state = save_auto_receive_state(
+            self.cfg.db_path, account_id=account_id, **changes
+        )
         state["enabled"] = bool(state.get("enabled"))
-        state.update(count_receive_retries(self.cfg.db_path))
+        state.update(count_receive_retries(self.cfg.db_path, account_id=account_id))
         return ServiceResult(OperationStatus.SUCCESS, details=state)
+
+    def synchronize_mail_accounts(self) -> ServiceResult:
+        """把当前兼容配置同步到正式账号表；不读取、复制或返回秘密。"""
+        self.initialize()
+        try:
+            accounts = sync_mail_accounts(
+                self.cfg.db_path, legacy_accounts_from_config(self.cfg)
+            )
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="account_model_sync_failed",
+                message=f"邮箱账号模型同步失败：{exc}",
+            )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            message="邮箱账号模型已同步",
+            details={
+                "accounts": accounts,
+                "mailboxes": query_mailboxes(self.cfg.db_path),
+            },
+        )
+
+    def list_mail_accounts(self) -> ServiceResult:
+        """返回统一账号及 mailbox 基础事实，供 GUI 和统一 MCP 展示。"""
+        synced = self.synchronize_mail_accounts()
+        if not synced.ok:
+            return synced
+        return ServiceResult(OperationStatus.SUCCESS, details=synced.details)
+
+    def list_mail_provider_adapters(self) -> ServiceResult:
+        self.initialize()
+        adapters = [
+            {
+                "provider": item.provider,
+                "display_name": item.display_name,
+                "authentication_types": list(item.authentication_types),
+                "available_capabilities": list(item.available_capabilities),
+                "implemented_capabilities": list(item.implemented_capabilities),
+                "receive_backends": list(item.receive_backends),
+                "send_backends": list(item.send_backends),
+                "status": item.status,
+            }
+            for item in list_provider_adapters()
+        ]
+        return ServiceResult(
+            OperationStatus.SUCCESS, details={"providers": adapters}
+        )
 
     def send_file(
         self,
@@ -1337,11 +1420,18 @@ class ApplicationService:
         return ServiceResult(OperationStatus.SUCCESS, details={"threads": rows})
 
     def get_mail_thread(
-        self, thread_ref: str, *, account_ref: str | None = None
+        self,
+        thread_ref: str,
+        *,
+        account_id: str | None = None,
+        account_ref: str | None = None,
     ) -> ServiceResult:
         self.initialize()
         row = query_mail_thread(
-            self.cfg.db_path, thread_ref, account_ref=account_ref
+            self.cfg.db_path,
+            thread_ref,
+            account_id=account_id,
+            account_ref=account_ref,
         )
         if row is None:
             return ServiceResult(
@@ -1412,6 +1502,7 @@ class ApplicationService:
         offset: int = 0,
         ensure_fresh: bool = False,
         allow_cached: bool = True,
+        account_id: str | None = None,
         account_ref: str | None = None,
         mailbox_ref: str | None = None,
     ) -> ServiceResult:
@@ -1427,6 +1518,11 @@ class ApplicationService:
             safe_limit = 1 if limit is None and time_scope == "latest" else int(limit or 20)
             if safe_limit <= 0 or safe_limit > 100 or int(offset) < 0:
                 raise ValueError("limit 必须在 1 到 100 之间，offset 必须为非负整数")
+            if account_id and account_id not in {
+                str(item["account_id"])
+                for item in query_mail_accounts(self.cfg.db_path, enabled_only=True)
+            }:
+                raise ValueError("account_id 不存在或未启用")
         except (TypeError, ValueError) as exc:
             return ServiceResult(
                 OperationStatus.FAILED, error_code="invalid_range", message=str(exc)
@@ -1450,6 +1546,7 @@ class ApplicationService:
             success_at = now_text if received.ok else sync_before.get("last_success_at")
             save_auto_receive_state(
                 self.cfg.db_path,
+                account_id=current_receive_account_id(self.cfg),
                 last_check_at=now_text,
                 last_success_at=success_at,
                 last_result=received.message,
@@ -1477,6 +1574,7 @@ class ApplicationService:
             rows = query_mail_facts(
                 self.cfg.db_path,
                 query,
+                account_id=account_id,
                 account_ref=account_ref,
                 mailbox_ref=mailbox_ref,
                 date_from=start,
@@ -1649,9 +1747,12 @@ class ApplicationService:
     def get_mail_sync_status(self) -> ServiceResult:
         """返回持久化调度、新鲜度、重试和跨进程同步状态。"""
         self.initialize()
-        state = get_auto_receive_state(self.cfg.db_path)
-        retries = count_receive_retries(self.cfg.db_path)
-        newest = query_mail_messages(self.cfg.db_path, limit=1)
+        account_id = current_receive_account_id(self.cfg)
+        state = get_auto_receive_state(self.cfg.db_path, account_id=account_id)
+        retries = count_receive_retries(self.cfg.db_path, account_id=account_id)
+        newest = query_mail_messages(
+            self.cfg.db_path, account_id=account_id, limit=1
+        )
         latest_local_at = None
         if newest:
             latest_local_at = newest[0].get("saved_at") or newest[0].get("received_at")
@@ -1675,6 +1776,8 @@ class ApplicationService:
             "latest_local_mail_at": latest_local_at,
             "latest_local_mail_age_seconds": local_age,
             "last_error": _redact_text(str(state.get("last_error") or ""), self.cfg),
+            "account_id": account_id,
+            "accounts": query_mail_accounts(self.cfg.db_path, enabled_only=True),
         }
         return ServiceResult(OperationStatus.SUCCESS, details=details)
 
@@ -1897,6 +2000,9 @@ class ApplicationService:
                         f"自动技术日志清理完成：删除 {deleted} 条",
                     )
             finally:
+                # 后台线程的线程本地 SQLite 连接必须在该线程内显式释放；
+                # 否则 Windows 上隔离数据目录可能在进程存活期间保持占用。
+                close_connection()
                 self._event_maintenance_lock.release()
 
         threading.Thread(
@@ -2052,7 +2158,10 @@ class ApplicationService:
             )
         try:
             restored = restore_database_backup(self.cfg, path)
-            init_db(self.cfg.db_path)
+            init_db(
+                self.cfg.db_path,
+                legacy_accounts=legacy_accounts_from_config(self.cfg),
+            )
             return ServiceResult(
                 OperationStatus.SUCCESS, message="数据库恢复并重新打开成功",
                 details=restored,
@@ -2096,6 +2205,7 @@ class ApplicationService:
 
     def get_config_and_connection_status(self) -> ServiceResult:
         """返回脱敏配置及三个连接面的可见状态。"""
+        self.initialize()
         backend = _effective_receive_backend(self.cfg)
         oauth = get_oauth_state(self.cfg)
         return ServiceResult(
@@ -2106,6 +2216,9 @@ class ApplicationService:
                 "imap": "configured" if self.cfg.gmail_address and self.cfg.gmail_app_password else "not_configured",
                 "gmail_api": oauth,
                 "qq_smtp": "configured" if self.cfg.qq_email and self.cfg.qq_auth_code else "not_configured",
+                "mail_accounts": query_mail_accounts(
+                    self.cfg.db_path, enabled_only=True
+                ),
             },
         )
 
@@ -2302,6 +2415,8 @@ def _mail_search_summary(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "mail_id": package_id,
         "package_id": package_id,
+        "account_id": str(row.get("account_id") or ""),
+        "mailbox_id": str(row.get("mailbox_id") or ""),
         "subject": str(row.get("subject") or ""),
         "from": str(row.get("from") or ""),
         "from_display": str(row.get("from_display") or ""),

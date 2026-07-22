@@ -16,8 +16,14 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
+from agent_mail_bridge.mail_accounts import (
+    MailAccount,
+    provider_and_address_from_legacy_ref,
+    stable_account_id,
+    stable_mailbox_id,
+)
 from agent_mail_bridge.utils import fmt_datetime, now_local
 
 # 每线程连接缓存
@@ -44,9 +50,40 @@ _DAILY_CHECK_SQL = """
 """
 
 SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS mail_accounts (
+    account_id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    email_address TEXT NOT NULL,
+    display_name TEXT NOT NULL DEFAULT '',
+    auth_type TEXT NOT NULL,
+    receive_enabled INTEGER NOT NULL DEFAULT 0,
+    send_enabled INTEGER NOT NULL DEFAULT 0,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    data_namespace TEXT NOT NULL UNIQUE,
+    capabilities_json TEXT NOT NULL DEFAULT '[]',
+    provider_settings_json TEXT NOT NULL DEFAULT '{}',
+    source TEXT NOT NULL DEFAULT 'legacy_config',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(provider, email_address COLLATE NOCASE)
+);
+
+CREATE TABLE IF NOT EXISTS mailboxes (
+    mailbox_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    external_ref TEXT NOT NULL,
+    display_name TEXT NOT NULL DEFAULT '',
+    mailbox_role TEXT NOT NULL DEFAULT 'other',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(account_id) REFERENCES mail_accounts(account_id),
+    UNIQUE(account_id, external_ref COLLATE NOCASE)
+);
+
 CREATE TABLE IF NOT EXISTS received_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    message_id TEXT UNIQUE,
+    message_id TEXT NOT NULL,
     gmail_uid TEXT,
     subject TEXT,
     from_email TEXT,
@@ -63,7 +100,9 @@ CREATE TABLE IF NOT EXISTS received_messages (
     gmail_message_id TEXT,
     gmail_thread_id TEXT,
     backend TEXT,
-    package_id TEXT
+    package_id TEXT,
+    account_id TEXT,
+    UNIQUE(account_id, message_id COLLATE NOCASE)
 );
 
 CREATE TABLE IF NOT EXISTS received_files (
@@ -81,7 +120,8 @@ CREATE TABLE IF NOT EXISTS received_files (
     created_at TEXT,
     updated_at TEXT,
     package_id TEXT,
-    resource_id TEXT
+    resource_id TEXT,
+    account_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS sent_files (
@@ -108,7 +148,8 @@ CREATE TABLE IF NOT EXISTS sent_files (
     outbound_id TEXT,
     outbound_resource_id TEXT,
     created_at TEXT,
-    updated_at TEXT
+    updated_at TEXT,
+    from_account_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS app_events (
@@ -172,7 +213,9 @@ CREATE TABLE IF NOT EXISTS mail_packages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     package_id TEXT NOT NULL UNIQUE,
     account_ref TEXT NOT NULL,
+    account_id TEXT,
     mailbox_ref TEXT NOT NULL,
+    mailbox_id TEXT,
     backend TEXT NOT NULL,
     message_id TEXT NOT NULL,
     provider_message_id TEXT,
@@ -243,6 +286,7 @@ CREATE TABLE IF NOT EXISTS outbound_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     outbound_id TEXT NOT NULL UNIQUE,
     sender_account_ref TEXT NOT NULL,
+    from_account_id TEXT,
     sender_ref TEXT NOT NULL,
     source_origin TEXT NOT NULL,
     request_id TEXT,
@@ -325,8 +369,24 @@ CREATE TABLE IF NOT EXISTS auto_receive_state (
     updated_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS account_sync_states (
+    account_id TEXT PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    interval_seconds INTEGER NOT NULL DEFAULT 60,
+    last_check_at TEXT,
+    last_success_at TEXT,
+    last_result TEXT,
+    last_error TEXT,
+    consecutive_global_failures INTEGER NOT NULL DEFAULT 0,
+    next_check_at TEXT,
+    checkpoint TEXT,
+    updated_at TEXT,
+    FOREIGN KEY(account_id) REFERENCES mail_accounts(account_id)
+);
+
 CREATE TABLE IF NOT EXISTS receive_retries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id TEXT NOT NULL,
     backend TEXT NOT NULL,
     resource_id TEXT NOT NULL,
     message_id TEXT,
@@ -338,12 +398,13 @@ CREATE TABLE IF NOT EXISTS receive_retries (
     terminal_status TEXT,
     created_at TEXT,
     updated_at TEXT,
-    UNIQUE (backend, resource_id, attachment_id)
+    UNIQUE (account_id, backend, resource_id, attachment_id)
 );
 
 CREATE TABLE IF NOT EXISTS receive_rule_evaluations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     account_ref TEXT NOT NULL,
+    account_id TEXT,
     backend TEXT NOT NULL,
     provider_message_id TEXT NOT NULL,
     message_id TEXT,
@@ -369,6 +430,8 @@ CREATE INDEX IF NOT EXISTS idx_mail_packages_thread
     ON mail_packages(account_ref, thread_ref, received_at);
 CREATE INDEX IF NOT EXISTS idx_mail_packages_mailbox
     ON mail_packages(account_ref, mailbox_ref, received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mailboxes_account
+    ON mailboxes(account_id, mailbox_role, external_ref);
 CREATE INDEX IF NOT EXISTS idx_mail_resources_package
     ON mail_resources(package_id, sort_order, id);
 CREATE INDEX IF NOT EXISTS idx_mail_resources_name
@@ -410,11 +473,13 @@ _RECEIVED_MESSAGES_NEW_COLUMNS = {
     "gmail_thread_id": "TEXT",
     "backend": "TEXT",
     "package_id": "TEXT",
+    "account_id": "TEXT",
 }
 
 _RECEIVED_FILES_NEW_COLUMNS = {
     "package_id": "TEXT",
     "resource_id": "TEXT",
+    "account_id": "TEXT",
 }
 
 _SENT_FILES_NEW_COLUMNS = {
@@ -429,6 +494,7 @@ _SENT_FILES_NEW_COLUMNS = {
     "sent_archive_sha256": "TEXT",
     "outbound_id": "TEXT",
     "outbound_resource_id": "TEXT",
+    "from_account_id": "TEXT",
 }
 
 _MCP_CALLS_NEW_COLUMNS = {
@@ -459,11 +525,32 @@ _MAIL_PACKAGES_V13_COLUMNS = {
     "local_outbound": "INTEGER NOT NULL DEFAULT 0",
 }
 
+_MAIL_PACKAGES_V14_COLUMNS = {
+    "account_id": "TEXT",
+    "mailbox_id": "TEXT",
+}
+
+_OUTBOUND_MESSAGES_V14_COLUMNS = {
+    "from_account_id": "TEXT",
+}
+
+_RECEIVE_RULE_EVALUATIONS_V14_COLUMNS = {
+    "account_id": "TEXT",
+}
+
+MULTI_ACCOUNT_MIGRATION_KEY = "multi_account_core_v1"
+MULTI_ACCOUNT_SCHEMA_VERSION = 1
+LEGACY_UNKNOWN_ACCOUNT_ID = stable_account_id("generic", "legacy-unknown")
+
 RECEIVE_RETRY_DELAYS_SECONDS = (60, 300, 1800, 7200)
 RECEIVE_RETRY_TERMINAL_COUNT = 5
 
 
-def init_db(db_path: Path | str) -> None:
+def init_db(
+    db_path: Path | str,
+    *,
+    legacy_accounts: Iterable[MailAccount] | None = None,
+) -> None:
     """初始化数据库文件及所有表。目录不存在会自动创建。
 
     向后兼容：若 received_messages 表已存在但缺少 Gmail API 新增列，
@@ -480,8 +567,13 @@ def init_db(db_path: Path | str) -> None:
             _migrate_sent_files(conn)
             _migrate_mcp_calls(conn)
             _migrate_mail_packages_v13(conn)
+            _migrate_mail_packages_v14(conn)
+            _migrate_outbound_messages_v14(conn)
+            _migrate_receive_rule_evaluations_v14(conn)
+            _migrate_multi_account_core(conn, tuple(legacy_accounts or ()))
             _ensure_unique_indexes(conn)
             _backfill_legacy_outbound_messages(conn)
+            _backfill_multi_account_ownership(conn, tuple(legacy_accounts or ()))
             conn.commit()
         except Exception:
             conn.rollback()
@@ -558,12 +650,413 @@ def _migrate_mail_packages_v13(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE mail_packages ADD COLUMN {col} {col_type}")
 
 
+def _add_missing_columns(
+    conn: sqlite3.Connection, table: str, columns: dict[str, str]
+) -> None:
+    existing = {
+        row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    for column, column_type in columns.items():
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+
+
+def _migrate_mail_packages_v14(conn: sqlite3.Connection) -> None:
+    _add_missing_columns(conn, "mail_packages", _MAIL_PACKAGES_V14_COLUMNS)
+
+
+def _migrate_outbound_messages_v14(conn: sqlite3.Connection) -> None:
+    _add_missing_columns(conn, "outbound_messages", _OUTBOUND_MESSAGES_V14_COLUMNS)
+
+
+def _migrate_receive_rule_evaluations_v14(conn: sqlite3.Connection) -> None:
+    _add_missing_columns(
+        conn, "receive_rule_evaluations", _RECEIVE_RULE_EVALUATIONS_V14_COLUMNS
+    )
+
+
+def _upsert_account_record(conn: sqlite3.Connection, account: MailAccount) -> None:
+    values = account.to_record()
+    now = _now()
+    conn.execute(
+        """
+        INSERT INTO mail_accounts
+            (account_id, provider, email_address, display_name, auth_type,
+             receive_enabled, send_enabled, enabled, data_namespace,
+             capabilities_json, provider_settings_json, source,
+             created_at, updated_at)
+        VALUES (:account_id, :provider, :email_address, :display_name, :auth_type,
+                :receive_enabled, :send_enabled, :enabled, :data_namespace,
+                :capabilities_json, :provider_settings_json, :source,
+                :created_at, :updated_at)
+        ON CONFLICT(account_id) DO UPDATE SET
+            provider=excluded.provider,
+            email_address=excluded.email_address,
+            display_name=excluded.display_name,
+            auth_type=excluded.auth_type,
+            receive_enabled=excluded.receive_enabled,
+            send_enabled=excluded.send_enabled,
+            enabled=excluded.enabled,
+            data_namespace=excluded.data_namespace,
+            capabilities_json=excluded.capabilities_json,
+            provider_settings_json=excluded.provider_settings_json,
+            source=excluded.source,
+            updated_at=excluded.updated_at
+        """,
+        {**values, "created_at": now, "updated_at": now},
+    )
+
+
+def _ensure_account_for_legacy_ref(
+    conn: sqlite3.Connection, account_ref: str | None
+) -> str:
+    provider, address = provider_and_address_from_legacy_ref(account_ref)
+    account_id = stable_account_id(provider, address)
+    existing = conn.execute(
+        "SELECT 1 FROM mail_accounts WHERE account_id = ?", (account_id,)
+    ).fetchone()
+    if existing is not None:
+        return account_id
+    receive_enabled = provider == "gmail"
+    send_enabled = provider == "qq"
+    display_name = {
+        "gmail": "Gmail",
+        "qq": "QQ 邮箱",
+    }.get(provider, provider or "旧邮箱账号")
+    capabilities: list[str] = []
+    if receive_enabled:
+        capabilities.extend(("receive", "archive", "mail_facts"))
+    if send_enabled:
+        capabilities.extend(("send", "outbound_archive"))
+    _upsert_account_record(
+        conn,
+        MailAccount(
+            account_id=account_id,
+            provider=provider,
+            email_address=address,
+            display_name=display_name,
+            auth_type="legacy_unknown",
+            receive_enabled=receive_enabled,
+            send_enabled=send_enabled,
+            data_namespace=account_id,
+            capabilities=tuple(capabilities),
+            source="legacy_database",
+        ),
+    )
+    return account_id
+
+
+def _preferred_account_id(
+    accounts: tuple[MailAccount, ...], capability: str
+) -> str:
+    for account in accounts:
+        if capability == "receive" and account.receive_enabled:
+            return account.account_id
+        if capability == "send" and account.send_enabled:
+            return account.account_id
+    return LEGACY_UNKNOWN_ACCOUNT_ID
+
+
+def _rebuild_received_messages_for_accounts(
+    conn: sqlite3.Connection, default_account_id: str
+) -> None:
+    table_sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'received_messages'"
+    ).fetchone()
+    table_sql = str(table_sql_row["sql"] or "") if table_sql_row else ""
+    if "message_id TEXT UNIQUE" not in table_sql.upper().replace("\n", " "):
+        # SQLite preserves the original casing. A second normalized check covers it.
+        normalized = " ".join(table_sql.casefold().split())
+        if "message_id text unique" not in normalized:
+            return
+    for index_name in (
+        "idx_received_messages_saved_date",
+        "idx_received_messages_package",
+        "ux_received_message_id_nocase",
+        "ux_received_account_message_id",
+    ):
+        conn.execute(f"DROP INDEX IF EXISTS {index_name}")
+    conn.execute("ALTER TABLE received_messages RENAME TO received_messages_v13")
+    conn.execute(
+        """
+        CREATE TABLE received_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id TEXT NOT NULL,
+            gmail_uid TEXT,
+            subject TEXT,
+            from_email TEXT,
+            to_email TEXT,
+            received_at TEXT,
+            saved_date TEXT,
+            body_file_path TEXT,
+            body_sha256 TEXT,
+            has_attachments INTEGER,
+            status TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            source TEXT,
+            gmail_message_id TEXT,
+            gmail_thread_id TEXT,
+            backend TEXT,
+            package_id TEXT,
+            account_id TEXT,
+            UNIQUE(account_id, message_id COLLATE NOCASE)
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO received_messages
+            (id, message_id, gmail_uid, subject, from_email, to_email,
+             received_at, saved_date, body_file_path, body_sha256,
+             has_attachments, status, created_at, updated_at, source,
+             gmail_message_id, gmail_thread_id, backend, package_id, account_id)
+        SELECT id, message_id, gmail_uid, subject, from_email, to_email,
+               received_at, saved_date, body_file_path, body_sha256,
+               has_attachments, status, created_at, updated_at, source,
+               gmail_message_id, gmail_thread_id, backend, package_id,
+               COALESCE(NULLIF(account_id, ''), ?)
+        FROM received_messages_v13
+        """,
+        (default_account_id,),
+    )
+    conn.execute("DROP TABLE received_messages_v13")
+
+
+def _rebuild_receive_retries_for_accounts(
+    conn: sqlite3.Connection, default_account_id: str
+) -> None:
+    columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(receive_retries)")
+    }
+    if "account_id" in columns:
+        return
+    conn.execute("DROP INDEX IF EXISTS idx_receive_retries_next_retry")
+    conn.execute("DROP INDEX IF EXISTS idx_receive_retries_account_due")
+    conn.execute("ALTER TABLE receive_retries RENAME TO receive_retries_v13")
+    conn.execute(
+        """
+        CREATE TABLE receive_retries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id TEXT NOT NULL,
+            backend TEXT NOT NULL,
+            resource_id TEXT NOT NULL,
+            message_id TEXT,
+            attachment_id TEXT NOT NULL DEFAULT '',
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            last_attempt_at TEXT,
+            next_retry_at TEXT,
+            terminal_status TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            UNIQUE (account_id, backend, resource_id, attachment_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO receive_retries
+            (id, account_id, backend, resource_id, message_id, attachment_id,
+             retry_count, last_error, last_attempt_at, next_retry_at,
+             terminal_status, created_at, updated_at)
+        SELECT id, ?, backend, resource_id, message_id, attachment_id,
+               retry_count, last_error, last_attempt_at, next_retry_at,
+               terminal_status, created_at, updated_at
+        FROM receive_retries_v13
+        """,
+        (default_account_id,),
+    )
+    conn.execute("DROP TABLE receive_retries_v13")
+
+
+def _migrate_multi_account_core(
+    conn: sqlite3.Connection, accounts: tuple[MailAccount, ...]
+) -> None:
+    """在 init_db 的同一事务内建立 v1.4 表结构与兼容数据。"""
+    for account in accounts:
+        _upsert_account_record(conn, account)
+    receive_account_id = _preferred_account_id(accounts, "receive")
+    if receive_account_id == LEGACY_UNKNOWN_ACCOUNT_ID:
+        _ensure_account_for_legacy_ref(conn, "generic:legacy-unknown")
+    _rebuild_received_messages_for_accounts(conn, receive_account_id)
+    _rebuild_receive_retries_for_accounts(conn, receive_account_id)
+    _backfill_multi_account_ownership(conn, accounts)
+
+
+def _backfill_multi_account_ownership(
+    conn: sqlite3.Connection, accounts: tuple[MailAccount, ...]
+) -> None:
+    """只补数据库 ownership，不移动文件、不修改 raw.eml 或历史 Hash。"""
+    for account in accounts:
+        _upsert_account_record(conn, account)
+    receive_account_id = _preferred_account_id(accounts, "receive")
+    send_account_id = _preferred_account_id(accounts, "send")
+
+    package_refs = conn.execute(
+        "SELECT DISTINCT account_ref FROM mail_packages"
+    ).fetchall()
+    for row in package_refs:
+        account_ref = str(row["account_ref"] or "")
+        account_id = _ensure_account_for_legacy_ref(conn, account_ref)
+        conn.execute(
+            "UPDATE mail_packages SET account_id = ? "
+            "WHERE account_ref = ? AND (account_id IS NULL OR account_id = '')",
+            (account_id, account_ref),
+        )
+
+    mailbox_rows = conn.execute(
+        "SELECT DISTINCT account_id, mailbox_ref FROM mail_packages "
+        "WHERE account_id IS NOT NULL AND account_id != ''"
+    ).fetchall()
+    for row in mailbox_rows:
+        account_id = str(row["account_id"])
+        mailbox_ref = str(row["mailbox_ref"] or "INBOX")
+        mailbox_id = stable_mailbox_id(account_id, mailbox_ref)
+        now = _now()
+        role = "inbox" if "inbox" in mailbox_ref.casefold() else "other"
+        conn.execute(
+            """
+            INSERT INTO mailboxes
+                (mailbox_id, account_id, external_ref, display_name,
+                 mailbox_role, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+            ON CONFLICT(mailbox_id) DO UPDATE SET
+                external_ref=excluded.external_ref,
+                display_name=excluded.display_name,
+                mailbox_role=excluded.mailbox_role,
+                updated_at=excluded.updated_at
+            """,
+            (mailbox_id, account_id, mailbox_ref, mailbox_ref, role, now, now),
+        )
+        conn.execute(
+            "UPDATE mail_packages SET mailbox_id = ? "
+            "WHERE account_id = ? AND mailbox_ref = ? "
+            "AND (mailbox_id IS NULL OR mailbox_id = '')",
+            (mailbox_id, account_id, mailbox_ref),
+        )
+
+    conn.execute(
+        """
+        UPDATE received_messages
+        SET account_id = COALESCE(
+            (SELECT p.account_id FROM mail_packages p
+             WHERE p.package_id = received_messages.package_id), ?)
+        WHERE account_id IS NULL OR account_id = ''
+        """,
+        (receive_account_id,),
+    )
+    conn.execute(
+        """
+        UPDATE received_files
+        SET account_id = COALESCE(
+            (SELECT p.account_id FROM mail_packages p
+             WHERE p.package_id = received_files.package_id),
+            (SELECT m.account_id FROM received_messages m
+             WHERE m.message_id = received_files.message_id LIMIT 1), ?)
+        WHERE account_id IS NULL OR account_id = ''
+        """,
+        (receive_account_id,),
+    )
+
+    outbound_refs = conn.execute(
+        "SELECT DISTINCT sender_account_ref FROM outbound_messages"
+    ).fetchall()
+    for row in outbound_refs:
+        account_ref = str(row["sender_account_ref"] or "")
+        account_id = _ensure_account_for_legacy_ref(conn, account_ref)
+        conn.execute(
+            "UPDATE outbound_messages SET from_account_id = ? "
+            "WHERE sender_account_ref = ? "
+            "AND (from_account_id IS NULL OR from_account_id = '')",
+            (account_id, account_ref),
+        )
+    conn.execute(
+        """
+        UPDATE sent_files
+        SET from_account_id = COALESCE(
+            (SELECT o.from_account_id FROM outbound_messages o
+             WHERE o.outbound_id = sent_files.outbound_id), ?)
+        WHERE from_account_id IS NULL OR from_account_id = ''
+        """,
+        (send_account_id,),
+    )
+    conn.execute(
+        """
+        UPDATE receive_rule_evaluations
+        SET account_id = COALESCE(
+            (SELECT p.account_id FROM mail_packages p
+             WHERE p.account_ref = receive_rule_evaluations.account_ref LIMIT 1), ?)
+        WHERE account_id IS NULL OR account_id = ''
+        """,
+        (receive_account_id,),
+    )
+
+    legacy_state = conn.execute(
+        "SELECT * FROM auto_receive_state WHERE id = 1"
+    ).fetchone()
+    if legacy_state is not None and receive_account_id:
+        conn.execute(
+            """
+            INSERT INTO account_sync_states
+                (account_id, enabled, interval_seconds, last_check_at,
+                 last_success_at, last_result, last_error,
+                 consecutive_global_failures, next_check_at, checkpoint,
+                 updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(account_id) DO NOTHING
+            """,
+            (
+                receive_account_id, legacy_state["enabled"],
+                legacy_state["interval_seconds"], legacy_state["last_check_at"],
+                legacy_state["last_success_at"], legacy_state["last_result"],
+                legacy_state["last_error"],
+                legacy_state["consecutive_global_failures"],
+                legacy_state["next_check_at"], legacy_state["checkpoint"],
+                legacy_state["updated_at"],
+            ),
+        )
+    now = _now()
+    details = json.dumps(
+        {
+            "accounts": int(
+                conn.execute("SELECT COUNT(*) FROM mail_accounts").fetchone()[0]
+            ),
+            "mailboxes": int(
+                conn.execute("SELECT COUNT(*) FROM mailboxes").fetchone()[0]
+            ),
+            "filesystem_moved": False,
+            "raw_or_hash_rewritten": False,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    conn.execute(
+        """
+        INSERT INTO migration_metadata
+            (migration_key, schema_version, status, details_json,
+             started_at, completed_at, updated_at)
+        VALUES (?, ?, 'completed', ?, ?, ?, ?)
+        ON CONFLICT(migration_key) DO UPDATE SET
+            schema_version=excluded.schema_version,
+            status='completed',
+            details_json=excluded.details_json,
+            completed_at=excluded.completed_at,
+            updated_at=excluded.updated_at
+        """,
+        (
+            MULTI_ACCOUNT_MIGRATION_KEY, MULTI_ACCOUNT_SCHEMA_VERSION,
+            details, now, now, now,
+        ),
+    )
+
+
 def _ensure_unique_indexes(conn: sqlite3.Connection) -> None:
     """数据库层阻止跨后端重复邮件和重复发送请求。"""
     try:
         conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS ux_received_message_id_nocase "
-            "ON received_messages(message_id COLLATE NOCASE)"
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_received_account_message_id "
+            "ON received_messages(account_id, message_id COLLATE NOCASE)"
         )
     except sqlite3.IntegrityError:
         # 旧库若已有仅大小写不同的历史记录，不破坏启动；新写入仍使用归一化键。
@@ -577,8 +1070,16 @@ def _ensure_unique_indexes(conn: sqlite3.Connection) -> None:
         "ON outbound_messages(request_id) WHERE request_id IS NOT NULL"
     )
     conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_received_messages_saved_date "
+        "ON received_messages(saved_date)"
+    )
+    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_received_messages_package "
         "ON received_messages(package_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_received_messages_account "
+        "ON received_messages(account_id, received_at DESC)"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_received_files_package "
@@ -592,6 +1093,23 @@ def _ensure_unique_indexes(conn: sqlite3.Connection) -> None:
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_mail_packages_provider_identity "
         "ON mail_packages(account_ref, backend, provider_message_id) "
         "WHERE provider_message_id IS NOT NULL AND provider_message_id != ''"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_mail_packages_account_message "
+        "ON mail_packages(account_id, message_id COLLATE NOCASE) "
+        "WHERE account_id IS NOT NULL AND account_id != ''"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_mail_packages_account_mailbox "
+        "ON mail_packages(account_id, mailbox_id, received_at DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_outbound_messages_account "
+        "ON outbound_messages(from_account_id, COALESCE(sent_at, created_at) DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_receive_retries_account_due "
+        "ON receive_retries(account_id, next_retry_at)"
     )
 
 
@@ -770,6 +1288,7 @@ def insert_received_message(
     gmail_message_id: str | None = None,
     gmail_thread_id: str | None = None,
     backend: str | None = None,
+    account_id: str | None = None,
 ) -> int | None:
     """插入一条收件记录。若 message_id 已存在则忽略并返回 None。
 
@@ -785,14 +1304,16 @@ def insert_received_message(
                     (message_id, gmail_uid, subject, from_email, to_email,
                      received_at, saved_date, body_file_path, body_sha256,
                      has_attachments, status, created_at, updated_at,
-                     source, gmail_message_id, gmail_thread_id, backend)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     source, gmail_message_id, gmail_thread_id, backend,
+                     account_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     message_id, gmail_uid, subject, from_email, to_email,
                     received_at, saved_date, body_file_path, body_sha256,
                     1 if has_attachments else 0, status, now, now,
                     source, gmail_message_id, gmail_thread_id, backend,
+                    account_id or LEGACY_UNKNOWN_ACCOUNT_ID,
                 ),
             )
             conn.commit()
@@ -802,20 +1323,36 @@ def insert_received_message(
             return None
 
 
-def message_id_exists(db_path: Path | str, message_id: str) -> bool:
+def message_id_exists(
+    db_path: Path | str, message_id: str, *, account_id: str | None = None
+) -> bool:
     """判断某 message_id 是否已记录过（用于去重）。"""
     with _get_conn(db_path) as conn:
         if message_id.startswith("gmail_api:"):
             gmail_message_id = message_id.split(":", 1)[1]
-            row = conn.execute(
-                "SELECT 1 FROM received_messages WHERE gmail_message_id = ? LIMIT 1",
-                (gmail_message_id,),
-            ).fetchone()
+            if account_id:
+                row = conn.execute(
+                    "SELECT 1 FROM received_messages "
+                    "WHERE account_id = ? AND gmail_message_id = ? LIMIT 1",
+                    (account_id, gmail_message_id),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT 1 FROM received_messages WHERE gmail_message_id = ? LIMIT 1",
+                    (gmail_message_id,),
+                ).fetchone()
             return row is not None
-        row = conn.execute(
-            "SELECT 1 FROM received_messages WHERE message_id = ? LIMIT 1",
-            (message_id,),
-        ).fetchone()
+        if account_id:
+            row = conn.execute(
+                "SELECT 1 FROM received_messages "
+                "WHERE account_id = ? AND message_id = ? LIMIT 1",
+                (account_id, message_id),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT 1 FROM received_messages WHERE message_id = ? LIMIT 1",
+                (message_id,),
+            ).fetchone()
         return row is not None
 
 
@@ -839,9 +1376,10 @@ def store_received_message_atomically(
                     (message_id, gmail_uid, subject, from_email, to_email,
                      received_at, saved_date, body_file_path, body_sha256,
                      has_attachments, status, created_at, updated_at,
-                     source, gmail_message_id, gmail_thread_id, backend)
+                     source, gmail_message_id, gmail_thread_id, backend,
+                     account_id)
                 VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, 'processing',
-                        ?, ?, ?, ?, ?, ?)
+                        ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT DO NOTHING
                 """,
                 (
@@ -852,6 +1390,7 @@ def store_received_message_atomically(
                     now, now, message.get("source"),
                     message.get("gmail_message_id"), message.get("gmail_thread_id"),
                     message.get("backend"),
+                    message.get("account_id") or LEGACY_UNKNOWN_ACCOUNT_ID,
                 ),
             )
             if cur.rowcount == 0:
@@ -865,8 +1404,8 @@ def store_received_message_atomically(
                     INSERT INTO received_files
                         (message_id, file_type, original_filename, saved_filename,
                          saved_path, sha256, size_bytes, mime_type, saved_date,
-                         status, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         status, created_at, updated_at, account_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         message["message_id"], item["file_type"],
@@ -874,6 +1413,7 @@ def store_received_message_atomically(
                         item["saved_path"], item.get("sha256"), item["size_bytes"],
                         item.get("mime_type"), message["saved_date"],
                         item.get("status", "normal"), now, now,
+                        message.get("account_id") or LEGACY_UNKNOWN_ACCOUNT_ID,
                     ),
                 )
 
@@ -976,6 +1516,7 @@ def insert_received_file(
     mime_type: str | None,
     saved_date: str,
     status: str = "normal",
+    account_id: str | None = None,
 ) -> int:
     """插入一条收件文件记录（正文或附件）。"""
     now = _now()
@@ -985,13 +1526,13 @@ def insert_received_file(
             INSERT INTO received_files
                 (message_id, file_type, original_filename, saved_filename,
                  saved_path, sha256, size_bytes, mime_type, saved_date,
-                 status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 status, created_at, updated_at, account_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 message_id, file_type, original_filename, saved_filename,
                 saved_path, sha256, size_bytes, mime_type, saved_date,
-                status, now, now,
+                status, now, now, account_id or LEGACY_UNKNOWN_ACCOUNT_ID,
             ),
         )
         conn.commit()
@@ -1009,6 +1550,7 @@ def query_received_files_by_date(
             FROM received_files AS files
             LEFT JOIN received_messages AS messages
                 ON messages.message_id = files.message_id
+               AND messages.account_id = files.account_id
             WHERE files.saved_date = ?
             ORDER BY files.id ASC
             """,
@@ -1018,14 +1560,21 @@ def query_received_files_by_date(
 
 
 def query_received_files_by_message(
-    db_path: Path | str, message_id: str
+    db_path: Path | str, message_id: str, *, account_id: str | None = None
 ) -> list[dict[str, Any]]:
     """查询某封邮件下的所有文件记录。"""
     with _get_conn(db_path) as conn:
-        rows = conn.execute(
-            "SELECT * FROM received_files WHERE message_id = ? ORDER BY id ASC",
-            (message_id,),
-        ).fetchall()
+        if account_id:
+            rows = conn.execute(
+                "SELECT * FROM received_files "
+                "WHERE account_id = ? AND message_id = ? ORDER BY id ASC",
+                (account_id, message_id),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM received_files WHERE message_id = ? ORDER BY id ASC",
+                (message_id,),
+            ).fetchall()
         return [dict(r) for r in rows]
 
 
@@ -1074,6 +1623,7 @@ def query_all_received_files_with_messages(
             FROM received_files AS files
             LEFT JOIN received_messages AS messages
                 ON messages.message_id = files.message_id
+               AND messages.account_id = files.account_id
             ORDER BY files.id DESC
             """
         ).fetchall()
@@ -1118,6 +1668,126 @@ def legacy_archive_backfill_needed(db_path: Path | str) -> bool:
         return package_count < legacy_count
     finally:
         connection.close()
+
+
+def multi_account_migration_needed(db_path: Path | str) -> bool:
+    """只读判断旧库是否需要 v1.4 ownership 迁移，供升级前备份使用。"""
+    path = Path(db_path)
+    if not path.is_file():
+        return False
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    try:
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        if "received_messages" not in tables:
+            return False
+        required_tables = {"mail_accounts", "mailboxes", "account_sync_states"}
+        if not required_tables.issubset(tables):
+            return True
+        for table, column in (
+            ("received_messages", "account_id"),
+            ("received_files", "account_id"),
+            ("sent_files", "from_account_id"),
+            ("mail_packages", "account_id"),
+            ("mail_packages", "mailbox_id"),
+            ("outbound_messages", "from_account_id"),
+            ("receive_retries", "account_id"),
+        ):
+            columns = {
+                str(row[1])
+                for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if column not in columns:
+                return True
+        row = connection.execute(
+            "SELECT status, schema_version FROM migration_metadata "
+            "WHERE migration_key = ?",
+            (MULTI_ACCOUNT_MIGRATION_KEY,),
+        ).fetchone()
+        return not row or row["status"] != "completed" or int(row["schema_version"]) < 1
+    finally:
+        connection.close()
+
+
+def sync_mail_accounts(
+    db_path: Path | str, accounts: Iterable[MailAccount]
+) -> list[dict[str, Any]]:
+    """幂等同步配置映射账号，并补齐仍为空的旧事实 ownership。"""
+    normalized = tuple(accounts)
+    with _get_conn(db_path) as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for account in normalized:
+                _upsert_account_record(conn, account)
+            _backfill_multi_account_ownership(conn, normalized)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return query_mail_accounts(db_path)
+
+
+def query_mail_accounts(
+    db_path: Path | str, *, enabled_only: bool = False
+) -> list[dict[str, Any]]:
+    clause = " WHERE enabled = 1" if enabled_only else ""
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM mail_accounts"
+            f"{clause} ORDER BY receive_enabled DESC, send_enabled DESC, account_id",
+        ).fetchall()
+    result: list[dict[str, Any]] = []
+    for raw in rows:
+        row = dict(raw)
+        for source, target in (
+            ("capabilities_json", "capabilities"),
+            ("provider_settings_json", "provider_settings"),
+        ):
+            try:
+                default_json = "[]" if source == "capabilities_json" else "{}"
+                row[target] = json.loads(str(row.get(source) or default_json))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                row[target] = [] if source == "capabilities_json" else {}
+        row["receive_enabled"] = bool(row.get("receive_enabled"))
+        row["send_enabled"] = bool(row.get("send_enabled"))
+        row["enabled"] = bool(row.get("enabled"))
+        result.append(row)
+    return result
+
+
+def get_mail_account(
+    db_path: Path | str, account_id: str
+) -> dict[str, Any] | None:
+    return next(
+        (
+            item
+            for item in query_mail_accounts(db_path)
+            if item["account_id"] == str(account_id)
+        ),
+        None,
+    )
+
+
+def query_mailboxes(
+    db_path: Path | str, *, account_id: str | None = None
+) -> list[dict[str, Any]]:
+    with _get_conn(db_path) as conn:
+        if account_id:
+            rows = conn.execute(
+                "SELECT * FROM mailboxes WHERE account_id = ? "
+                "ORDER BY mailbox_role, external_ref",
+                (account_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM mailboxes ORDER BY account_id, mailbox_role, external_ref"
+            ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def outbound_mail_migration_needed(db_path: Path | str) -> bool:
@@ -1357,10 +2027,38 @@ def store_mail_archive_atomically(
     with _get_conn(db_path) as conn:
         try:
             conn.execute("BEGIN IMMEDIATE")
+            derived_account_id = _ensure_account_for_legacy_ref(
+                conn, str(package.get("account_ref") or "")
+            )
+            requested_account_id = str(package.get("account_id") or "")
+            account_id = requested_account_id or derived_account_id
+            if conn.execute(
+                "SELECT 1 FROM mail_accounts WHERE account_id = ?", (account_id,)
+            ).fetchone() is None:
+                account_id = derived_account_id
+            mailbox_id = str(package.get("mailbox_id") or "") or stable_mailbox_id(
+                account_id, str(package.get("mailbox_ref") or "INBOX")
+            )
+            mailbox_ref = str(package.get("mailbox_ref") or "INBOX")
+            conn.execute(
+                """
+                INSERT INTO mailboxes
+                    (mailbox_id, account_id, external_ref, display_name,
+                     mailbox_role, enabled, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                ON CONFLICT(mailbox_id) DO UPDATE SET updated_at=excluded.updated_at
+                """,
+                (
+                    mailbox_id, account_id, mailbox_ref, mailbox_ref,
+                    "inbox" if "inbox" in mailbox_ref.casefold() else "other",
+                    created_at, now,
+                ),
+            )
             conn.execute(
                 """
                 INSERT INTO mail_packages
-                    (package_id, account_ref, mailbox_ref, backend, message_id,
+                    (package_id, account_ref, account_id, mailbox_ref, mailbox_id,
+                     backend, message_id,
                      provider_message_id, thread_ref, subject, from_email,
                      to_emails, cc_emails, bcc_emails, from_raw_header,
                      to_raw_header, cc_raw_header, bcc_raw_header,
@@ -1372,7 +2070,8 @@ def store_mail_archive_atomically(
                      resource_count, attachment_count, inline_image_count,
                      link_count, downloaded_count, archive_status, parse_status,
                      last_error, legacy, created_at, updated_at)
-                VALUES (:package_id, :account_ref, :mailbox_ref, :backend,
+                VALUES (:package_id, :account_ref, :account_id, :mailbox_ref,
+                        :mailbox_id, :backend,
                         :message_id, :provider_message_id, :thread_ref, :subject,
                         :from_email, :to_emails, :cc_emails, :bcc_emails,
                         :from_raw_header, :to_raw_header, :cc_raw_header,
@@ -1386,7 +2085,9 @@ def store_mail_archive_atomically(
                         :downloaded_count, :archive_status, :parse_status,
                         :last_error, :legacy, :created_at, :updated_at)
                 ON CONFLICT(package_id) DO UPDATE SET
+                    account_id=excluded.account_id,
                     mailbox_ref=excluded.mailbox_ref,
+                    mailbox_id=excluded.mailbox_id,
                     backend=excluded.backend,
                     provider_message_id=COALESCE(excluded.provider_message_id, mail_packages.provider_message_id),
                     thread_ref=COALESCE(excluded.thread_ref, mail_packages.thread_ref),
@@ -1430,7 +2131,9 @@ def store_mail_archive_atomically(
                 {
                     "package_id": package["package_id"],
                     "account_ref": package["account_ref"],
-                    "mailbox_ref": package["mailbox_ref"],
+                    "account_id": account_id,
+                    "mailbox_ref": mailbox_ref,
+                    "mailbox_id": mailbox_id,
                     "backend": package["backend"],
                     "message_id": package["message_id"],
                     "provider_message_id": package.get("provider_message_id"),
@@ -1519,15 +2222,29 @@ def store_mail_archive_atomically(
                 (item for item in compatibility_files if item["file_type"] == "body"),
                 None,
             )
+            legacy_received_id = package.get("legacy_received_id")
+            if legacy_received_id:
+                conn.execute(
+                    """
+                    UPDATE received_messages
+                    SET account_id = ?, package_id = ?, status = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        account_id, package["package_id"], compatibility_status,
+                        now, int(legacy_received_id),
+                    ),
+                )
             conn.execute(
                 """
                 INSERT INTO received_messages
                     (message_id, gmail_uid, subject, from_email, to_email,
                      received_at, saved_date, body_file_path, body_sha256,
                      has_attachments, status, created_at, updated_at, source,
-                     gmail_message_id, gmail_thread_id, backend, package_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(message_id) DO UPDATE SET
+                     gmail_message_id, gmail_thread_id, backend, package_id,
+                     account_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id, message_id COLLATE NOCASE) DO UPDATE SET
                     package_id=excluded.package_id,
                     body_file_path=COALESCE(received_messages.body_file_path, excluded.body_file_path),
                     body_sha256=COALESCE(received_messages.body_sha256, excluded.body_sha256),
@@ -1544,7 +2261,7 @@ def store_mail_archive_atomically(
                     1 if int(package.get("attachment_count") or 0) else 0,
                     compatibility_status, created_at, now, package.get("backend"),
                     package.get("provider_message_id"), package.get("gmail_thread_id"),
-                    package.get("backend"), package["package_id"],
+                    package.get("backend"), package["package_id"], account_id,
                 ),
             )
 
@@ -1552,8 +2269,12 @@ def store_mail_archive_atomically(
                 legacy_file_id = item.get("legacy_file_id")
                 if legacy_file_id:
                     conn.execute(
-                        "UPDATE received_files SET package_id = ?, resource_id = ?, updated_at = ? WHERE id = ?",
-                        (package["package_id"], item["resource_id"], now, legacy_file_id),
+                        "UPDATE received_files SET package_id = ?, resource_id = ?, "
+                        "account_id = ?, updated_at = ? WHERE id = ?",
+                        (
+                            package["package_id"], item["resource_id"],
+                            account_id, now, legacy_file_id,
+                        ),
                     )
                     continue
                 existing = conn.execute(
@@ -1565,7 +2286,7 @@ def store_mail_archive_atomically(
                     item["saved_filename"], item["saved_path"], item.get("sha256"),
                     item.get("size_bytes"), item.get("mime_type"),
                     package.get("saved_date", ""), item.get("status", "normal"),
-                    package["package_id"], item["resource_id"], now,
+                    package["package_id"], item["resource_id"], account_id, now,
                 )
                 if existing:
                     conn.execute(
@@ -1573,7 +2294,8 @@ def store_mail_archive_atomically(
                         UPDATE received_files SET
                             message_id=?, file_type=?, original_filename=?, saved_filename=?,
                             saved_path=?, sha256=?, size_bytes=?, mime_type=?, saved_date=?,
-                            status=?, package_id=?, resource_id=?, updated_at=? WHERE id=?
+                            status=?, package_id=?, resource_id=?, account_id=?,
+                            updated_at=? WHERE id=?
                         """,
                         (*values, existing["id"]),
                     )
@@ -1583,8 +2305,9 @@ def store_mail_archive_atomically(
                         INSERT INTO received_files
                             (message_id, file_type, original_filename, saved_filename,
                              saved_path, sha256, size_bytes, mime_type, saved_date,
-                             status, package_id, resource_id, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             status, package_id, resource_id, account_id,
+                             created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (*values[:-1], now, now),
                     )
@@ -1693,6 +2416,7 @@ def insert_sent_file(
     sent_archive_sha256: str | None = None,
     outbound_id: str | None = None,
     outbound_resource_id: str | None = None,
+    from_account_id: str | None = None,
 ) -> int:
     """插入一条发送记录（成功或失败均可记录）。"""
     now = _now()
@@ -1705,8 +2429,8 @@ def insert_sent_file(
                  error_message, original_filename, size_bytes, source_origin,
                  source_sha256, staged_sha256, attachment_sha256,
                  sent_archive_sha256, outbound_id, outbound_resource_id,
-                 created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 created_at, updated_at, from_account_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 request_id, attempt_count, source_path, send_copy_path, sent_copy_path, sha256,
@@ -1714,7 +2438,7 @@ def insert_sent_file(
                 error_message, original_filename, size_bytes, source_origin,
                 source_sha256, staged_sha256, attachment_sha256,
                 sent_archive_sha256, outbound_id, outbound_resource_id,
-                now, now,
+                now, now, from_account_id or stable_account_id("qq", from_email),
             ),
         )
         conn.commit()
@@ -1746,6 +2470,7 @@ def create_or_retry_send_attempt(
     source_origin: str = "controlled",
     source_sha256: str | None = None,
     staged_sha256: str | None = None,
+    from_account_id: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """创建发送尝试；失败记录可重试，已发送记录按重复返回。"""
     now = _now()
@@ -1766,10 +2491,11 @@ def create_or_retry_send_attempt(
                     SET status = 'attempt_created', error_message = NULL,
                         attempt_count = attempt_count + 1,
                         source_sha256 = COALESCE(?, source_sha256),
-                        staged_sha256 = COALESCE(?, staged_sha256), updated_at = ?
+                        staged_sha256 = COALESCE(?, staged_sha256),
+                        from_account_id = COALESCE(?, from_account_id), updated_at = ?
                     WHERE request_id = ?
                     """,
-                    (source_sha256, staged_sha256, now, request_id),
+                    (source_sha256, staged_sha256, from_account_id, now, request_id),
                 )
                 conn.commit()
                 return "retry", get_send_by_request_id(db_path, request_id) or current
@@ -1779,13 +2505,15 @@ def create_or_retry_send_attempt(
                 INSERT INTO sent_files
                     (request_id, attempt_count, source_path, sha256, subject,
                      from_email, to_email, status, original_filename, size_bytes,
-                     source_origin, source_sha256, staged_sha256, created_at, updated_at)
-                VALUES (?, 1, ?, ?, ?, ?, ?, 'attempt_created', ?, ?, ?, ?, ?, ?, ?)
+                     source_origin, source_sha256, staged_sha256, from_account_id,
+                     created_at, updated_at)
+                VALUES (?, 1, ?, ?, ?, ?, ?, 'attempt_created', ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     request_id, source_path, sha256, subject, from_email, to_email,
                     original_filename, size_bytes, source_origin,
-                    source_sha256, staged_sha256, now, now,
+                    source_sha256, staged_sha256,
+                    from_account_id or stable_account_id("qq", from_email), now, now,
                 ),
             )
             conn.commit()
@@ -2106,6 +2834,7 @@ def create_outbound_message(
     *,
     outbound_id: str,
     sender_account_ref: str,
+    from_account_id: str | None = None,
     sender_ref: str,
     source_origin: str,
     request_id: str | None,
@@ -2123,14 +2852,16 @@ def create_outbound_message(
         conn.execute(
             """
             INSERT OR IGNORE INTO outbound_messages
-                (outbound_id, sender_account_ref, sender_ref, source_origin,
+                (outbound_id, sender_account_ref, from_account_id, sender_ref, source_origin,
                  request_id, subject, body_text, to_emails, status, error,
                  attachment_count, link_count, legacy_limited,
                  created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
             """,
             (
-                outbound_id, sender_account_ref, sender_ref, source_origin,
+                outbound_id, sender_account_ref,
+                from_account_id or _ensure_account_for_legacy_ref(conn, sender_account_ref),
+                sender_ref, source_origin,
                 request_id, subject, body_text,
                 json.dumps(to_emails, ensure_ascii=False), status, error,
                 int(attachment_count), int(link_count), now, now,
@@ -2319,14 +3050,25 @@ def backfill_legacy_outbound_messages(db_path: Path | str) -> dict[str, int]:
 # auto_receive_state / receive_retries
 # ============================================================
 
-def get_auto_receive_state(db_path: Path | str) -> dict[str, Any]:
+def get_auto_receive_state(
+    db_path: Path | str, *, account_id: str | None = None
+) -> dict[str, Any]:
     """读取持久化调度状态；首次使用返回健康的默认状态。"""
     with _get_conn(db_path) as conn:
-        row = conn.execute("SELECT * FROM auto_receive_state WHERE id = 1").fetchone()
+        row = (
+            conn.execute(
+                "SELECT * FROM account_sync_states WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            if account_id
+            else conn.execute("SELECT * FROM auto_receive_state WHERE id = 1").fetchone()
+        )
         if row is not None:
-            return dict(row)
+            result = dict(row)
+            result.setdefault("id", 1)
+            return result
     return {
-        "id": 1,
+        "id": 1, "account_id": account_id,
         "enabled": 0,
         "interval_seconds": 60,
         "last_check_at": None,
@@ -2342,6 +3084,8 @@ def get_auto_receive_state(db_path: Path | str) -> dict[str, Any]:
 
 def save_auto_receive_state(
     db_path: Path | str,
+    *,
+    account_id: str | None = None,
     **changes: Any,
 ) -> dict[str, Any]:
     """以白名单字段更新单行调度状态，跨重启保留真实运行事实。"""
@@ -2351,7 +3095,7 @@ def save_auto_receive_state(
         "next_check_at", "checkpoint",
     }
     values = {key: value for key, value in changes.items() if key in allowed}
-    current = get_auto_receive_state(db_path)
+    current = get_auto_receive_state(db_path, account_id=account_id)
     current.update(values)
     now = _now()
     with _get_conn(db_path) as conn:
@@ -2383,8 +3127,46 @@ def save_auto_receive_state(
                 current.get("next_check_at"), current.get("checkpoint"), now,
             ),
         )
+        target_account_ids = [account_id] if account_id else [
+            str(row["account_id"])
+            for row in conn.execute(
+                "SELECT account_id FROM mail_accounts "
+                "WHERE receive_enabled = 1 AND enabled = 1"
+            ).fetchall()
+        ]
+        for target_account_id in filter(None, target_account_ids):
+            conn.execute(
+                """
+                INSERT INTO account_sync_states
+                    (account_id, enabled, interval_seconds, last_check_at,
+                     last_success_at, last_result, last_error,
+                     consecutive_global_failures, next_check_at, checkpoint,
+                     updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id) DO UPDATE SET
+                    enabled=excluded.enabled,
+                    interval_seconds=excluded.interval_seconds,
+                    last_check_at=excluded.last_check_at,
+                    last_success_at=excluded.last_success_at,
+                    last_result=excluded.last_result,
+                    last_error=excluded.last_error,
+                    consecutive_global_failures=excluded.consecutive_global_failures,
+                    next_check_at=excluded.next_check_at,
+                    checkpoint=excluded.checkpoint,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    target_account_id,
+                    1 if current.get("enabled") else 0,
+                    max(30, int(current.get("interval_seconds") or 60)),
+                    current.get("last_check_at"), current.get("last_success_at"),
+                    current.get("last_result"), current.get("last_error"),
+                    max(0, int(current.get("consecutive_global_failures") or 0)),
+                    current.get("next_check_at"), current.get("checkpoint"), now,
+                ),
+            )
         conn.commit()
-    return get_auto_receive_state(db_path)
+    return get_auto_receive_state(db_path, account_id=account_id)
 
 
 def get_receive_retry(
@@ -2392,15 +3174,37 @@ def get_receive_retry(
     backend: str,
     resource_id: str,
     attachment_id: str = "",
+    *,
+    account_id: str | None = None,
 ) -> dict[str, Any] | None:
+    owner = account_id or LEGACY_UNKNOWN_ACCOUNT_ID
     with _get_conn(db_path) as conn:
         row = conn.execute(
             """
             SELECT * FROM receive_retries
-            WHERE backend = ? AND resource_id = ? AND attachment_id = ?
+            WHERE account_id = ? AND backend = ? AND resource_id = ? AND attachment_id = ?
             """,
-            (backend, resource_id, attachment_id),
+            (owner, backend, resource_id, attachment_id),
         ).fetchone()
+        if row is None and account_id and owner != LEGACY_UNKNOWN_ACCOUNT_ID:
+            row = conn.execute(
+                """
+                SELECT * FROM receive_retries
+                WHERE account_id = ? AND backend = ? AND resource_id = ?
+                  AND attachment_id = ?
+                """,
+                (LEGACY_UNKNOWN_ACCOUNT_ID, backend, resource_id, attachment_id),
+            ).fetchone()
+        if row is None and account_id is None:
+            # v1.3 兼容调用没有 account_id；仅用于旧代码/测试读取任一匹配项。
+            row = conn.execute(
+                """
+                SELECT * FROM receive_retries
+                WHERE backend = ? AND resource_id = ? AND attachment_id = ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (backend, resource_id, attachment_id),
+            ).fetchone()
         return dict(row) if row else None
 
 
@@ -2410,10 +3214,13 @@ def receive_retry_is_due(
     resource_id: str,
     *,
     attachment_id: str = "",
+    account_id: str | None = None,
     now: datetime | None = None,
 ) -> bool:
     """终态或未到 next_retry_at 的坏资源不会污染每轮轮询。"""
-    row = get_receive_retry(db_path, backend, resource_id, attachment_id)
+    row = get_receive_retry(
+        db_path, backend, resource_id, attachment_id, account_id=account_id
+    )
     if row is None:
         return True
     if row.get("terminal_status"):
@@ -2434,19 +3241,26 @@ def query_due_receive_retries(
     *,
     now: datetime | None = None,
     limit: int = 100,
+    account_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return non-terminal retry resources even after they leave the overlap window."""
     now_text = fmt_datetime(now or now_local())
+    owner = account_id or LEGACY_UNKNOWN_ACCOUNT_ID
+    owners = (
+        (owner, LEGACY_UNKNOWN_ACCOUNT_ID)
+        if account_id and owner != LEGACY_UNKNOWN_ACCOUNT_ID
+        else (owner, owner)
+    )
     with _get_conn(db_path) as conn:
         rows = conn.execute(
             """
             SELECT * FROM receive_retries
-            WHERE backend = ? AND terminal_status IS NULL
+            WHERE account_id IN (?, ?) AND backend = ? AND terminal_status IS NULL
               AND (next_retry_at IS NULL OR next_retry_at <= ?)
             ORDER BY COALESCE(next_retry_at, last_attempt_at) ASC, id ASC
             LIMIT ?
             """,
-            (backend, now_text, max(1, int(limit))),
+            (*owners, backend, now_text, max(1, int(limit))),
         ).fetchall()
     return [dict(row) for row in rows]
 
@@ -2459,11 +3273,15 @@ def record_receive_failure(
     error: str,
     message_id: str | None = None,
     attachment_id: str = "",
+    account_id: str | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """记录单邮件或单附件有限重试，连接级失败不进入此表。"""
     attempted_at = now or now_local()
-    previous = get_receive_retry(db_path, backend, resource_id, attachment_id)
+    owner = account_id or LEGACY_UNKNOWN_ACCOUNT_ID
+    previous = get_receive_retry(
+        db_path, backend, resource_id, attachment_id, account_id=owner
+    )
     retry_count = int(previous.get("retry_count") or 0) + 1 if previous else 1
     terminal = "needs_attention" if retry_count >= RECEIVE_RETRY_TERMINAL_COUNT else None
     if terminal:
@@ -2475,14 +3293,22 @@ def record_receive_failure(
         )
     attempted_text = fmt_datetime(attempted_at)
     with _get_conn(db_path) as conn:
+        if (
+            previous
+            and str(previous.get("account_id") or "") == LEGACY_UNKNOWN_ACCOUNT_ID
+            and owner != LEGACY_UNKNOWN_ACCOUNT_ID
+        ):
+            conn.execute(
+                "DELETE FROM receive_retries WHERE id = ?", (previous["id"],)
+            )
         conn.execute(
             """
             INSERT INTO receive_retries
-                (backend, resource_id, message_id, attachment_id, retry_count,
+                (account_id, backend, resource_id, message_id, attachment_id, retry_count,
                  last_error, last_attempt_at, next_retry_at, terminal_status,
                  created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(backend, resource_id, attachment_id) DO UPDATE SET
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(account_id, backend, resource_id, attachment_id) DO UPDATE SET
                 message_id=COALESCE(excluded.message_id, receive_retries.message_id),
                 retry_count=excluded.retry_count,
                 last_error=excluded.last_error,
@@ -2492,7 +3318,7 @@ def record_receive_failure(
                 updated_at=excluded.updated_at
             """,
             (
-                backend, resource_id, message_id, attachment_id, retry_count,
+                owner, backend, resource_id, message_id, attachment_id, retry_count,
                 error[:2000], attempted_text, next_retry_at, terminal,
                 attempted_text, attempted_text,
             ),
@@ -2502,18 +3328,22 @@ def record_receive_failure(
                 """
                 UPDATE mail_packages
                 SET archive_status = 'needs_attention', updated_at = ?
-                WHERE message_id = ? COLLATE NOCASE OR provider_message_id = ?
+                WHERE account_id = ? AND (
+                    message_id = ? COLLATE NOCASE OR provider_message_id = ?)
                 """,
-                (attempted_text, message_id, resource_id),
+                (attempted_text, owner, message_id, resource_id),
             )
         conn.commit()
-    return get_receive_retry(db_path, backend, resource_id, attachment_id) or {}
+    return get_receive_retry(
+        db_path, backend, resource_id, attachment_id, account_id=owner
+    ) or {}
 
 
 def record_receive_rule_evaluation(
     db_path: Path | str,
     *,
     account_ref: str,
+    account_id: str | None = None,
     backend: str,
     provider_message_id: str,
     message_id: str | None,
@@ -2529,10 +3359,10 @@ def record_receive_rule_evaluation(
         conn.execute(
             """
             INSERT INTO receive_rule_evaluations
-                (account_ref, backend, provider_message_id, message_id,
+                (account_ref, account_id, backend, provider_message_id, message_id,
                  evaluated_at, result, reason, rule_fingerprint, scan_id,
                  created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(account_ref, backend, provider_message_id) DO UPDATE SET
                 message_id=excluded.message_id,
                 evaluated_at=excluded.evaluated_at,
@@ -2543,7 +3373,9 @@ def record_receive_rule_evaluation(
                 updated_at=excluded.updated_at
             """,
             (
-                account_ref, backend, provider_message_id, message_id,
+                account_ref,
+                account_id or stable_account_id(*provider_and_address_from_legacy_ref(account_ref)),
+                backend, provider_message_id, message_id,
                 now_text, result, reason, rule_fingerprint, scan_id,
                 now_text, now_text,
             ),
@@ -2579,24 +3411,38 @@ def clear_receive_retry(
     backend: str,
     resource_id: str,
     attachment_id: str = "",
+    *,
+    account_id: str | None = None,
 ) -> None:
     with _get_conn(db_path) as conn:
         conn.execute(
-            "DELETE FROM receive_retries WHERE backend = ? AND resource_id = ? AND attachment_id = ?",
-            (backend, resource_id, attachment_id),
+            "DELETE FROM receive_retries WHERE account_id IN (?, ?) AND backend = ? "
+            "AND resource_id = ? AND attachment_id = ?",
+            (
+                account_id or LEGACY_UNKNOWN_ACCOUNT_ID,
+                LEGACY_UNKNOWN_ACCOUNT_ID,
+                backend, resource_id, attachment_id,
+            ),
         )
         conn.commit()
 
 
-def count_receive_retries(db_path: Path | str) -> dict[str, int]:
+def count_receive_retries(
+    db_path: Path | str, *, account_id: str | None = None
+) -> dict[str, int]:
     with _get_conn(db_path) as conn:
+        where = " WHERE account_id IN (?, ?)" if account_id else ""
+        params: tuple[Any, ...] = (
+            (account_id, LEGACY_UNKNOWN_ACCOUNT_ID) if account_id else ()
+        )
         row = conn.execute(
             """
             SELECT
                 SUM(CASE WHEN terminal_status IS NULL THEN 1 ELSE 0 END) AS pending,
                 SUM(CASE WHEN terminal_status = 'needs_attention' THEN 1 ELSE 0 END) AS needs_attention
             FROM receive_retries
-            """
+            """ + where,
+            params,
         ).fetchone()
     return {
         "pending": int(row["pending"] or 0),

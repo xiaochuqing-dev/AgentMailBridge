@@ -64,8 +64,8 @@ def test_add_account_is_a_future_extension_demo(v1_qt_app):
     v1_qt_app.processEvents()
     text = _all_text(dialog)
     assert "未来邮箱扩展入口" in text
-    assert "暂不支持新增第二个同类型账号" in text
-    assert "通过左侧 Gmail 账号卡片管理已有账号" in text
+    assert "暂不开放新增第二个同类型账号" in text
+    assert "通过左侧账号卡片管理" in text
     assert not hasattr(dialog, "selected_type")
     dialog.close()
 

@@ -359,7 +359,7 @@ def _validate_tool_arguments(tool_name: str, arguments: dict[str, Any]) -> str |
             "query", "time_scope", "recent_days", "date_from", "date_to",
             "subject", "sender", "recipient", "has_attachments", "status",
             "sort", "limit", "offset", "ensure_fresh", "allow_cached",
-            "account_ref", "mailbox_ref",
+            "account_id", "account_ref", "mailbox_ref",
         },
         "get_mail": {"mail_id", "package_id", "offset", "max_chars"},
         "read_mail_resource": {
@@ -461,6 +461,7 @@ def _search_mails_tool() -> dict[str, Any]:
         "description": (
             "按最新、今天、昨天、最近若干天或日期范围搜索已归档邮件。query 使用多词 AND，"
             "覆盖主题、发件人、收件人、抄送、完整可读正文、附件/图片名、链接文字、域名、URL 和自然状态。"
+            "默认搜索全部已归档账号，也可用稳定 account_id 限定账号。"
             "可用 latest + newest + limit=1 读取最新邮件；ensure_fresh=true 会在需要时受控同步。"
         ),
         "annotations": _tool_annotations(
@@ -484,7 +485,8 @@ def _search_mails_tool() -> dict[str, Any]:
                 "offset": {"type": "integer", "minimum": 0, "default": 0},
                 "ensure_fresh": {"type": "boolean", "default": False},
                 "allow_cached": {"type": "boolean", "default": True},
-                "account_ref": {"type": "string"},
+                "account_id": {"type": "string", "description": "统一账号模型的稳定账号 ID"},
+                "account_ref": {"type": "string", "description": "v1.3 兼容字段；新调用优先使用 account_id"},
                 "mailbox_ref": {"type": "string"},
             },
             "additionalProperties": False,
