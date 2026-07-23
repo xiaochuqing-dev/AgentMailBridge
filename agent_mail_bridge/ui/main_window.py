@@ -2610,11 +2610,13 @@ class BridgeWindow(QMainWindow):
         colors = {
             "gmail": "#EA4335",
             "qq": "#21A4E8",
+            "163": "#D9483B",
             "generic_imap_smtp": "#6F7585",
         }
         names = {
             "gmail": "Gmail",
             "qq": "QQ 邮箱",
+            "163": "163 邮箱",
             "generic_imap_smtp": "Generic 邮箱",
         }
         for account in accounts:
@@ -2628,7 +2630,7 @@ class BridgeWindow(QMainWindow):
             if account.get("send_enabled"):
                 capabilities.append("发件")
             if not capabilities and provider == "generic_imap_smtp":
-                capabilities.append("连接测试与目录发现")
+                capabilities.append("按配置启用收件 / 发件")
             capability_text = "当前能力：" + " · ".join(
                 capabilities or ["尚未接通"]
             )

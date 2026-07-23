@@ -544,7 +544,7 @@ _MAIL_ACCOUNTS_V141_COLUMNS = {
 }
 
 MULTI_ACCOUNT_MIGRATION_KEY = "multi_account_core_v1"
-MULTI_ACCOUNT_SCHEMA_VERSION = 2
+MULTI_ACCOUNT_SCHEMA_VERSION = 3
 LEGACY_UNKNOWN_ACCOUNT_ID = stable_account_id("generic", "legacy-unknown")
 
 RECEIVE_RETRY_DELAYS_SECONDS = (60, 300, 1800, 7200)
@@ -880,14 +880,103 @@ def _migrate_multi_account_core(
     conn: sqlite3.Connection, accounts: tuple[MailAccount, ...]
 ) -> None:
     """在 init_db 的同一事务内建立 v1.4 表结构与兼容数据。"""
+    metadata = conn.execute(
+        "SELECT schema_version FROM migration_metadata WHERE migration_key = ?",
+        (MULTI_ACCOUNT_MIGRATION_KEY,),
+    ).fetchone()
+    previous_version = int(metadata["schema_version"]) if metadata else 0
     for account in accounts:
         _upsert_account_record(conn, account)
+    if previous_version < 3:
+        _upgrade_provider_runtime_v142(conn)
     receive_account_id = _preferred_account_id(accounts, "receive")
     if receive_account_id == LEGACY_UNKNOWN_ACCOUNT_ID:
         _ensure_account_for_legacy_ref(conn, "generic:legacy-unknown")
     _rebuild_received_messages_for_accounts(conn, receive_account_id)
     _rebuild_receive_retries_for_accounts(conn, receive_account_id)
     _backfill_multi_account_ownership(conn, accounts)
+
+
+def _upgrade_provider_runtime_v142(conn: sqlite3.Connection) -> None:
+    """一次性开放共享 IMAP/SMTP Core，不覆盖后续用户启停选择。"""
+    now = _now()
+    full_capabilities = (
+        "archive",
+        "folder_discovery",
+        "imap",
+        "mail_facts",
+        "outbound_archive",
+        "receive",
+        "send",
+        "smtp",
+    )
+    for row in conn.execute(
+        "SELECT account_id, provider, provider_settings_json "
+        "FROM mail_accounts WHERE removed_at IS NULL "
+        "AND provider IN ('qq', 'generic_imap_smtp')"
+    ).fetchall():
+        provider = str(row["provider"])
+        try:
+            settings = json.loads(str(row["provider_settings_json"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            settings = {}
+        if provider == "qq":
+            settings = {
+                "profile_id": "qq",
+                "imap_host": "imap.qq.com",
+                "imap_port": 993,
+                "imap_security": "ssl",
+                "smtp_host": "smtp.qq.com",
+                "smtp_port": 465,
+                "smtp_security": "ssl",
+                "inbox_name": "INBOX",
+                "uid_overlap": 10,
+                **settings,
+            }
+            receive_enabled = 1
+            send_enabled = 1
+            capabilities = full_capabilities
+        else:
+            receive_enabled = 1 if settings.get("imap_host") else 0
+            send_enabled = 1 if settings.get("smtp_host") else 0
+            capabilities = tuple(
+                item
+                for item in full_capabilities
+                if (
+                    item not in {"receive", "archive", "mail_facts", "imap", "folder_discovery"}
+                    or receive_enabled
+                )
+                and (
+                    item not in {"send", "smtp", "outbound_archive"}
+                    or send_enabled
+                )
+            )
+        conn.execute(
+            """
+            UPDATE mail_accounts
+            SET receive_enabled = ?, send_enabled = ?,
+                capabilities_json = ?, provider_settings_json = ?,
+                updated_at = ?
+            WHERE account_id = ?
+            """,
+            (
+                receive_enabled,
+                send_enabled,
+                json.dumps(
+                    capabilities,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                json.dumps(
+                    settings,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                now,
+                str(row["account_id"]),
+            ),
+        )
 
 
 def _backfill_multi_account_ownership(

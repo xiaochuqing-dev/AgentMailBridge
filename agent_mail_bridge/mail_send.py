@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import mimetypes
 import hashlib
+import socket
 import smtplib
 import ssl
 import uuid
@@ -25,7 +26,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from agent_mail_bridge.config import AppConfig, ConfigError, require_send_config
+from agent_mail_bridge.config import (
+    AppConfig,
+    ConfigError,
+    effective_outgoing_runtime,
+    require_send_config,
+)
 from agent_mail_bridge.database import (
     create_outbound_message,
     create_or_retry_send_attempt,
@@ -39,6 +45,7 @@ from agent_mail_bridge.database import (
     update_send_attempt,
 )
 from agent_mail_bridge.logging_setup import get_logger
+from agent_mail_bridge.mail_accounts import current_send_account_id
 from agent_mail_bridge.receive_rules import invalid_sender_rules
 from agent_mail_bridge.security import (
     SecurityError,
@@ -67,7 +74,11 @@ OUTBOUND_ID_HEADER = "X-AgentMailBridge-Outbound-ID"
 
 def _sender_account_ref(cfg: AppConfig) -> str:
     provider = str(getattr(cfg, "runtime_provider", "") or "qq").strip().casefold()
-    return f"{provider}:{cfg.qq_email.strip().casefold() or 'unconfigured'}"
+    return f"{provider}:{_smtp_sender(cfg).casefold() or 'unconfigured'}"
+
+
+def _smtp_sender(cfg: AppConfig) -> str:
+    return effective_outgoing_runtime(cfg).username.strip()
 
 
 def _outbound_id_for_request(request_id: str) -> str:
@@ -191,7 +202,8 @@ def send_file_to_owner_gmail(
         cfg.db_path,
         outbound_id=outbound_id,
         sender_account_ref=_sender_account_ref(cfg),
-        sender_ref=cfg.qq_email,
+        from_account_id=current_send_account_id(cfg),
+        sender_ref=_smtp_sender(cfg),
         source_origin="legacy_file_api",
         request_id=None,
         subject=subject,
@@ -246,7 +258,7 @@ def send_file_to_owner_gmail(
         sent_copy_path=str(sent_copy_path),
         sha256=sha,
         subject=subject,
-        from_email=cfg.qq_email,
+        from_email=_smtp_sender(cfg),
         to_email=cfg.owner_gmail,
         sent_at=sent_at,
         status="sent",
@@ -259,6 +271,7 @@ def send_file_to_owner_gmail(
         attachment_sha256=sha256_of_file(send_copy_path),
         sent_archive_sha256=sha256_of_file(sent_copy_path),
         outbound_id=outbound_id,
+        from_account_id=current_send_account_id(cfg),
     )
     update_outbound_message(
         cfg.db_path, outbound_id, status="sent", sent_at=sent_at, error=None
@@ -370,7 +383,8 @@ def send_outbound_mail(
         cfg.db_path,
         outbound_id=mail_id,
         sender_account_ref=_sender_account_ref(cfg),
-        sender_ref=cfg.qq_email,
+        from_account_id=current_send_account_id(cfg),
+        sender_ref=_smtp_sender(cfg),
         source_origin=source_origin,
         request_id=None,
         subject=actual_subject,
@@ -465,13 +479,14 @@ def send_outbound_mail(
                 cfg.db_path,
                 source_path=str(item["path"]), send_copy_path=str(item["staged_path"]),
                 sent_copy_path=None, sha256=item["sha256"], subject=actual_subject,
-                from_email=cfg.qq_email, to_email=target_recipient, sent_at=None,
+                from_email=_smtp_sender(cfg), to_email=target_recipient, sent_at=None,
                 status="failed", error_message=error,
                 original_filename=item["display_name"], size_bytes=item["size_bytes"],
                 source_origin=source_origin, source_sha256=item["sha256"],
                 staged_sha256=item["staged_sha256"],
                 attachment_sha256=item["staged_sha256"],
                 outbound_id=mail_id, outbound_resource_id=item["resource_id"],
+                from_account_id=current_send_account_id(cfg),
             )
         return {
             **_send_error_result("", f"smtp_{stage}_failed", error),
@@ -516,7 +531,7 @@ def send_outbound_mail(
             source_path=str(item["path"]), send_copy_path=str(item["staged_path"]),
             sent_copy_path=str(archive_path) if str(archive_path) not in {"", "."} else None,
             sha256=item["sha256"], subject=actual_subject,
-            from_email=cfg.qq_email, to_email=target_recipient, sent_at=sent_at,
+            from_email=_smtp_sender(cfg), to_email=target_recipient, sent_at=sent_at,
             status=resource_status, error_message=resource_error,
             original_filename=item["display_name"], size_bytes=item["size_bytes"],
             source_origin=source_origin, source_sha256=item["sha256"],
@@ -524,6 +539,7 @@ def send_outbound_mail(
             attachment_sha256=item["staged_sha256"],
             sent_archive_sha256=archive_sha or None,
             outbound_id=mail_id, outbound_resource_id=item["resource_id"],
+            from_account_id=current_send_account_id(cfg),
         )
 
     final_status = "partial" if archive_errors else "sent"
@@ -580,7 +596,7 @@ def _build_outbound_email(
     outbound_id: str,
 ) -> EmailMessage:
     message = EmailMessage()
-    message["From"] = cfg.qq_email
+    message["From"] = _smtp_sender(cfg)
     message["To"] = normalize_manual_recipient(recipient)
     message["Subject"] = subject
     message["Date"] = formatdate(localtime=True)
@@ -633,7 +649,7 @@ def _build_email(
     - 其他类型：正文写简单说明，文件作为附件。
     """
     msg = EmailMessage()
-    msg["From"] = cfg.qq_email
+    msg["From"] = _smtp_sender(cfg)
     msg["To"] = cfg.owner_gmail
     msg["Subject"] = subject
     msg["Date"] = formatdate(localtime=True)
@@ -654,7 +670,7 @@ def _build_email(
         msg.set_content(
             f"这是 Agent Mail Bridge 发送的文件：{source_name}。\n"
             f"请查看附件。\n\n"
-            f"发件身份：{cfg.qq_email}\n"
+            f"发件身份：{_smtp_sender(cfg)}\n"
             f"接收邮箱：{cfg.owner_gmail}\n"
         )
 
@@ -681,44 +697,101 @@ def _build_email(
 # ============================================================
 
 def _smtp_send(cfg: AppConfig, msg: EmailMessage) -> None:
-    """使用 QQ SMTP SSL 发送邮件。"""
-    ctx = ssl.create_default_context()
-    # 连接超时直接传给底层 SMTP_SSL，单位为秒。
-    with smtplib.SMTP_SSL(
-        cfg.qq_smtp_host,
-        cfg.qq_smtp_port,
-        timeout=cfg.qq_smtp_connect_timeout,
-        context=ctx,
-    ) as server:
-        server.login(cfg.qq_email, cfg.qq_auth_code)
-        server.send_message(msg)
-    logger.info("SMTP 发送完成")
+    """使用账号级 Provider-neutral SMTP 发送邮件。"""
+    _smtp_send_with_stage(cfg, msg)
 
 
 def _smtp_send_with_stage(cfg: AppConfig, msg: EmailMessage) -> None:
     """分阶段执行 SMTP，便于 GUI 给出准确错误。"""
+    outgoing = effective_outgoing_runtime(cfg)
+    if outgoing.security not in {"ssl", "starttls"}:
+        raise SmtpStageError("tls", "SMTP 只允许 SSL/TLS 或 STARTTLS")
     context = ssl.create_default_context()
     try:
-        server = smtplib.SMTP_SSL(
-            cfg.qq_smtp_host, cfg.qq_smtp_port,
-            timeout=cfg.qq_smtp_connect_timeout, context=context,
-        )
+        if outgoing.security == "ssl":
+            server = smtplib.SMTP_SSL(
+                outgoing.host,
+                outgoing.port,
+                timeout=outgoing.connect_timeout,
+                context=context,
+            )
+        else:
+            server = smtplib.SMTP(
+                outgoing.host,
+                outgoing.port,
+                timeout=outgoing.connect_timeout,
+            )
     except Exception as exc:  # noqa: BLE001
-        raise SmtpStageError("connect", f"QQ SMTP 连接失败：{exc}") from exc
+        stage = _classify_smtp_error(exc, default_stage="connect")
+        raise SmtpStageError(stage, _smtp_error_message(stage)) from exc
     try:
         try:
-            server.login(cfg.qq_email, cfg.qq_auth_code)
+            server.ehlo()
+            if outgoing.security == "starttls":
+                server.starttls(context=context)
+                server.ehlo()
         except Exception as exc:  # noqa: BLE001
-            raise SmtpStageError("auth", f"QQ SMTP 认证失败：{exc}") from exc
+            stage = _classify_smtp_error(exc, default_stage="tls")
+            raise SmtpStageError(stage, _smtp_error_message(stage)) from exc
         try:
-            server.send_message(msg)
+            server.login(outgoing.username, outgoing.secret)
         except Exception as exc:  # noqa: BLE001
-            raise SmtpStageError("send", f"QQ SMTP 发送失败：{exc}") from exc
+            stage = _classify_smtp_error(exc, default_stage="auth")
+            raise SmtpStageError(stage, _smtp_error_message(stage)) from exc
+        try:
+            server.send_message(
+                msg,
+                from_addr=outgoing.username,
+                to_addrs=[str(msg.get("To") or "")],
+            )
+        except Exception as exc:  # noqa: BLE001
+            stage = _classify_smtp_error(exc, default_stage="send")
+            raise SmtpStageError(stage, _smtp_error_message(stage)) from exc
     finally:
         try:
             server.quit()
         except Exception:
-            pass
+            try:
+                server.close()
+            except Exception:
+                pass
+    logger.info("SMTP 发送完成")
+
+
+def _classify_smtp_error(exc: Exception, *, default_stage: str) -> str:
+    if isinstance(exc, smtplib.SMTPAuthenticationError):
+        return "auth"
+    if isinstance(exc, smtplib.SMTPRecipientsRefused):
+        return "recipient_rejected"
+    if isinstance(exc, smtplib.SMTPSenderRefused):
+        return "sender_rejected"
+    if isinstance(exc, (ssl.SSLError, smtplib.SMTPNotSupportedError)):
+        return "tls"
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return "timeout"
+    code = int(getattr(exc, "smtp_code", 0) or 0)
+    if code == 552:
+        return "message_too_large"
+    if code == 421:
+        return "server_unavailable"
+    if 400 <= code < 500:
+        return "temporary"
+    return default_stage
+
+
+def _smtp_error_message(stage: str) -> str:
+    return {
+        "auth": "SMTP 认证失败，请检查账号授权码或应用专用密码",
+        "recipient_rejected": "SMTP 服务器拒绝收件人",
+        "sender_rejected": "SMTP 服务器拒绝发件身份",
+        "tls": "SMTP TLS 协商失败",
+        "timeout": "SMTP 连接超时",
+        "message_too_large": "SMTP 服务器拒绝超大邮件",
+        "server_unavailable": "SMTP 服务器暂时不可用",
+        "temporary": "SMTP 服务器返回临时错误，请稍后重试",
+        "connect": "SMTP 连接失败",
+        "send": "SMTP 发送失败",
+    }.get(stage, "SMTP 操作失败")
 
 
 def send_file_with_request(
@@ -768,13 +841,14 @@ def send_file_with_request(
         source_path=str(source_path),
         sha256=sha,
         subject=actual_subject,
-        from_email=cfg.qq_email,
+        from_email=_smtp_sender(cfg),
         to_email=cfg.owner_gmail,
         original_filename=confirmed_name,
         size_bytes=size_bytes,
         source_origin=source_origin,
         source_sha256=source_sha,
         staged_sha256=staged_sha,
+        from_account_id=current_send_account_id(cfg),
     )
     existing_outbound = get_outbound_by_request_id(cfg.db_path, request_id)
     outbound_id = str(
@@ -792,7 +866,8 @@ def send_file_with_request(
         cfg.db_path,
         outbound_id=outbound_id,
         sender_account_ref=_sender_account_ref(cfg),
-        sender_ref=cfg.qq_email,
+        from_account_id=current_send_account_id(cfg),
+        sender_ref=_smtp_sender(cfg),
         source_origin=outbound_origin,
         request_id=request_id,
         subject=actual_subject,
@@ -1052,9 +1127,10 @@ def _record_failure(
         sent_copy_path=None,
         sha256=sha,
         subject=subject,
-        from_email=cfg.qq_email,
+        from_email=_smtp_sender(cfg),
         to_email=cfg.owner_gmail,
         sent_at=sent_at,
         status="failed",
         error_message=err,
+        from_account_id=current_send_account_id(cfg),
     )

@@ -120,8 +120,18 @@ def receive_mails(
     log_backend = logger.debug if automatic else logger.info
     log_backend("收件后端：%s（配置=%s）", backend, cfg.gmail_receive_backend)
 
+    runtime_provider = str(getattr(cfg, "runtime_provider", "") or "").casefold()
     if backend == "gmail_api":
         result = receive_gmail_api(cfg, limit=limit, automatic=automatic)
+    elif runtime_provider in {"qq", "163", "generic_imap_smtp"}:
+        from agent_mail_bridge.imap_sync import receive_imap_account
+
+        result = receive_imap_account(
+            cfg,
+            limit=limit,
+            mark_seen=mark_seen,
+            automatic=automatic,
+        )
     else:
         result = _receive_via_imap(
             cfg, limit=limit, unseen_only=unseen_only, mark_seen=mark_seen,
@@ -158,6 +168,7 @@ def historical_rescan_mails(
 
     backend = _effective_receive_backend(cfg)
     stable_scan_id = scan_id or f"scan_{uuid.uuid4().hex}"
+    runtime_provider = str(getattr(cfg, "runtime_provider", "") or "").casefold()
     if backend == "gmail_api":
         from agent_mail_bridge.gmail_api_receive import rescan_gmail_api_messages
 
@@ -169,6 +180,19 @@ def historical_rescan_mails(
             cancel_check=cancel_check,
             progress_callback=progress_callback,
             scan_id=stable_scan_id,
+            page_size=page_size,
+            scan_cap=scan_cap,
+        )
+    elif runtime_provider in {"qq", "163", "generic_imap_smtp"}:
+        from agent_mail_bridge.imap_sync import rescan_imap_account
+
+        result = rescan_imap_account(
+            cfg,
+            date_from=date_from,
+            date_to=date_to,
+            apply_receive_rule=apply_receive_rule,
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
             page_size=page_size,
             scan_cap=scan_cap,
         )

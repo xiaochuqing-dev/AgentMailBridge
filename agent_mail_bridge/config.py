@@ -121,6 +121,34 @@ def _resolve_path(raw: str, default: str, *, base_dir: Path) -> Path:
     return p
 
 
+@dataclass(frozen=True)
+class IncomingRuntimeConfig:
+    """账号级、Provider-neutral 的收件运行参数；只存在于内存。"""
+
+    backend: str = ""
+    username: str = ""
+    secret: str = field(default="", repr=False)
+    host: str = ""
+    port: int = 993
+    security: str = "ssl"
+    connect_timeout: int = 20
+    mailbox: str = "INBOX"
+    uid_overlap: int = 10
+
+
+@dataclass(frozen=True)
+class OutgoingRuntimeConfig:
+    """账号级、Provider-neutral 的发件运行参数；只存在于内存。"""
+
+    backend: str = ""
+    username: str = ""
+    secret: str = field(default="", repr=False)
+    host: str = ""
+    port: int = 465
+    security: str = "ssl"
+    connect_timeout: int = 20
+
+
 @dataclass
 class AppConfig:
     """应用配置。所有字段均可由 .env 覆盖。"""
@@ -129,6 +157,12 @@ class AppConfig:
     # 只由 AccountRuntimeRouter 在内存副本中设置，不写入 .env。
     runtime_account_id: str = field(default="", repr=False)
     runtime_provider: str = field(default="", repr=False)
+    incoming: IncomingRuntimeConfig = field(
+        default_factory=IncomingRuntimeConfig, repr=False
+    )
+    outgoing: OutgoingRuntimeConfig = field(
+        default_factory=OutgoingRuntimeConfig, repr=False
+    )
 
     # --- Gmail 收件 ---
     gmail_address: str = ""
@@ -619,15 +653,28 @@ def require_receive_config(cfg: AppConfig) -> None:
         return
 
     # imap 模式
+    incoming = effective_incoming_runtime(cfg)
+    legacy_gmail = not (
+        cfg.runtime_account_id
+        or cfg.incoming.backend
+        or cfg.incoming.username
+        or cfg.incoming.host
+    )
     missing = []
-    if not cfg.gmail_address:
-        missing.append("GMAIL_ADDRESS")
-    if not cfg.gmail_app_password:
-        missing.append("GMAIL_APP_PASSWORD")
+    if not incoming.username:
+        missing.append("GMAIL_ADDRESS" if legacy_gmail else "IMAP_USERNAME")
+    if not incoming.secret:
+        missing.append(
+            "GMAIL_APP_PASSWORD" if legacy_gmail else "IMAP_CREDENTIAL"
+        )
+    if not incoming.host:
+        missing.append(
+            "GMAIL_IMAP_HOST" if legacy_gmail else "IMAP_HOST"
+        )
     if missing:
         raise ConfigError(
             "IMAP 收件缺少必需配置：" + ", ".join(missing)
-            + "。请在 .env 中填写（参考 .env.example）。"
+            + "。请在邮箱账号中完成配置。"
         )
 
 
@@ -637,6 +684,8 @@ def _effective_receive_backend(cfg: AppConfig) -> str:
     auto: 优先 gmail_api（credentials.json 严格有效），否则回退 imap。
     imap / gmail_api: 原样返回。
     """
+    if cfg.incoming.backend:
+        return cfg.incoming.backend
     backend = cfg.gmail_receive_backend
     if backend == "auto":
         return "gmail_api" if cfg.gmail_api_configured else "imap"
@@ -645,18 +694,51 @@ def _effective_receive_backend(cfg: AppConfig) -> str:
 
 def require_send_config(cfg: AppConfig, *, require_owner: bool = True) -> None:
     """发件前校验必需配置，缺失时给出明确错误。"""
+    outgoing = effective_outgoing_runtime(cfg)
     missing: list[str] = []
-    if not cfg.qq_email:
-        missing.append("QQ_EMAIL")
-    if not cfg.qq_auth_code:
-        missing.append("QQ_AUTH_CODE")
+    if not outgoing.username:
+        missing.append("SMTP_USERNAME")
+    if not outgoing.secret:
+        missing.append("SMTP_CREDENTIAL")
+    if not outgoing.host:
+        missing.append("SMTP_HOST")
     if require_owner and not cfg.owner_gmail:
         missing.append("OWNER_GMAIL")
     if missing:
         raise ConfigError(
             "发件缺少必需配置：" + ", ".join(missing)
-            + "。请在 .env 中填写（参考 .env.example）。"
+            + "。请在邮箱账号中完成配置。"
         )
+
+
+def effective_incoming_runtime(cfg: AppConfig) -> IncomingRuntimeConfig:
+    """返回账号级收件配置；旧 Gmail 配置仅作为兼容适配层。"""
+    if cfg.incoming.backend or cfg.incoming.username or cfg.incoming.host:
+        return cfg.incoming
+    return IncomingRuntimeConfig(
+        backend=_effective_receive_backend(cfg),
+        username=cfg.gmail_address,
+        secret=cfg.gmail_app_password,
+        host=cfg.gmail_imap_host,
+        port=cfg.gmail_imap_port,
+        security="ssl",
+        connect_timeout=cfg.gmail_connect_timeout,
+    )
+
+
+def effective_outgoing_runtime(cfg: AppConfig) -> OutgoingRuntimeConfig:
+    """返回账号级发件配置；旧 QQ 配置仅作为兼容适配层。"""
+    if cfg.outgoing.backend or cfg.outgoing.username or cfg.outgoing.host:
+        return cfg.outgoing
+    return OutgoingRuntimeConfig(
+        backend="smtp",
+        username=cfg.qq_email,
+        secret=cfg.qq_auth_code,
+        host=cfg.qq_smtp_host,
+        port=cfg.qq_smtp_port,
+        security="ssl",
+        connect_timeout=cfg.qq_smtp_connect_timeout,
+    )
 
 
 def require_gmail_network_config(cfg: AppConfig) -> None:

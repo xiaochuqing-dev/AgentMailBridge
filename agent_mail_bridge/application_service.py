@@ -23,6 +23,8 @@ from agent_mail_bridge.config import (
     AppConfig,
     ConfigError,
     _effective_receive_backend,
+    effective_incoming_runtime,
+    effective_outgoing_runtime,
     require_receive_config,
 )
 from agent_mail_bridge.credentials import (
@@ -880,25 +882,36 @@ class ApplicationService:
             )
             receive_enabled = True
             secret_kind = ACCOUNT_IMAP_SECRET if backend == "imap" else ""
-        elif normalized_provider == "qq":
-            if not address.endswith("@qq.com"):
+        elif normalized_provider in {"qq", "163"}:
+            expected_domain = "@qq.com" if normalized_provider == "qq" else "@163.com"
+            if not address.endswith(expected_domain):
                 return ServiceResult(
                     OperationStatus.FAILED,
-                    error_code="invalid_qq_address",
-                    message="QQ Provider 只接受 @qq.com 地址",
+                    error_code=f"invalid_{normalized_provider}_address",
+                    message=f"{adapter.display_name} 只接受 {expected_domain} 地址",
                 )
-            settings = {
-                "smtp_host": settings.get(
-                    "smtp_host", self.cfg.qq_smtp_host
-                ),
-                "smtp_port": settings.get(
-                    "smtp_port", self.cfg.qq_smtp_port
-                ),
-            }
+            profile = detect_provider_profile(address)
+            if profile is None:
+                return ServiceResult(
+                    OperationStatus.FAILED,
+                    error_code="provider_profile_missing",
+                    message="缺少该邮箱 Provider Profile",
+                )
+            try:
+                settings = validate_server_settings(
+                    {**profile.to_settings(), **settings}
+                )
+            except ProviderFoundationError as exc:
+                return ServiceResult(
+                    OperationStatus.FAILED,
+                    error_code=exc.error_code,
+                    message=str(exc),
+                )
             auth_type = auth_type or "app_password"
-            capabilities = ("send", "smtp", "outbound_archive")
+            capabilities = adapter.implemented_capabilities
+            receive_enabled = True
             send_enabled = True
-            secret_kind = ACCOUNT_SMTP_SECRET
+            secret_kind = "shared_imap_smtp"
         elif normalized_provider == "generic_imap_smtp":
             profile = detect_provider_profile(address)
             if profile is not None:
@@ -920,7 +933,26 @@ class ApplicationService:
                     message="Generic 邮箱至少需要配置 IMAP 或 SMTP 服务器",
                 )
             auth_type = auth_type or "app_password"
-            capabilities = adapter.implemented_capabilities
+            receive_enabled = bool(settings.get("imap_host"))
+            send_enabled = bool(settings.get("smtp_host"))
+            capabilities = tuple(
+                capability
+                for capability in adapter.implemented_capabilities
+                if (
+                    capability
+                    not in {
+                        "receive",
+                        "archive",
+                        "mail_facts",
+                        "folder_discovery",
+                    }
+                    or receive_enabled
+                )
+                and (
+                    capability not in {"send", "outbound_archive"}
+                    or send_enabled
+                )
+            )
         else:
             return ServiceResult(
                 OperationStatus.FAILED,
@@ -986,6 +1018,17 @@ class ApplicationService:
                 secrets_to_save.append((ACCOUNT_IMAP_SECRET, resolved_imap_secret))
             if resolved_smtp_secret:
                 secrets_to_save.append((ACCOUNT_SMTP_SECRET, resolved_smtp_secret))
+        elif (
+            normalized_provider in {"qq", "163"}
+            and secret.strip()
+            and secret_kind == "shared_imap_smtp"
+        ):
+            secrets_to_save.extend(
+                (
+                    (ACCOUNT_IMAP_SECRET, secret.strip()),
+                    (ACCOUNT_SMTP_SECRET, secret.strip()),
+                )
+            )
         elif secret.strip() and secret_kind:
             secrets_to_save.append((secret_kind, secret.strip()))
         try:
@@ -1083,12 +1126,16 @@ class ApplicationService:
                             if backend == "gmail_api"
                             else "app_password"
                         )
-                elif account["provider"] == "qq":
-                    settings = {
-                        key: settings[key]
-                        for key in ("smtp_host", "smtp_port")
-                        if key in settings
-                    }
+                elif account["provider"] in {"qq", "163"}:
+                    profile = detect_provider_profile(
+                        str(account.get("email_address") or "")
+                    )
+                    settings = validate_server_settings(
+                        {
+                            **(profile.to_settings() if profile else {}),
+                            **settings,
+                        }
+                    )
             except ProviderFoundationError as exc:
                 return ServiceResult(
                     OperationStatus.FAILED,
@@ -1317,18 +1364,19 @@ class ApplicationService:
                     if legacy_kind:
                         legacy_value = self._credentials.get(legacy_kind)
                         if legacy_value:
-                            expected_kind = (
-                                ACCOUNT_IMAP_SECRET
-                                if account["provider"] == "gmail"
-                                else ACCOUNT_SMTP_SECRET
-                            )
-                            credential_states[expected_kind] = True
+                            if account["provider"] == "qq":
+                                credential_states[ACCOUNT_IMAP_SECRET] = True
+                                credential_states[ACCOUNT_SMTP_SECRET] = True
+                            else:
+                                credential_states[ACCOUNT_IMAP_SECRET] = True
                     account["credential_states"] = credential_states
                     required_kinds = []
                     if account["provider"] == "gmail":
                         required_kinds.append(ACCOUNT_IMAP_SECRET)
-                    elif account["provider"] == "qq":
-                        required_kinds.append(ACCOUNT_SMTP_SECRET)
+                    elif account["provider"] in {"qq", "163"}:
+                        required_kinds.extend(
+                            (ACCOUNT_IMAP_SECRET, ACCOUNT_SMTP_SECRET)
+                        )
                     else:
                         if settings.get("imap_host"):
                             required_kinds.append(ACCOUNT_IMAP_SECRET)
@@ -1419,30 +1467,16 @@ class ApplicationService:
                     message="Gmail IMAP 连接正常",
                     details={"account_id": account_id, "protocol": "imap"},
                 )
-            if provider == "qq":
-                details = test_smtp_connection(
-                    settings={
-                        "smtp_host": runtime_cfg.qq_smtp_host,
-                        "smtp_port": runtime_cfg.qq_smtp_port,
-                        "smtp_security": "ssl",
-                        "connect_timeout": runtime_cfg.qq_smtp_connect_timeout,
-                    },
-                    username=runtime_cfg.qq_email,
-                    secret=runtime_cfg.qq_auth_code,
-                )
-                return ServiceResult(
-                    OperationStatus.SUCCESS,
-                    message="QQ SMTP 连接正常",
-                    details={"account_id": account_id, **details},
-                )
-            if provider == "generic_imap_smtp":
+            if provider in {"qq", "163", "generic_imap_smtp"}:
                 settings = dict(account.get("provider_settings") or {})
+                incoming = effective_incoming_runtime(runtime_cfg)
+                outgoing = effective_outgoing_runtime(runtime_cfg)
                 checks: dict[str, Any] = {}
                 if settings.get("imap_host"):
                     discovered = discover_imap_mailboxes(
                         settings=settings,
-                        username=str(account["email_address"]),
-                        secret=runtime_cfg.gmail_app_password,
+                        username=incoming.username,
+                        secret=incoming.secret,
                     )
                     checks["imap"] = {
                         "authenticated": True,
@@ -1452,8 +1486,8 @@ class ApplicationService:
                 if settings.get("smtp_host"):
                     checks["smtp"] = test_smtp_connection(
                         settings=settings,
-                        username=str(account["email_address"]),
-                        secret=runtime_cfg.qq_auth_code,
+                        username=outgoing.username,
+                        secret=outgoing.secret,
                     )
                 if not checks:
                     raise ProviderFoundationError(
@@ -1462,7 +1496,7 @@ class ApplicationService:
                     )
                 return ServiceResult(
                     OperationStatus.SUCCESS,
-                    message="Generic 邮箱连接测试通过",
+                    message=f"{context.adapter.display_name} 连接测试通过",
                     details={"account_id": account_id, "checks": checks},
                 )
             return ServiceResult(
@@ -1521,10 +1555,11 @@ class ApplicationService:
                 }
                 username = runtime_cfg.gmail_address
                 secret = runtime_cfg.gmail_app_password
-            elif provider == "generic_imap_smtp":
+            elif provider in {"qq", "163", "generic_imap_smtp"}:
                 settings = dict(account.get("provider_settings") or {})
-                username = str(account["email_address"])
-                secret = runtime_cfg.gmail_app_password
+                incoming = effective_incoming_runtime(runtime_cfg)
+                username = incoming.username
+                secret = incoming.secret
             else:
                 raise ProviderFoundationError(
                     "folder_discovery_not_available",
@@ -1544,11 +1579,36 @@ class ApplicationService:
                 if item.get("checkpoint")
             }
             if checkpoints:
+                state = get_auto_receive_state(
+                    self.cfg.db_path, account_id=account_id
+                )
+                try:
+                    checkpoint_data = json.loads(
+                        str(state.get("checkpoint") or "{}")
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    checkpoint_data = {}
+                existing_mailboxes = checkpoint_data.setdefault(
+                    "mailboxes", {}
+                )
+                if not isinstance(existing_mailboxes, dict):
+                    existing_mailboxes = {}
+                    checkpoint_data["mailboxes"] = existing_mailboxes
+                for mailbox_name, discovered_checkpoint in checkpoints.items():
+                    previous = existing_mailboxes.get(mailbox_name)
+                    existing_mailboxes[mailbox_name] = {
+                        **(
+                            previous
+                            if isinstance(previous, dict)
+                            else {}
+                        ),
+                        **discovered_checkpoint,
+                    }
                 save_auto_receive_state(
                     self.cfg.db_path,
                     account_id=account_id,
                     checkpoint=json.dumps(
-                        {"mailboxes": checkpoints},
+                        checkpoint_data,
                         ensure_ascii=False,
                         sort_keys=True,
                         separators=(",", ":"),

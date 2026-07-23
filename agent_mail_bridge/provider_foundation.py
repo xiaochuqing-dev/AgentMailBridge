@@ -1,7 +1,7 @@
 """Generic IMAP/SMTP 的协议基础与保守 Provider Profile。
 
-本模块只负责非秘密配置校验、连接测试、目录发现和同步 checkpoint 事实。
-正式持续收件与发件仍由经过真实 Provider 验证的 Adapter 接通。
+本模块负责非秘密配置校验、连接测试、目录发现和 Provider Profile。
+持续收件与正式发件由共享的 Generic Core 承担。
 """
 
 from __future__ import annotations
@@ -77,7 +77,7 @@ PROVIDER_PROFILES: tuple[ProviderProfile, ...] = (
         domains=("qq.com",),
         imap_host="imap.qq.com",
         smtp_host="smtp.qq.com",
-        status="send_supported",
+        status="implementation_ready_e2e_required",
     ),
     ProviderProfile(
         profile_id="163",
@@ -85,7 +85,7 @@ PROVIDER_PROFILES: tuple[ProviderProfile, ...] = (
         domains=("163.com",),
         imap_host="imap.163.com",
         smtp_host="smtp.163.com",
-        status="planned",
+        status="implementation_ready_e2e_required",
     ),
 )
 
@@ -137,6 +137,15 @@ def validate_server_settings(settings: dict[str, Any]) -> dict[str, Any]:
             result[f"{protocol}_port"] = port
             result[f"{protocol}_security"] = security
     result["profile_id"] = str(safe.get("profile_id") or "manual").strip()[:80]
+    inbox_name = str(safe.get("inbox_name") or "INBOX").strip()
+    result["inbox_name"] = inbox_name[:255] or "INBOX"
+    try:
+        uid_overlap = int(safe.get("uid_overlap") or 10)
+    except (TypeError, ValueError) as exc:
+        raise ProviderFoundationError(
+            "invalid_uid_overlap", "UID 重叠扫描数量无效"
+        ) from exc
+    result["uid_overlap"] = max(0, min(uid_overlap, 100))
     try:
         timeout = int(safe.get("connect_timeout") or 20)
     except (TypeError, ValueError) as exc:

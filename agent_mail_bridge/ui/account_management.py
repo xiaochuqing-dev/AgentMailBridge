@@ -1281,6 +1281,7 @@ class AccountTypeDialog(QDialog):
 
     GMAIL = "gmail"
     QQ = "qq"
+    NETEASE_163 = "163"
     GENERIC = "generic_imap_smtp"
 
     def __init__(
@@ -1301,8 +1302,8 @@ class AccountTypeDialog(QDialog):
         title = QLabel("添加邮箱账号")
         title.setObjectName("pageTitle")
         hint = QLabel(
-            "可添加多个 Gmail、QQ 或 Generic IMAP/SMTP 账号。"
-            "Generic 当前只开放连接测试和目录发现，尚未开放正式收发。"
+            "可添加多个 Gmail、QQ、163 或 Generic IMAP/SMTP 账号。"
+            "QQ、163 与 Generic 共用标准 IMAP/SMTP 收发核心。"
         )
         hint.setObjectName("hint")
         hint.setWordWrap(True)
@@ -1317,6 +1318,7 @@ class AccountTypeDialog(QDialog):
         self.provider_combo = QComboBox()
         self.provider_combo.addItem("Gmail", self.GMAIL)
         self.provider_combo.addItem("QQ 邮箱", self.QQ)
+        self.provider_combo.addItem("163 邮箱", self.NETEASE_163)
         self.provider_combo.addItem("Generic IMAP/SMTP", self.GENERIC)
         self.display_name_edit = QLineEdit()
         self.display_name_edit.setPlaceholderText("可选的账号显示名称")
@@ -1391,8 +1393,10 @@ class AccountTypeDialog(QDialog):
         self.backend_combo.setVisible(is_gmail)
         gmail_api = is_gmail and self.backend_combo.currentData() == "gmail_api"
         self.secret_label.setText(
-            "QQ SMTP 授权码"
+            "QQ IMAP/SMTP 授权码"
             if provider == self.QQ
+            else "163 客户端授权密码"
+            if provider == self.NETEASE_163
             else "IMAP 应用专用密码"
             if is_gmail
             else "IMAP/SMTP 密码或授权码"
@@ -1479,9 +1483,12 @@ class RuntimeAccountDialog(_AccountDialog):
             self.imap_secret_edit = self._secret_editor(
                 root, "更新 IMAP 应用专用密码"
             )
-        elif provider == "qq":
+        elif provider in {"qq", "163"}:
             self.smtp_secret_edit = self._secret_editor(
-                root, "更新 QQ SMTP 授权码"
+                root,
+                "更新 QQ IMAP/SMTP 授权码"
+                if provider == "qq"
+                else "更新 163 客户端授权密码",
             )
         elif provider == "generic_imap_smtp":
             if settings.get("imap_host"):
@@ -1501,7 +1508,7 @@ class RuntimeAccountDialog(_AccountDialog):
         self.test_button.clicked.connect(self.test_connection)
         actions_layout.addWidget(self.test_button)
         self.discover_button = QPushButton("发现 IMAP 目录")
-        can_discover = provider == "generic_imap_smtp" or (
+        can_discover = provider in {"qq", "163", "generic_imap_smtp"} or (
             provider == "gmail"
             and settings.get("receive_backend") == "imap"
         )
@@ -1756,6 +1763,13 @@ class RuntimeAccountDialog(_AccountDialog):
                 result = self.service.set_account_credential(
                     self.account_id, "smtp_password", value
                 )
+                if result.ok and str(self.account.get("provider")) in {
+                    "qq",
+                    "163",
+                }:
+                    result = self.service.set_account_credential(
+                        self.account_id, "imap_password", value
+                    )
         self._show_result(result)
         if result.ok:
             QDialog.accept(self)

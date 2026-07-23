@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from agent_mail_bridge.config import AppConfig
+from agent_mail_bridge.config import AppConfig, effective_incoming_runtime
 from agent_mail_bridge.database import (
     get_outbound_message,
     get_mail_package_by_identity,
@@ -65,7 +65,9 @@ class ArchiveResult:
 
 
 def stable_account_ref(cfg: AppConfig) -> str:
-    address = canonical_gmail_address(cfg.gmail_address)
+    address = canonical_gmail_address(
+        effective_incoming_runtime(cfg).username or cfg.gmail_address
+    )
     provider = str(getattr(cfg, "runtime_provider", "") or "gmail").strip().casefold()
     return f"{provider}:{address}" if address else f"{provider}:legacy-unknown"
 

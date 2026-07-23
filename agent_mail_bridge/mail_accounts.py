@@ -127,11 +127,30 @@ def legacy_accounts_from_config(cfg: AppConfig) -> list[MailAccount]:
                 email_address=qq_address,
                 display_name="QQ 邮箱",
                 auth_type="app_password",
-                receive_enabled=False,
+                receive_enabled=True,
                 send_enabled=True,
                 data_namespace=account_id,
-                capabilities=("send", "smtp", "outbound_archive"),
-                provider_settings={"smtp_host": cfg.qq_smtp_host},
+                capabilities=(
+                    "receive",
+                    "send",
+                    "archive",
+                    "mail_facts",
+                    "imap",
+                    "smtp",
+                    "folder_discovery",
+                    "outbound_archive",
+                ),
+                provider_settings={
+                    "profile_id": "qq",
+                    "imap_host": "imap.qq.com",
+                    "imap_port": 993,
+                    "imap_security": "ssl",
+                    "smtp_host": cfg.qq_smtp_host,
+                    "smtp_port": cfg.qq_smtp_port,
+                    "smtp_security": "ssl",
+                    "inbox_name": "INBOX",
+                    "uid_overlap": 10,
+                },
             )
         )
     return accounts

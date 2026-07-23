@@ -1,8 +1,8 @@
 """Provider/Adapter 能力注册表。
 
 Adapter 声明稳定能力边界并指向既有实现，不重复实现协议。
-Generic IMAP/SMTP 只接通连接测试与目录发现基础；Microsoft 仍为 planned，
-两者都不会被误报为已正式支持收发。
+QQ、163 与 Generic 共享标准协议 Core；Microsoft 仍为 planned。
+Provider status 单独表达真实 E2E 是否完成，避免把自动化实现误报为线上验收。
 """
 
 from __future__ import annotations
@@ -40,9 +40,26 @@ _ADAPTERS = {
         display_name="QQ 邮箱",
         authentication_types=("app_password",),
         available_capabilities=("receive", "send"),
-        implemented_capabilities=("send", "outbound_archive"),
+        implemented_capabilities=(
+            "receive", "send", "archive", "mail_facts",
+            "folder_discovery", "outbound_archive",
+        ),
+        receive_backends=("imap",),
         send_backends=("smtp",),
-        status="send_supported",
+        status="implementation_ready_e2e_required",
+    ),
+    "163": ProviderAdapter(
+        provider="163",
+        display_name="163 邮箱",
+        authentication_types=("app_password",),
+        available_capabilities=("receive", "send", "folder_discovery"),
+        implemented_capabilities=(
+            "receive", "send", "archive", "mail_facts",
+            "folder_discovery", "outbound_archive",
+        ),
+        receive_backends=("imap",),
+        send_backends=("smtp",),
+        status="implementation_ready_e2e_required",
     ),
     "generic_imap_smtp": ProviderAdapter(
         provider="generic_imap_smtp",
@@ -51,10 +68,13 @@ _ADAPTERS = {
         available_capabilities=(
             "receive", "send", "connection_test", "folder_discovery"
         ),
-        implemented_capabilities=("connection_test", "folder_discovery"),
+        implemented_capabilities=(
+            "receive", "send", "archive", "mail_facts",
+            "connection_test", "folder_discovery", "outbound_archive",
+        ),
         receive_backends=("imap",),
         send_backends=("smtp",),
-        status="planned",
+        status="implementation_ready_e2e_required",
     ),
     "microsoft": ProviderAdapter(
         provider="microsoft",

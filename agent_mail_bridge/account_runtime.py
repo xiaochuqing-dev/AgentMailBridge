@@ -6,7 +6,12 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from agent_mail_bridge.config import AppConfig
+from agent_mail_bridge.config import (
+    AppConfig,
+    IncomingRuntimeConfig,
+    OutgoingRuntimeConfig,
+    _effective_receive_backend,
+)
 from agent_mail_bridge.credentials import (
     ACCOUNT_IMAP_SECRET,
     ACCOUNT_SMTP_SECRET,
@@ -138,7 +143,37 @@ class AccountRuntimeRouter:
             )
             runtime_cfg.gmail_api_credentials_path = credentials_path
             runtime_cfg.gmail_api_token_path = token_path
+            runtime_cfg.incoming = IncomingRuntimeConfig(
+                backend=_effective_receive_backend(runtime_cfg),
+                username=address,
+                secret=runtime_cfg.gmail_app_password,
+                host=runtime_cfg.gmail_imap_host,
+                port=runtime_cfg.gmail_imap_port,
+                security=str(settings.get("imap_security") or "ssl"),
+                connect_timeout=int(
+                    settings.get("connect_timeout")
+                    or runtime_cfg.gmail_connect_timeout
+                ),
+            )
         elif provider == "qq":
+            imap_secret = (
+                self.credentials.get_for_account(
+                    str(account["account_id"]),
+                    ACCOUNT_IMAP_SECRET,
+                    legacy_name=QQ_SMTP_SECRET if is_legacy_qq else None,
+                    migrate_legacy=is_legacy_qq,
+                )
+                or ""
+            )
+            smtp_secret = (
+                self.credentials.get_for_account(
+                    str(account["account_id"]),
+                    ACCOUNT_SMTP_SECRET,
+                    legacy_name=QQ_SMTP_SECRET if is_legacy_qq else None,
+                    migrate_legacy=is_legacy_qq,
+                )
+                or imap_secret
+            )
             runtime_cfg.qq_email = address
             runtime_cfg.qq_smtp_host = str(
                 settings.get("smtp_host") or self.cfg.qq_smtp_host
@@ -146,35 +181,65 @@ class AccountRuntimeRouter:
             runtime_cfg.qq_smtp_port = int(
                 settings.get("smtp_port") or self.cfg.qq_smtp_port
             )
-            runtime_cfg.qq_auth_code = (
-                self.credentials.get_for_account(
-                    str(account["account_id"]),
-                    ACCOUNT_SMTP_SECRET,
-                    legacy_name=QQ_SMTP_SECRET if is_legacy_qq else None,
-                    migrate_legacy=is_legacy_qq,
-                )
-                or ""
+            runtime_cfg.qq_auth_code = smtp_secret
+            runtime_cfg.incoming = IncomingRuntimeConfig(
+                backend="imap",
+                username=address,
+                secret=imap_secret or smtp_secret,
+                host=str(settings.get("imap_host") or "imap.qq.com"),
+                port=int(settings.get("imap_port") or 993),
+                security=str(settings.get("imap_security") or "ssl"),
+                connect_timeout=int(
+                    settings.get("connect_timeout")
+                    or runtime_cfg.gmail_connect_timeout
+                ),
             )
-        elif provider == "generic_imap_smtp":
-            runtime_cfg.gmail_address = address
-            runtime_cfg.gmail_receive_backend = "imap"
-            runtime_cfg.gmail_imap_host = str(settings.get("imap_host") or "")
-            runtime_cfg.gmail_imap_port = int(settings.get("imap_port") or 993)
-            runtime_cfg.gmail_network_mode = "direct"
-            runtime_cfg.gmail_app_password = (
+            runtime_cfg.outgoing = OutgoingRuntimeConfig(
+                backend="smtp",
+                username=address,
+                secret=smtp_secret or imap_secret,
+                host=runtime_cfg.qq_smtp_host,
+                port=runtime_cfg.qq_smtp_port,
+                security=str(settings.get("smtp_security") or "ssl"),
+                connect_timeout=int(
+                    settings.get("connect_timeout")
+                    or runtime_cfg.qq_smtp_connect_timeout
+                ),
+            )
+        elif provider in {"163", "generic_imap_smtp"}:
+            imap_secret = (
                 self.credentials.get_for_account(
                     str(account["account_id"]), ACCOUNT_IMAP_SECRET
                 )
                 or ""
             )
-            runtime_cfg.qq_email = address
-            runtime_cfg.qq_smtp_host = str(settings.get("smtp_host") or "")
-            runtime_cfg.qq_smtp_port = int(settings.get("smtp_port") or 465)
-            runtime_cfg.qq_auth_code = (
+            smtp_secret = (
                 self.credentials.get_for_account(
                     str(account["account_id"]), ACCOUNT_SMTP_SECRET
                 )
-                or ""
+                or imap_secret
+            )
+            runtime_cfg.incoming = IncomingRuntimeConfig(
+                backend="imap" if settings.get("imap_host") else "",
+                username=address,
+                secret=imap_secret or smtp_secret,
+                host=str(settings.get("imap_host") or ""),
+                port=int(settings.get("imap_port") or 993),
+                security=str(settings.get("imap_security") or "ssl"),
+                connect_timeout=int(settings.get("connect_timeout") or 20),
+                mailbox=str(settings.get("inbox_name") or "INBOX"),
+                uid_overlap=max(
+                    0, min(int(settings.get("uid_overlap") or 10), 100)
+                ),
+            )
+            runtime_cfg.outgoing = OutgoingRuntimeConfig(
+                backend="smtp" if settings.get("smtp_host") else "",
+                username=address,
+                secret=smtp_secret or imap_secret,
+                host=str(settings.get("smtp_host") or ""),
+                port=int(settings.get("smtp_port") or 465),
+                security=str(settings.get("smtp_security") or "ssl"),
+                connect_timeout=int(settings.get("connect_timeout") or 20),
             )
         return runtime_cfg
 
