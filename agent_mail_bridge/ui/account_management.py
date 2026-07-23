@@ -29,7 +29,12 @@ from PySide6.QtWidgets import (
 )
 
 from agent_mail_bridge.application_service import ApplicationService
-from agent_mail_bridge.credentials import GMAIL_IMAP_SECRET, QQ_SMTP_SECRET
+from agent_mail_bridge.credentials import (
+    ACCOUNT_IMAP_SECRET,
+    ACCOUNT_SMTP_SECRET,
+    GMAIL_IMAP_SECRET,
+    QQ_SMTP_SECRET,
+)
 from agent_mail_bridge.models import OperationStatus, ServiceResult
 from agent_mail_bridge.ui.settings_store import save_env_values
 from agent_mail_bridge.ui.theme import DANGER, PURPLE, SUCCESS, WARNING
@@ -220,6 +225,28 @@ class AccountSettingsController:
                 error_code="account_model_sync_failed",
                 message="QQ 邮箱配置已保存，账号模型将在下次启动时重试同步",
             )
+        if new_secret.strip():
+            account = next(
+                (
+                    item
+                    for item in synced.details.get("accounts") or []
+                    if item.get("provider") == "qq"
+                    and str(item.get("email_address") or "").casefold()
+                    == email.casefold()
+                ),
+                None,
+            )
+            if account is not None:
+                for kind in (ACCOUNT_IMAP_SECRET, ACCOUNT_SMTP_SECRET):
+                    saved = self.service.set_account_credential(
+                        str(account["account_id"]), kind, new_secret
+                    )
+                    if not saved.ok:
+                        return ServiceResult(
+                            OperationStatus.PARTIAL,
+                            error_code="account_credential_sync_failed",
+                            message="QQ 配置已保存，但统一账号凭据同步失败",
+                        )
         return ServiceResult(OperationStatus.SUCCESS, message="QQ 邮箱账号已保存")
 
 

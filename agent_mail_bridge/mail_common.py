@@ -198,6 +198,15 @@ def attachment_security_status(filename: str) -> str:
     return "unknown_type"
 
 
+def _joined_header_values(message: Message, name: str) -> str:
+    """兼容含原始非 ASCII 字节时 email 包返回 Header 对象的旧邮件。"""
+    return ", ".join(
+        str(value)
+        for value in (message.get_all(name, []) or [])
+        if value is not None
+    )
+
+
 def normalized_mail_from_raw(
     raw_bytes: bytes,
     *,
@@ -274,9 +283,9 @@ def normalized_mail_from_raw(
         backend_message_id=backend_message_id,
         thread_id=thread_id,
         uid=uid,
-        from_raw=", ".join(message.get_all("From", [])),
-        to_raw=", ".join(message.get_all("To", [])),
-        cc_raw=", ".join(message.get_all("Cc", [])),
+        from_raw=_joined_header_values(message, "From"),
+        to_raw=_joined_header_values(message, "To"),
+        cc_raw=_joined_header_values(message, "Cc"),
         subject=decode_mime_header(message.get("Subject", "")),
         received_at=received_at,
         saved_date=saved_date,
@@ -285,8 +294,8 @@ def normalized_mail_from_raw(
         raw_bytes=raw_bytes,
         body_plain=body_plain,
         body_html=body_html,
-        bcc_raw=", ".join(message.get_all("Bcc", [])),
-        reply_to_raw=", ".join(message.get_all("Reply-To", [])),
+        bcc_raw=_joined_header_values(message, "Bcc"),
+        reply_to_raw=_joined_header_values(message, "Reply-To"),
         sent_at=received_at,
         references_raw=str(message.get("References", "")),
         in_reply_to_raw=str(message.get("In-Reply-To", "")),

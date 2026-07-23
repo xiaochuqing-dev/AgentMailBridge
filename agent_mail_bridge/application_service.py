@@ -529,7 +529,8 @@ class ApplicationService:
                 needs_attention=int(raw.get("needs_attention", retry_counts["needs_attention"])),
                 error_code=(
                     "partial_receive" if status == OperationStatus.PARTIAL
-                    else _classify_receive_error(errors[0]) if errors else None
+                    else str(raw.get("error_code") or "")
+                    or (_classify_receive_error(errors[0]) if errors else None)
                 ),
                 message=(
                     "收件完成" if status == OperationStatus.SUCCESS

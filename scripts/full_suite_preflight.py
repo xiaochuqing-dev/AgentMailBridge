@@ -18,7 +18,7 @@ from agent_mail_bridge.provider_foundation import PROVIDER_PROFILES
 from agent_mail_bridge.version import __version__
 
 
-TARGET_VERSION = "1.4.3"
+TARGET_VERSION = "1.4.4"
 TARGETED_TESTS = (
     "tests/test_v1_4_3_provider_hardening.py",
     "tests/test_v1_4_2_generic_mail.py",
@@ -46,7 +46,7 @@ def _run(command: list[str], label: str) -> None:
 
 
 def _check_version_consistency() -> None:
-    _require(__version__ == TARGET_VERSION, "version.py is not v1.4.3")
+    _require(__version__ == TARGET_VERSION, "version.py is not v1.4.4")
     version_tuple = tuple(int(part) for part in TARGET_VERSION.split(".")) + (0,)
     tuple_text = ", ".join(str(part) for part in version_tuple)
     for relative in (
@@ -97,7 +97,7 @@ def _check_provider_status() -> None:
     profile_statuses = {
         profile.profile_id: profile.status for profile in PROVIDER_PROFILES
     }
-    expected = "implementation_ready_e2e_required"
+    expected = "supported"
     for provider in ("qq", "163"):
         adapter = get_provider_adapter(provider)
         _require(adapter.status == expected, f"{provider} adapter status was promoted")
@@ -105,13 +105,19 @@ def _check_provider_status() -> None:
             profile_statuses.get(provider) == expected,
             f"{provider} profile and adapter status differ",
         )
+    generic_expected = "implementation_ready_e2e_required"
     generic = get_provider_adapter("generic_imap_smtp")
-    _require(generic.status == expected, "Generic status was promoted without E2E")
+    _require(
+        generic.status == generic_expected,
+        "Generic status was promoted without E2E",
+    )
     matrix = _text("docs/Provider 支持矩阵与 QQ 163 配置说明.md")
     for provider in ("QQ", "163", "Generic"):
         _require(provider in matrix, f"{provider} missing from Provider matrix")
     _require(
-        "NOT_TESTED" in matrix and expected in matrix,
+        "NOT_TESTED" in matrix
+        and expected in matrix
+        and generic_expected in matrix,
         "Provider matrix does not distinguish implementation from real E2E",
     )
     print("PASS Provider status consistency")

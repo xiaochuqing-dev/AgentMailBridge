@@ -28,9 +28,16 @@ def _status(result: Any) -> str:
 
 
 def _check(result: Any, *, counts: dict[str, int] | None = None) -> dict[str, Any]:
+    operation_status = _status(result)
     item: dict[str, Any] = {
-        "status": "PASS" if bool(getattr(result, "ok", False)) else "FAIL",
-        "operation_status": _status(result),
+        "status": (
+            "PARTIAL"
+            if operation_status == "partial"
+            else "PASS"
+            if bool(getattr(result, "ok", False))
+            else "FAIL"
+        ),
+        "operation_status": operation_status,
         "error_code": str(getattr(result, "error_code", "") or ""),
     }
     if counts:

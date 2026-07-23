@@ -46,7 +46,7 @@ _ADAPTERS = {
         ),
         receive_backends=("imap",),
         send_backends=("smtp",),
-        status="implementation_ready_e2e_required",
+        status="supported",
     ),
     "163": ProviderAdapter(
         provider="163",
@@ -59,7 +59,7 @@ _ADAPTERS = {
         ),
         receive_backends=("imap",),
         send_backends=("smtp",),
-        status="implementation_ready_e2e_required",
+        status="supported",
     ),
     "generic_imap_smtp": ProviderAdapter(
         provider="generic_imap_smtp",

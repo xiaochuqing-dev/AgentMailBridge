@@ -33,6 +33,7 @@ from agent_mail_bridge.mail_processing import process_normalized_mail
 from agent_mail_bridge.provider_foundation import (
     _mailbox_role,
     classify_protocol_error,
+    identify_imap_client,
     mailbox_text,
 )
 from agent_mail_bridge.utils import fmt_datetime, now_local
@@ -359,6 +360,9 @@ def _connect(incoming: Any, client_factory: Callable[..., Any] | None) -> Any:
         if not use_ssl:
             client.starttls(ssl_context=ssl.create_default_context())
         client.login(incoming.username, incoming.secret)
+        identify_imap_client(
+            client, enabled=bool(incoming.imap_id_enabled)
+        )
     except Exception:
         _logout(client)
         raise

@@ -169,6 +169,7 @@ def test_qq_and_163_share_full_provider_profile_and_credentials(
     assert runtime.incoming.host == imap_host
     assert runtime.outgoing.host == smtp_host
     assert runtime.incoming.secret == runtime.outgoing.secret
+    assert runtime.incoming.imap_id_enabled is (provider == "163")
 
 
 def test_imap_initial_incremental_uidvalidity_and_failure_isolation(tmp_cfg):

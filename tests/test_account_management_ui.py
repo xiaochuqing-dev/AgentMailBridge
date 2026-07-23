@@ -16,6 +16,7 @@ from PySide6.QtCore import QEventLoop, QPoint, QRect, QTimer
 from PySide6.QtWidgets import QApplication, QDialog, QLabel, QMessageBox, QPushButton
 
 from agent_mail_bridge.application_service import ApplicationService
+from agent_mail_bridge.credentials import ACCOUNT_IMAP_SECRET, ACCOUNT_SMTP_SECRET
 from agent_mail_bridge.models import OperationStatus, ServiceResult
 from agent_mail_bridge.ui.account_management import (
     FIXED_SECRET_MASK,
@@ -134,6 +135,35 @@ def test_qq_and_gmail_credentials_are_independent(tmp_cfg):
     assert "QQ SMTP" not in _all_text(gmail)
     assert "Gmail IMAP" not in _all_text(qq)
     assert gmail.imap_credential.secret_edit is not qq.qq_credential.secret_edit
+
+
+def test_legacy_qq_editor_refreshes_unified_account_credentials(
+    tmp_cfg, monkeypatch
+):
+    service = ApplicationService(tmp_cfg)
+    monkeypatch.setattr(
+        "agent_mail_bridge.ui.account_management.save_env_values",
+        lambda _values: None,
+    )
+
+    result = AccountSettingsController(service).save_qq(
+        "refreshed@qq.com", "new-authorization-code"
+    )
+
+    assert result.ok
+    account = next(
+        item
+        for item in service.list_mail_accounts().details["accounts"]
+        if item["provider"] == "qq"
+        and item["email_address"] == "refreshed@qq.com"
+    )
+    account_id = account["account_id"]
+    assert service._credentials.get_for_account(
+        account_id, ACCOUNT_IMAP_SECRET
+    ) == "new-authorization-code"
+    assert service._credentials.get_for_account(
+        account_id, ACCOUNT_SMTP_SECRET
+    ) == "new-authorization-code"
 
 
 @pytest.mark.parametrize(

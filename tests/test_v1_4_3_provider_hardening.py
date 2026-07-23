@@ -10,6 +10,8 @@ from agent_mail_bridge.application_service import ApplicationService
 from agent_mail_bridge.database import query_receive_retries
 from agent_mail_bridge.imap_sync import receive_imap_account
 from agent_mail_bridge.mail_send import _classify_smtp_error
+from agent_mail_bridge.mail_common import normalized_mail_from_raw
+from agent_mail_bridge.version import __version__
 from agent_mail_bridge.provider_foundation import (
     ProviderFoundationError,
     classify_protocol_error,
@@ -69,16 +71,22 @@ class GenerationImapClient:
 
 
 class ByteMailboxClient:
+    commands = []
+
     def __init__(self, *_args, **_kwargs):
-        pass
+        type(self).commands = []
 
     def login(self, _username, _secret):
-        return None
+        self.commands.append("login")
+
+    def id_(self, parameters):
+        self.commands.append(("id", parameters))
 
     def capabilities(self):
         return (b"IMAP4rev1", b"SPECIAL-USE")
 
     def list_folders(self):
+        self.commands.append("list")
         return [
             ((b"\\Inbox",), b"/", b"INBOX"),
             ((b"\\Sent",), b"/", b"&XfJT0ZAB-"),
@@ -108,7 +116,7 @@ def _generic_runtime(tmp_cfg):
     runtime = service._account_router.context(
         account_id, capability="receive"
     ).config
-    return account_id, runtime
+    return account_id, runtime, service
 
 
 def test_mailbox_bytes_are_decoded_and_roles_remain_provider_neutral():
@@ -127,6 +135,44 @@ def test_mailbox_bytes_are_decoded_and_roles_remain_provider_neutral():
         not item["display_name"].startswith("b'")
         for item in result["mailboxes"]
     )
+    assert ByteMailboxClient.commands == ["login", "list"]
+
+
+def test_profile_driven_imap_id_is_sent_after_login_without_user_identity():
+    result = discover_imap_mailboxes(
+        settings={
+            "imap_host": "imap.163.com",
+            "profile_id": "163",
+            "imap_id_enabled": True,
+        },
+        username="person@163.com",
+        secret="authorization-code",
+        client_factory=ByteMailboxClient,
+    )
+
+    assert result["mailboxes"]
+    assert ByteMailboxClient.commands[0] == "login"
+    assert ByteMailboxClient.commands[1][0] == "id"
+    assert ByteMailboxClient.commands[1][1] == {
+        "name": "AgentMailBridge",
+        "version": __version__,
+    }
+    assert ByteMailboxClient.commands[2] == "list"
+
+
+def test_legacy_163_profile_settings_enable_imap_id_without_migration():
+    result = discover_imap_mailboxes(
+        settings={
+            "imap_host": "imap.163.com",
+            "profile_id": "163",
+        },
+        username="person@163.com",
+        secret="authorization-code",
+        client_factory=ByteMailboxClient,
+    )
+
+    assert result["mailboxes"]
+    assert ByteMailboxClient.commands[1][0] == "id"
 
 
 def test_connection_errors_are_classified_without_server_response_or_secret():
@@ -167,6 +213,52 @@ def test_connection_reset_is_classified_as_disconnect():
     ) == ("imap_disconnected", "IMAP 连接已断开")
 
 
+def test_provider_neutral_receive_preserves_backend_error_code(
+    tmp_cfg, monkeypatch
+):
+    account_id, _runtime, service = _generic_runtime(tmp_cfg)
+    monkeypatch.setattr(
+        "agent_mail_bridge.application_service.receive_mails",
+        lambda *_args, **_kwargs: {
+            "ok": False,
+            "global_error": True,
+            "error_code": "imap_auth_failed",
+            "errors": ["IMAP 认证失败，请检查账号授权码或应用专用密码"],
+            "failed": 0,
+        },
+    )
+
+    result = service.receive(account_id=account_id)
+
+    assert result.error_code == "imap_auth_failed"
+
+
+def test_legacy_non_ascii_address_header_is_normalized_without_type_error():
+    raw = (
+        b"From: \xc4\xe3\xba\xc3 <sender@example.com>\r\n"
+        b"To: receiver@example.com\r\n"
+        b"Subject: legacy header\r\n"
+        b"Message-ID: <legacy-header@example.com>\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+        b"body"
+    )
+
+    normalized = normalized_mail_from_raw(
+        raw,
+        backend="imap",
+        backend_message_id="",
+        thread_id="",
+        uid="179",
+        received_at="2026-07-24 02:00:00",
+        saved_date="2026-07-24",
+        max_attachment_bytes=1024,
+        mailbox_ref="INBOX",
+    )
+
+    assert isinstance(normalized.from_raw, str)
+    assert "sender@example.com" in normalized.from_raw
+
+
 @pytest.mark.parametrize(
     ("error", "expected"),
     [
@@ -203,7 +295,7 @@ def test_smtp_reply_classification_distinguishes_retryability(error, expected):
 def test_uidvalidity_reset_retires_old_generation_retry_and_sanitizes_error(
     tmp_cfg,
 ):
-    account_id, runtime = _generic_runtime(tmp_cfg)
+    account_id, runtime, _service = _generic_runtime(tmp_cfg)
     first_client = GenerationImapClient(
         uidvalidity=11,
         raw=None,

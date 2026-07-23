@@ -49,6 +49,7 @@ class ProviderProfile:
     smtp_host: str = ""
     smtp_port: int = 465
     smtp_security: str = SECURITY_SSL
+    imap_id_enabled: bool = False
     status: str = "planned"
 
     def to_settings(self) -> dict[str, Any]:
@@ -60,6 +61,7 @@ class ProviderProfile:
             "smtp_host": self.smtp_host,
             "smtp_port": self.smtp_port,
             "smtp_security": self.smtp_security,
+            "imap_id_enabled": self.imap_id_enabled,
         }
 
 
@@ -78,7 +80,7 @@ PROVIDER_PROFILES: tuple[ProviderProfile, ...] = (
         domains=("qq.com",),
         imap_host="imap.qq.com",
         smtp_host="smtp.qq.com",
-        status="implementation_ready_e2e_required",
+        status="supported",
     ),
     ProviderProfile(
         profile_id="163",
@@ -86,7 +88,8 @@ PROVIDER_PROFILES: tuple[ProviderProfile, ...] = (
         domains=("163.com",),
         imap_host="imap.163.com",
         smtp_host="smtp.163.com",
-        status="implementation_ready_e2e_required",
+        imap_id_enabled=True,
+        status="supported",
     ),
 )
 
@@ -240,6 +243,7 @@ def validate_server_settings(settings: dict[str, Any]) -> dict[str, Any]:
             "invalid_uid_overlap", "UID 重叠扫描数量无效"
         ) from exc
     result["uid_overlap"] = max(0, min(uid_overlap, 100))
+    result["imap_id_enabled"] = resolve_imap_id_enabled(safe)
     try:
         timeout = int(safe.get("connect_timeout") or 20)
     except (TypeError, ValueError) as exc:
@@ -265,6 +269,27 @@ def validate_non_secret_provider_settings(
     return safe
 
 
+def resolve_imap_id_enabled(settings: dict[str, Any]) -> bool:
+    """兼容旧账号设置，并把 Provider 默认值集中留在 Profile。"""
+    raw = settings.get("imap_id_enabled")
+    if raw is not None:
+        if not isinstance(raw, bool):
+            raise ProviderFoundationError(
+                "invalid_imap_id_setting", "IMAP ID 扩展开关必须是布尔值"
+            )
+        return raw
+    profile_id = str(settings.get("profile_id") or "").strip().casefold()
+    profile = next(
+        (
+            item
+            for item in PROVIDER_PROFILES
+            if item.profile_id.casefold() == profile_id
+        ),
+        None,
+    )
+    return bool(profile and profile.imap_id_enabled)
+
+
 def _mailbox_role(flags: Any, name: str) -> str:
     normalized_flags = {
         (item.decode("ascii", errors="ignore") if isinstance(item, bytes) else str(item))
@@ -278,6 +303,25 @@ def _mailbox_role(flags: Any, name: str) -> str:
     if mailbox_text(name).casefold() == "inbox":
         return "inbox"
     return "other"
+
+
+def identify_imap_client(client: Any, *, enabled: bool) -> bool:
+    """按 Profile 开关发送最小、真实且不含用户信息的 RFC 2971 ID。"""
+    if not enabled:
+        return False
+    try:
+        from agent_mail_bridge.version import __version__
+
+        client.id_(
+            {
+                "name": "AgentMailBridge",
+                "version": __version__,
+            }
+        )
+    except Exception as exc:
+        code, message = classify_protocol_error("imap", exc)
+        raise ProviderFoundationError(code, message) from exc
+    return True
 
 
 def discover_imap_mailboxes(
@@ -314,6 +358,9 @@ def discover_imap_mailboxes(
         if not use_ssl:
             client.starttls(ssl_context=ssl.create_default_context())
         client.login(str(username).strip(), secret)
+        identify_imap_client(
+            client, enabled=bool(safe.get("imap_id_enabled"))
+        )
         capabilities = sorted(
             item.decode("ascii", errors="ignore")
             if isinstance(item, bytes)

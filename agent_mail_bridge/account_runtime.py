@@ -22,6 +22,7 @@ from agent_mail_bridge.credentials import (
 from agent_mail_bridge.database import get_mail_account
 from agent_mail_bridge.oauth_storage import ensure_account_oauth_storage
 from agent_mail_bridge.provider_adapters import ProviderAdapter, get_provider_adapter
+from agent_mail_bridge.provider_foundation import resolve_imap_id_enabled
 
 
 class AccountRuntimeError(ValueError):
@@ -154,6 +155,7 @@ class AccountRuntimeRouter:
                     settings.get("connect_timeout")
                     or runtime_cfg.gmail_connect_timeout
                 ),
+                imap_id_enabled=resolve_imap_id_enabled(settings),
             )
         elif provider == "qq":
             imap_secret = (
@@ -231,6 +233,7 @@ class AccountRuntimeRouter:
                 uid_overlap=max(
                     0, min(int(settings.get("uid_overlap") or 10), 100)
                 ),
+                imap_id_enabled=resolve_imap_id_enabled(settings),
             )
             runtime_cfg.outgoing = OutgoingRuntimeConfig(
                 backend="smtp" if settings.get("smtp_host") else "",

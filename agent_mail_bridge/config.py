@@ -134,6 +134,7 @@ class IncomingRuntimeConfig:
     connect_timeout: int = 20
     mailbox: str = "INBOX"
     uid_overlap: int = 10
+    imap_id_enabled: bool = False
 
 
 @dataclass(frozen=True)
