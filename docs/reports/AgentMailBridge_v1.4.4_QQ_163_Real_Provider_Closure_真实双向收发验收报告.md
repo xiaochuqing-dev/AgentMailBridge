@@ -202,8 +202,8 @@ Gmail send 与 Outlook/Microsoft 未实现；Gmail OAuth scope 仍严格为 gmai
 
 ## 44. commits
 
-代码、测试、版本、文档和本报告将在当前 `master` 上按逻辑提交；最终 commit 以本报告所在 Git 历史为准，不创建 Tag。
+`95f01db feat: close QQ and 163 real provider support`；`6e59c5d docs: document v1.4.4 provider closure`。最终状态回写位于本报告当前 HEAD，不创建 Tag。
 
 ## 45. push status
 
-报告生成时为 PENDING。完成最终检查与提交后推送 `origin/master`，推送结果将在最终状态提交中更新。
+PASS。代码、测试、文档和专项报告已推送 `origin/master`；最终状态回写提交随后一并推送。未 force push，未创建 Tag 或 GitHub Release。
