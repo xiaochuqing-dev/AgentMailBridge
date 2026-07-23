@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## 1.4.1 Multi-Account Runtime 与 Provider Foundation - 2026-07-23
+
+- 新增统一 Account Runtime Router，业务入口可按稳定 `account_id` 解析 Provider、运行配置、能力、Credential 与 OAuth 文件；Gmail 收件、GUI QQ 发件、历史补扫、MCP 新鲜度同步和连接测试不再只能依赖单个全局账号。
+- 新增账号 create/read/update/enable/disable/soft remove 生命周期。移除默认保留邮件、附件、发件事实和审计，凭据与 OAuth Token 由用户明确选择是否按账号清理；旧配置同步不会重新启用已停用或已移除账号。
+- 新账号凭据按 `account_id` 写入 Windows Credential Manager，Gmail OAuth credentials/Token 进入账号专属目录；同 Provider 多账号的密码、Token、授权状态和失败互不覆盖，原 Gmail/QQ key 只为地址精确匹配的兼容账号回退。
+- 自动收件升级为逐账号状态、锁、重试与退避，一个账号失败不阻断其他到期账号；GUI 可选择手工收件、历史补扫、连接测试和正式发件账号，新增账号入口、动态卡片、启停与安全移除开始真实工作。
+- Generic IMAP/SMTP Foundation 引入 New BSD 许可的 IMAPClient，提供 TLS-only 配置校验、Provider Profile、连接测试、LIST/SPECIAL-USE 目录发现及 UIDVALIDITY/UIDNEXT/HIGHESTMODSEQ checkpoint；正式 receive/send 仍未开放。
+- 调研 Google 官方发件方案后保留 Gmail `gmail.readonly` 唯一 scope。Gmail send 需要额外 `gmail.send`/`gmail.compose` 或更宽 SMTP OAuth 权限，与当前硬安全边界冲突，因此本版明确不实现、不触发重新授权。
+- 统一 MCP 保持七个工具和 `submit_result` 固定 `OWNER_GMAIL` 边界；`get_mail_sync_status` 新增可选 `account_id`。数据库 Multi-Account schema 升级到 v2，升级前备份、事务、raw.eml/历史 Hash 不改写规则保持不变。
+- Python、GUI、MCP、EXE metadata、Inno Setup 与构建产物版本统一升级为 1.4.1；Windows 包显式包含 IMAPClient 模块和许可证 metadata。
+
 ## 1.4.0 Multi-Account Core 多邮箱架构地基 - 2026-07-22
 
 - 新增无秘密 `MailAccount` 一等实体、稳定 `account_id/data_namespace`、`Mailbox` 与 Provider Adapter 能力注册表；Gmail 继续复用现有 API/IMAP 收件归档，QQ 继续复用现有 SMTP 发件归档，Generic IMAP/SMTP 与 Microsoft 仅作未接通扩展边界。

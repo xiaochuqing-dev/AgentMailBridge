@@ -80,7 +80,7 @@ Use `runtime_paths.py`. Frozen program files are read-only under the install dir
 - The top-level work area contains only Receive and Send.
 - Agent/MCP is an independent left-side entry joined visually with History, Files & Data, Settings and About; it must not leave a detached gap.
 - Existing account configuration belongs only to unified account cards; the current Gmail and QQ cards open their provider-specific authentication views.
-- Add mailbox account is only a future-extension demo and must not route to an existing account editor.
+- Add mailbox account creates a new unified account; it must not overwrite or silently route into an existing account identity.
 - The receive page must not contain account secrets or OAuth configuration.
 - The send page must not contain QQ account configuration.
 - Agent/MCP owns one independent page and must not be duplicated in Send or Settings.
@@ -110,7 +110,7 @@ Use `runtime_paths.py`. Frozen program files are read-only under the install dir
 - Normal automatic no-change checks must not create permanent `app_events` noise; scheduler health belongs in `auto_receive_state`.
 - `app_events` retention may delete only technical events. It must never delete business history, outbound records, MCP audit, retry state, mail packages, resources, raw mail or attachments.
 - File-log rotation and SQLite event retention are separate mechanisms and must both remain bounded.
-- AgentMailBridge v1.4.0 is the current product version. Multi-Account Core ownership is implemented; additional live providers and full Unified Inbox productization remain future scope.
+- AgentMailBridge v1.4.1 is the current product version. Multi-Account Runtime, per-account credentials/OAuth/sync and the Generic connection/folder foundation are implemented; Gmail send, additional live providers and full Unified Inbox productization remain future scope.
 
 ## History and managed-file invariants
 

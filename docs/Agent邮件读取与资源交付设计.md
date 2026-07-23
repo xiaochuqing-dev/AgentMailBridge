@@ -2,7 +2,7 @@
 
 ## 产品边界
 
-AgentMailBridge v1.4.0 保留 v1.2.0 引入的通用 Agent 邮件读取能力，并在同一个 MCP 中加入稳定账号归属与可选账号过滤。`search_mails` 省略 `account_id` 时读取统一本地视图，指定时只读取该账号；`ensure_fresh` 仍只触发当前已接通 Gmail 账号的增量同步，不替代 GUI 历史补扫。GUI 用于一次性授权、工作区配置和审计观察，不参与每次读件。功能仍是本地单用户邮箱桥接，不扩展为通用邮件客户端、SaaS、Agent 编排或知识管理系统。
+AgentMailBridge v1.4.1 保留通用 Agent 邮件读取能力，并在同一个 MCP 中使用稳定账号归属与可选账号过滤。`search_mails` 省略 `account_id` 时读取统一本地视图，指定时只读取该账号；`ensure_fresh` 通过 Account Runtime Router 同步指定或兼容当前账号，不替代 GUI 历史补扫。GUI 的自由发件账号选择不会扩展到 MCP。
 
 ## 数据流
 
@@ -28,7 +28,7 @@ Provider Adapter 复用现有 Gmail API/IMAP 收件实现，先完成带 `accoun
 
 ## 同步与并发
 
-`ensure_fresh` 先查询持久化调度状态，只在数据超过 30 至 600 秒可配置阈值时触发收件。GUI 手动收件、自动调度和所有 Agent 使用同一个 `DATA_ROOT/.locks/receive.lock` 字节锁；锁由操作系统持有，进程崩溃后自动释放。连接级失败、单邮件重试、no_changes 和 partial 保持原有语义。
+`ensure_fresh` 先查询目标账号的持久化调度状态，只在数据过期时触发收件。兼容默认调用保留 `receive.lock`；明确账号调用使用 `receive-<account_id>.lock`，进程内也按账号互斥。一个账号的连接错误、认证失败或退避不会阻塞其他账号；单邮件重试继续携带账号 ownership。
 
 ## 审计与兼容
 

@@ -2,7 +2,7 @@
 
 ## search_mails
 
-输入支持 query、time_scope、recent_days、date_from/date_to、subject、sender、recipient、has_attachments、status、sort、limit、offset、ensure_fresh、allow_cached、`account_id`、兼容 `account_ref` 和 mailbox_ref。time_scope 取 latest、today、yesterday、recent_days、date_range 或 all；limit 为 1 至 100。省略账号时查询全部归档账号，指定 `account_id` 时严格按账号过滤。搜索覆盖解码后的联系人显示名与地址，输出保持唯一邮件摘要、分页和同步状态；`ensure_fresh` 只做当前已接通 Gmail 账号的增量同步，不替代 GUI 历史补扫。
+输入支持 query、time_scope、recent_days、date_from/date_to、subject、sender、recipient、has_attachments、status、sort、limit、offset、ensure_fresh、allow_cached、`account_id`、兼容 `account_ref` 和 mailbox_ref。省略账号时查询全部归档账号，指定 `account_id` 时严格按账号过滤；同时请求 `ensure_fresh` 时只同步该账号，不替代 GUI 历史补扫。
 
 ## get_mail
 
@@ -24,7 +24,7 @@
 
 ## get_mail_sync_status
 
-无输入且不受邮件读取开关阻断。返回当前收件 `account_id`、已启用账号摘要，以及 enabled、background_status、is_syncing、freshness、阈值、数据年龄、最近本地邮件时间、上次检查/成功/结果、下次检查和该账号重试计数。freshness 为 fresh、stale 或 unknown。
+可选输入 `account_id`，且不受邮件读取开关阻断。返回指定或当前收件账号、已启用账号摘要，以及 enabled、background_status、is_syncing、freshness、阈值、数据年龄、最近本地邮件时间、上次检查/成功/结果、下次检查和该账号重试计数。freshness 为 fresh、stale 或 unknown。
 
 ## submit_result
 
