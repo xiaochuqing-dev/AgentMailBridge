@@ -527,7 +527,7 @@ def test_gmail_send_is_not_claimed_and_mcp_boundary_is_unchanged(tmp_cfg):
     assert "account_id" in sync_status["inputSchema"]["properties"]
 
 
-def test_qq_account_secret_uses_smtp_namespace_only(tmp_cfg):
+def test_qq_account_secret_isolated_in_shared_imap_smtp_namespaces(tmp_cfg):
     service = ApplicationService(tmp_cfg)
     service.initialize()
     created = service.create_mail_account(
@@ -546,7 +546,7 @@ def test_qq_account_secret_uses_smtp_namespace_only(tmp_cfg):
     ) == "qq-second-secret"
     assert service._credentials.get_for_account(
         account_id, ACCOUNT_IMAP_SECRET
-    ) is None
+    ) == "qq-second-secret"
 
 
 def test_isolated_v14_to_v141_upgrade_preserves_user_files_oauth_and_secret(
@@ -607,7 +607,7 @@ def test_isolated_v14_to_v141_upgrade_preserves_user_files_oauth_and_secret(
                 "PRAGMA table_info(mail_accounts)"
             ).fetchall()
         }
-    assert schema_version == 2
+    assert schema_version == 3
     assert "removed_at" in account_columns
     assert list(
         backup_dir(tmp_cfg).glob("*before_v1_4_multi_account*.db")

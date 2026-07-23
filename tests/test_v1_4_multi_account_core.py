@@ -184,7 +184,12 @@ def test_stable_ids_and_provider_adapter_boundaries(tmp_cfg):
     assert first != stable_account_id("gmail", "second@gmail.com")
     assert get_provider_adapter("gmail").supports("receive")
     assert not get_provider_adapter("gmail").supports("send")
-    assert get_provider_adapter("generic_imap_smtp").status == "planned"
+    assert (
+        get_provider_adapter("generic_imap_smtp").status
+        == "implementation_ready_e2e_required"
+    )
+    assert get_provider_adapter("generic_imap_smtp").supports("receive")
+    assert get_provider_adapter("generic_imap_smtp").supports("send")
     assert get_provider_adapter("microsoft").implemented_capabilities == ()
 
 

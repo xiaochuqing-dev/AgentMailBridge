@@ -67,7 +67,8 @@ def test_add_account_is_a_real_runtime_entry(v1_qt_app, tmp_cfg):
     assert "未来邮箱扩展入口" not in text
     assert hasattr(dialog, "email_edit")
     assert hasattr(dialog, "provider_combo")
-    assert dialog.provider_combo.count() == 3
+    assert dialog.provider_combo.count() == 4
+    assert dialog.provider_combo.findData("163") >= 0
     dialog.close()
 
 
