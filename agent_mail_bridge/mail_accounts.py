@@ -138,8 +138,14 @@ def legacy_accounts_from_config(cfg: AppConfig) -> list[MailAccount]:
 
 
 def current_receive_account_id(cfg: AppConfig) -> str:
+    runtime_account_id = str(getattr(cfg, "runtime_account_id", "") or "").strip()
+    if runtime_account_id:
+        return runtime_account_id
     return stable_account_id("gmail", cfg.gmail_address)
 
 
 def current_send_account_id(cfg: AppConfig) -> str:
+    runtime_account_id = str(getattr(cfg, "runtime_account_id", "") or "").strip()
+    if runtime_account_id:
+        return runtime_account_id
     return stable_account_id("qq", cfg.qq_email)

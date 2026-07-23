@@ -125,6 +125,11 @@ def _resolve_path(raw: str, default: str, *, base_dir: Path) -> Path:
 class AppConfig:
     """应用配置。所有字段均可由 .env 覆盖。"""
 
+    # --- 运行时账号上下文 ---
+    # 只由 AccountRuntimeRouter 在内存副本中设置，不写入 .env。
+    runtime_account_id: str = field(default="", repr=False)
+    runtime_provider: str = field(default="", repr=False)
+
     # --- Gmail 收件 ---
     gmail_address: str = ""
     gmail_app_password: str = ""

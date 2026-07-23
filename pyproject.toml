@@ -16,6 +16,7 @@ dependencies = [
     "google-api-python-client>=2.0.0",
     "google-auth-httplib2>=0.2.0",
     "google-auth-oauthlib>=1.0.0",
+    "IMAPClient>=3.0,<4",
     "PySide6-Essentials>=6.8,<7",
 ]
 

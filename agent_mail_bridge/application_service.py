@@ -26,6 +26,8 @@ from agent_mail_bridge.config import (
     require_receive_config,
 )
 from agent_mail_bridge.credentials import (
+    ACCOUNT_IMAP_SECRET,
+    ACCOUNT_SMTP_SECRET,
     CredentialError,
     CredentialService,
     GMAIL_IMAP_SECRET,
@@ -33,13 +35,16 @@ from agent_mail_bridge.credentials import (
     QQ_SMTP_SECRET,
 )
 from agent_mail_bridge.database import (
+    account_owned_fact_counts,
     app_event_overview,
     close_connection,
     clear_all_app_events,
     clear_daily_check_events,
     configure_app_event_retention,
     count_receive_retries,
+    create_mail_account as create_mail_account_record,
     get_auto_receive_state,
+    get_mail_account as query_mail_account,
     get_mail_package as query_raw_mail_package,
     init_db,
     insert_mcp_call,
@@ -59,6 +64,7 @@ from agent_mail_bridge.database import (
     query_recent_sent_files,
     query_trusted_domains,
     query_sent_files_by_date,
+    remove_mail_account as remove_mail_account_record,
     update_mcp_call,
     update_mcp_staging,
     save_auto_receive_state,
@@ -68,6 +74,8 @@ from agent_mail_bridge.database import (
     query_mail_accounts,
     query_mailboxes,
     sync_mail_accounts,
+    update_mail_account as update_mail_account_record,
+    upsert_mailboxes,
 )
 from agent_mail_bridge.file_index import list_received_files_for_date, scan_file_status
 from agent_mail_bridge.gmail_api_auth import get_oauth_state
@@ -87,10 +95,28 @@ from agent_mail_bridge.mail_facts import (
 )
 from agent_mail_bridge.mail_send import send_file_with_request, send_outbound_mail
 from agent_mail_bridge.mail_accounts import (
+    MailAccount,
     current_receive_account_id,
     legacy_accounts_from_config,
+    normalize_email_address,
+    stable_account_id,
 )
-from agent_mail_bridge.provider_adapters import list_provider_adapters
+from agent_mail_bridge.provider_adapters import (
+    get_provider_adapter,
+    list_provider_adapters,
+)
+from agent_mail_bridge.account_runtime import (
+    AccountRuntimeError,
+    AccountRuntimeRouter,
+)
+from agent_mail_bridge.provider_foundation import (
+    ProviderFoundationError,
+    detect_provider_profile,
+    discover_imap_mailboxes,
+    test_smtp_connection,
+    validate_non_secret_provider_settings,
+    validate_server_settings,
+)
 from agent_mail_bridge.mail_resource_access import (
     MAX_TEXT_CHARS,
     MailAccessError,
@@ -150,7 +176,8 @@ class ApplicationService:
 
     def __init__(self, cfg: AppConfig):
         self.cfg = cfg
-        self._receive_lock = threading.Lock()
+        self._account_receive_locks: dict[str, threading.Lock] = {}
+        self._account_receive_locks_guard = threading.Lock()
         self._setup_lock = threading.Lock()
         self._maintenance_lock = threading.Lock()
         self._event_maintenance_lock = threading.Lock()
@@ -168,6 +195,7 @@ class ApplicationService:
             )
         else:
             self._credentials = CredentialService()
+        self._account_router = AccountRuntimeRouter(cfg, self._credentials)
 
     def initialize(self) -> ServiceResult:
         """初始化安全目录、数据库和日志。"""
@@ -362,6 +390,7 @@ class ApplicationService:
     def receive(
         self,
         *,
+        account_id: str | None = None,
         limit: int | None = None,
         unseen_only: bool | None = None,
         mark_seen: bool | None = None,
@@ -370,27 +399,77 @@ class ApplicationService:
     ) -> ReceiveResult:
         """执行一次线程/进程双重互斥收件，普通收件绝不启动浏览器授权。"""
         self.initialize()
-        backend = _effective_receive_backend(self.cfg)
+        target_account_id = account_id or current_receive_account_id(self.cfg)
+        try:
+            runtime_cfg = self._account_router.context(
+                target_account_id, capability="receive"
+            ).config
+        except AccountRuntimeError as exc:
+            if account_id is None and exc.error_code == "account_not_found":
+                runtime_cfg = self.cfg
+            else:
+                return ReceiveResult(
+                    OperationStatus.FAILED,
+                    backend="",
+                    error_code=exc.error_code,
+                    message=str(exc),
+                )
+        except CredentialError as exc:
+            return ReceiveResult(
+                OperationStatus.FAILED,
+                backend="",
+                error_code="credential_read_failed",
+                message=str(exc),
+            )
+        backend = _effective_receive_backend(runtime_cfg)
         if limit is not None and limit <= 0:
             return ReceiveResult(
                 OperationStatus.FAILED, backend=backend,
                 error_code="invalid_limit", message="收件数量必须大于 0",
             )
-        if not self._receive_lock.acquire(blocking=False):
+        with self._account_receive_locks_guard:
+            receive_lock = self._account_receive_locks.setdefault(
+                target_account_id, threading.Lock()
+            )
+        if not receive_lock.acquire(blocking=False):
             return ReceiveResult(
                 OperationStatus.CANCELLED, backend=backend,
                 error_code="receive_busy", message="已有收件任务正在运行",
             )
-        process_lock = ProcessLock(self.cfg.data_root_path / ".locks" / "receive.lock")
-        if not process_lock.acquire(timeout=max(0.0, float(wait_for_process_lock))):
-            self._receive_lock.release()
+        legacy_process_lock = (
+            ProcessLock(
+                runtime_cfg.data_root_path / ".locks" / "receive.lock"
+            )
+            if account_id is None
+            else None
+        )
+        lock_timeout = max(0.0, float(wait_for_process_lock))
+        if legacy_process_lock is not None and not legacy_process_lock.acquire(
+            timeout=lock_timeout
+        ):
+            receive_lock.release()
+            return ReceiveResult(
+                OperationStatus.CANCELLED,
+                backend=backend,
+                error_code="sync_in_progress",
+                message="其他进程正在同步邮件",
+            )
+        process_lock = ProcessLock(
+            runtime_cfg.data_root_path
+            / ".locks"
+            / f"receive-{target_account_id}.lock"
+        )
+        if not process_lock.acquire(timeout=lock_timeout):
+            if legacy_process_lock is not None:
+                legacy_process_lock.release()
+            receive_lock.release()
             return ReceiveResult(
                 OperationStatus.CANCELLED, backend=backend,
                 error_code="sync_in_progress", message="其他进程正在同步邮件",
             )
         try:
             if backend == "gmail_api":
-                oauth = get_oauth_state(self.cfg)
+                oauth = get_oauth_state(runtime_cfg)
                 if oauth["state"] not in {"READY", "TOKEN_EXPIRED_REFRESHABLE"}:
                     return ReceiveResult(
                         OperationStatus.AUTH_REQUIRED,
@@ -400,9 +479,9 @@ class ApplicationService:
                         needs_auth=True,
                     )
             try:
-                require_receive_config(self.cfg)
+                require_receive_config(runtime_cfg)
                 raw = receive_mails(
-                    self.cfg, limit=limit,
+                    runtime_cfg, limit=limit,
                     unseen_only=unseen_only, mark_seen=mark_seen,
                     automatic=automatic,
                 )
@@ -421,8 +500,8 @@ class ApplicationService:
             saved = int(raw.get("saved", 0))
             errors = list(raw.get("errors", []))
             retry_counts = count_receive_retries(
-                self.cfg.db_path,
-                account_id=current_receive_account_id(self.cfg),
+                runtime_cfg.db_path,
+                account_id=target_account_id,
             )
             if raw.get("global_error") or not raw.get("ok", True):
                 status = OperationStatus.FAILED
@@ -458,11 +537,14 @@ class ApplicationService:
             )
         finally:
             process_lock.release()
-            self._receive_lock.release()
+            if legacy_process_lock is not None:
+                legacy_process_lock.release()
+            receive_lock.release()
 
     def historical_rescan(
         self,
         *,
+        account_id: str | None = None,
         date_from: datetime | str,
         date_to: datetime | str,
         apply_receive_rule: bool = True,
@@ -473,7 +555,29 @@ class ApplicationService:
     ) -> ReceiveResult:
         """显式历史补扫；范围、锁、取消和统计均独立于普通增量收件。"""
         self.initialize()
-        backend = _effective_receive_backend(self.cfg)
+        target_account_id = account_id or current_receive_account_id(self.cfg)
+        try:
+            runtime_cfg = self._account_router.context(
+                target_account_id, capability="receive"
+            ).config
+        except AccountRuntimeError as exc:
+            if account_id is None and exc.error_code == "account_not_found":
+                runtime_cfg = self.cfg
+            else:
+                return ReceiveResult(
+                    OperationStatus.FAILED,
+                    backend="",
+                    error_code=exc.error_code,
+                    message=str(exc),
+                )
+        except CredentialError as exc:
+            return ReceiveResult(
+                OperationStatus.FAILED,
+                backend="",
+                error_code="credential_read_failed",
+                message=str(exc),
+            )
+        backend = _effective_receive_backend(runtime_cfg)
         try:
             start = _coerce_rescan_datetime(date_from, end_of_day=False)
             end = _coerce_rescan_datetime(date_to, end_of_day=True)
@@ -492,7 +596,11 @@ class ApplicationService:
                 error_code="invalid_history_range",
                 message=str(exc),
             )
-        if not self._receive_lock.acquire(blocking=False):
+        with self._account_receive_locks_guard:
+            receive_lock = self._account_receive_locks.setdefault(
+                target_account_id, threading.Lock()
+            )
+        if not receive_lock.acquire(blocking=False):
             return ReceiveResult(
                 OperationStatus.CANCELLED,
                 backend=backend,
@@ -500,9 +608,33 @@ class ApplicationService:
                 message="已有收件或历史补扫任务正在运行",
                 cancelled=True,
             )
-        process_lock = ProcessLock(self.cfg.data_root_path / ".locks" / "receive.lock")
+        legacy_process_lock = (
+            ProcessLock(
+                runtime_cfg.data_root_path / ".locks" / "receive.lock"
+            )
+            if account_id is None
+            else None
+        )
+        if legacy_process_lock is not None and not legacy_process_lock.acquire(
+            timeout=0.0
+        ):
+            receive_lock.release()
+            return ReceiveResult(
+                OperationStatus.CANCELLED,
+                backend=backend,
+                error_code="sync_in_progress",
+                message="其他进程正在同步邮件",
+                cancelled=True,
+            )
+        process_lock = ProcessLock(
+            runtime_cfg.data_root_path
+            / ".locks"
+            / f"receive-{target_account_id}.lock"
+        )
         if not process_lock.acquire(timeout=0.0):
-            self._receive_lock.release()
+            if legacy_process_lock is not None:
+                legacy_process_lock.release()
+            receive_lock.release()
             return ReceiveResult(
                 OperationStatus.CANCELLED,
                 backend=backend,
@@ -512,7 +644,7 @@ class ApplicationService:
             )
         try:
             if backend == "gmail_api":
-                oauth = get_oauth_state(self.cfg)
+                oauth = get_oauth_state(runtime_cfg)
                 if oauth["state"] not in {"READY", "TOKEN_EXPIRED_REFRESHABLE"}:
                     return ReceiveResult(
                         OperationStatus.AUTH_REQUIRED,
@@ -522,9 +654,9 @@ class ApplicationService:
                         needs_auth=True,
                     )
             try:
-                require_receive_config(self.cfg)
+                require_receive_config(runtime_cfg)
                 raw = historical_rescan_mails(
-                    self.cfg,
+                    runtime_cfg,
                     date_from=start,
                     date_to=end,
                     apply_receive_rule=bool(apply_receive_rule),
@@ -599,26 +731,63 @@ class ApplicationService:
             )
         finally:
             process_lock.release()
-            self._receive_lock.release()
+            if legacy_process_lock is not None:
+                legacy_process_lock.release()
+            receive_lock.release()
 
-    def get_auto_receive_state(self) -> ServiceResult:
+    def get_auto_receive_state(
+        self, account_id: str | None = None
+    ) -> ServiceResult:
         """供 GUI 展示真实持久化调度与坏邮件隔离状态。"""
         self.initialize()
-        account_id = current_receive_account_id(self.cfg)
-        state = get_auto_receive_state(self.cfg.db_path, account_id=account_id)
+        state = get_auto_receive_state(
+            self.cfg.db_path, account_id=account_id
+        )
         state["enabled"] = bool(state.get("enabled"))
-        state.update(count_receive_retries(self.cfg.db_path, account_id=account_id))
+        state.update(
+            count_receive_retries(
+                self.cfg.db_path,
+                account_id=account_id or current_receive_account_id(self.cfg),
+            )
+        )
         return ServiceResult(OperationStatus.SUCCESS, details=state)
 
-    def save_auto_receive_state(self, **changes: Any) -> ServiceResult:
+    def save_auto_receive_state(
+        self, account_id: str | None = None, **changes: Any
+    ) -> ServiceResult:
         """由 GUI 调度器原子更新可恢复状态。"""
         self.initialize()
-        account_id = current_receive_account_id(self.cfg)
         state = save_auto_receive_state(
             self.cfg.db_path, account_id=account_id, **changes
         )
         state["enabled"] = bool(state.get("enabled"))
-        state.update(count_receive_retries(self.cfg.db_path, account_id=account_id))
+        state.update(
+            count_receive_retries(
+                self.cfg.db_path,
+                account_id=account_id or current_receive_account_id(self.cfg),
+            )
+        )
+        return ServiceResult(OperationStatus.SUCCESS, details=state)
+
+    def save_all_auto_receive_states(self, **changes: Any) -> ServiceResult:
+        """更新全局兼容状态，并广播到所有已启用收件账号。"""
+        self.initialize()
+        state = save_auto_receive_state(
+            self.cfg.db_path, account_id=None, **changes
+        )
+        state["enabled"] = bool(state.get("enabled"))
+        return ServiceResult(OperationStatus.SUCCESS, details=state)
+
+    def save_global_auto_receive_state(self, **changes: Any) -> ServiceResult:
+        """只更新协调器状态，不覆盖任何账号自己的 retry/backoff。"""
+        self.initialize()
+        state = save_auto_receive_state(
+            self.cfg.db_path,
+            account_id=None,
+            broadcast_accounts=False,
+            **changes,
+        )
+        state["enabled"] = bool(state.get("enabled"))
         return ServiceResult(OperationStatus.SUCCESS, details=state)
 
     def synchronize_mail_accounts(self) -> ServiceResult:
@@ -643,12 +812,563 @@ class ApplicationService:
             },
         )
 
+    def create_mail_account(
+        self,
+        *,
+        provider: str,
+        email_address: str,
+        display_name: str = "",
+        auth_type: str = "",
+        receive_backend: str = "",
+        provider_settings: dict[str, Any] | None = None,
+        secret: str = "",
+        imap_secret: str = "",
+        smtp_secret: str = "",
+    ) -> ServiceResult:
+        """创建真实账号；秘密只写 Credential Manager，不进入 SQLite。"""
+        self.initialize()
+        normalized_provider = str(provider or "").strip().casefold()
+        address = normalize_email_address(email_address)
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", address):
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="invalid_email_address",
+                message="请输入有效的邮箱地址",
+            )
+        try:
+            adapter = get_provider_adapter(normalized_provider)
+        except ValueError as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="provider_not_supported",
+                message=str(exc),
+            )
+        try:
+            settings = validate_non_secret_provider_settings(
+                provider_settings
+            )
+        except ProviderFoundationError as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code=exc.error_code,
+                message=str(exc),
+            )
+        capabilities: tuple[str, ...]
+        receive_enabled = False
+        send_enabled = False
+        secret_kind = ""
+        if normalized_provider == "gmail":
+            backend = str(receive_backend or settings.get("receive_backend") or "gmail_api")
+            if backend not in {"gmail_api", "imap"}:
+                return ServiceResult(
+                    OperationStatus.FAILED,
+                    error_code="invalid_receive_backend",
+                    message="Gmail 收件后端必须是 Gmail API 或 IMAP",
+                )
+            settings = {
+                "receive_backend": backend,
+                **{
+                    key: settings[key]
+                    for key in ("imap_host", "imap_port")
+                    if key in settings
+                },
+            }
+            auth_type = auth_type or ("oauth2" if backend == "gmail_api" else "app_password")
+            capabilities = (
+                "receive", "archive", "mail_facts",
+                "gmail_api" if backend == "gmail_api" else "imap",
+            )
+            receive_enabled = True
+            secret_kind = ACCOUNT_IMAP_SECRET if backend == "imap" else ""
+        elif normalized_provider == "qq":
+            if not address.endswith("@qq.com"):
+                return ServiceResult(
+                    OperationStatus.FAILED,
+                    error_code="invalid_qq_address",
+                    message="QQ Provider 只接受 @qq.com 地址",
+                )
+            settings = {
+                "smtp_host": settings.get(
+                    "smtp_host", self.cfg.qq_smtp_host
+                ),
+                "smtp_port": settings.get(
+                    "smtp_port", self.cfg.qq_smtp_port
+                ),
+            }
+            auth_type = auth_type or "app_password"
+            capabilities = ("send", "smtp", "outbound_archive")
+            send_enabled = True
+            secret_kind = ACCOUNT_SMTP_SECRET
+        elif normalized_provider == "generic_imap_smtp":
+            profile = detect_provider_profile(address)
+            if profile is not None:
+                settings = {**profile.to_settings(), **settings}
+            try:
+                settings = validate_server_settings(settings)
+            except ProviderFoundationError as exc:
+                return ServiceResult(
+                    OperationStatus.FAILED,
+                    error_code=exc.error_code,
+                    message=str(exc),
+                )
+            if not (
+                settings.get("imap_host") or settings.get("smtp_host")
+            ):
+                return ServiceResult(
+                    OperationStatus.FAILED,
+                    error_code="server_not_configured",
+                    message="Generic 邮箱至少需要配置 IMAP 或 SMTP 服务器",
+                )
+            auth_type = auth_type or "app_password"
+            capabilities = adapter.implemented_capabilities
+        else:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="provider_not_implemented",
+                message=f"{adapter.display_name} 尚未进入可创建账号阶段",
+            )
+        account_id = stable_account_id(normalized_provider, address)
+        account = MailAccount(
+            account_id=account_id,
+            provider=normalized_provider,
+            email_address=address,
+            display_name=display_name.strip() or adapter.display_name,
+            auth_type=auth_type,
+            receive_enabled=receive_enabled,
+            send_enabled=send_enabled,
+            enabled=True,
+            data_namespace=account_id,
+            capabilities=capabilities,
+            provider_settings=settings,
+            source="user",
+        )
+        if query_mail_account(self.cfg.db_path, account_id) is not None:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="account_already_exists",
+                message="同一 Provider 的该邮箱账号已经存在",
+            )
+        try:
+            record = create_mail_account_record(self.cfg.db_path, account)
+        except sqlite3.IntegrityError:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="account_already_exists",
+                message="同一 Provider 的该邮箱账号已经存在",
+            )
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="account_create_failed",
+                message=f"创建邮箱账号失败：{exc}",
+            )
+        if receive_enabled:
+            global_state = get_auto_receive_state(self.cfg.db_path)
+            save_auto_receive_state(
+                self.cfg.db_path,
+                account_id=account_id,
+                enabled=bool(global_state.get("enabled")),
+                interval_seconds=int(
+                    global_state.get("interval_seconds") or 60
+                ),
+                next_check_at=global_state.get("next_check_at"),
+            )
+        secrets_to_save: list[tuple[str, str]] = []
+        if normalized_provider == "generic_imap_smtp":
+            generic_secret = secret.strip()
+            resolved_imap_secret = imap_secret.strip() or (
+                generic_secret if settings.get("imap_host") else ""
+            )
+            resolved_smtp_secret = smtp_secret.strip() or (
+                generic_secret if settings.get("smtp_host") else ""
+            )
+            if resolved_imap_secret:
+                secrets_to_save.append((ACCOUNT_IMAP_SECRET, resolved_imap_secret))
+            if resolved_smtp_secret:
+                secrets_to_save.append((ACCOUNT_SMTP_SECRET, resolved_smtp_secret))
+        elif secret.strip() and secret_kind:
+            secrets_to_save.append((secret_kind, secret.strip()))
+        try:
+            for kind, value in secrets_to_save:
+                self._credentials.set_for_account(account_id, kind, value)
+        except CredentialError as exc:
+            return ServiceResult(
+                OperationStatus.PARTIAL,
+                error_code="credential_write_failed",
+                message=f"账号已创建，但凭据保存失败：{exc}",
+                details={"account": record},
+            )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            message="邮箱账号已创建",
+            details={"account": record},
+        )
+
+    def update_mail_account(
+        self,
+        account_id: str,
+        *,
+        display_name: str | None = None,
+        enabled: bool | None = None,
+        receive_enabled: bool | None = None,
+        send_enabled: bool | None = None,
+        auth_type: str | None = None,
+        provider_settings: dict[str, Any] | None = None,
+    ) -> ServiceResult:
+        """更新可变属性；邮箱地址和 Provider 不允许原地变更。"""
+        self.initialize()
+        account = query_mail_account(self.cfg.db_path, account_id)
+        if account is None:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="account_not_found",
+                message="邮箱账号不存在或已移除",
+            )
+        adapter = get_provider_adapter(str(account["provider"]))
+        capabilities = set(account.get("capabilities") or ())
+        if receive_enabled and (
+            "receive" not in capabilities or not adapter.supports("receive")
+        ):
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="capability_not_available",
+                message="该 Provider 尚未正式接通收件能力",
+            )
+        if send_enabled and (
+            "send" not in capabilities or not adapter.supports("send")
+        ):
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="capability_not_available",
+                message="该 Provider 尚未正式接通发件能力",
+            )
+        settings = provider_settings
+        updated_capabilities: tuple[str, ...] | None = None
+        resolved_auth_type = auth_type
+        if settings is not None:
+            try:
+                settings = validate_non_secret_provider_settings(settings)
+                if account["provider"] == "generic_imap_smtp":
+                    settings = validate_server_settings(settings)
+                elif account["provider"] == "gmail":
+                    backend = str(
+                        settings.get("receive_backend")
+                        or account.get("provider_settings", {}).get(
+                            "receive_backend"
+                        )
+                        or "gmail_api"
+                    )
+                    if backend not in {"gmail_api", "imap"}:
+                        raise ProviderFoundationError(
+                            "invalid_receive_backend",
+                            "Gmail 收件后端必须是 Gmail API 或 IMAP",
+                        )
+                    settings = {
+                        "receive_backend": backend,
+                        **{
+                            key: settings[key]
+                            for key in ("imap_host", "imap_port")
+                            if key in settings
+                        },
+                    }
+                    updated_capabilities = (
+                        "receive",
+                        "archive",
+                        "mail_facts",
+                        "gmail_api" if backend == "gmail_api" else "imap",
+                    )
+                    if resolved_auth_type is None:
+                        resolved_auth_type = (
+                            "oauth2"
+                            if backend == "gmail_api"
+                            else "app_password"
+                        )
+                elif account["provider"] == "qq":
+                    settings = {
+                        key: settings[key]
+                        for key in ("smtp_host", "smtp_port")
+                        if key in settings
+                    }
+            except ProviderFoundationError as exc:
+                return ServiceResult(
+                    OperationStatus.FAILED,
+                    error_code=exc.error_code,
+                    message=str(exc),
+                )
+        try:
+            record = update_mail_account_record(
+                self.cfg.db_path,
+                account_id,
+                display_name=display_name,
+                enabled=enabled,
+                receive_enabled=receive_enabled,
+                send_enabled=send_enabled,
+                auth_type=resolved_auth_type,
+                capabilities=updated_capabilities,
+                provider_settings=settings,
+            )
+        except (ValueError, sqlite3.Error) as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="account_update_failed",
+                message=str(exc),
+            )
+        if enabled is True and record.get("receive_enabled"):
+            global_state = get_auto_receive_state(self.cfg.db_path)
+            save_auto_receive_state(
+                self.cfg.db_path,
+                account_id=account_id,
+                enabled=bool(global_state.get("enabled")),
+                interval_seconds=int(
+                    global_state.get("interval_seconds") or 60
+                ),
+                next_check_at=global_state.get("next_check_at"),
+            )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            message="邮箱账号已更新",
+            details={"account": record},
+        )
+
+    def set_account_credential(
+        self, account_id: str, secret_kind: str, value: str
+    ) -> ServiceResult:
+        """保存按账号秘密；同 Provider 账号之间不会共享。"""
+        self.initialize()
+        if query_mail_account(self.cfg.db_path, account_id) is None:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="account_not_found",
+                message="邮箱账号不存在或已移除",
+            )
+        if secret_kind not in {ACCOUNT_IMAP_SECRET, ACCOUNT_SMTP_SECRET}:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="invalid_credential_name",
+                message="不支持的账号凭据类型",
+            )
+        if not value.strip():
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="credential_empty",
+                message="账号凭据不能为空",
+            )
+        try:
+            self._credentials.set_for_account(
+                account_id, secret_kind, value.strip()
+            )
+        except CredentialError as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="credential_write_failed",
+                message=str(exc),
+            )
+        return ServiceResult(OperationStatus.SUCCESS, message="账号凭据已安全保存")
+
+    def delete_account_credential(
+        self, account_id: str, secret_kind: str
+    ) -> ServiceResult:
+        self.initialize()
+        account = query_mail_account(self.cfg.db_path, account_id)
+        if account is None:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="account_not_found",
+                message="邮箱账号不存在或已移除",
+            )
+        legacy_name = self._legacy_credential_name(account, secret_kind)
+        try:
+            self._credentials.delete_for_account(account_id, secret_kind)
+            if legacy_name:
+                self._credentials.delete(legacy_name)
+        except CredentialError as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="credential_delete_failed",
+                message=str(exc),
+            )
+        return ServiceResult(OperationStatus.SUCCESS, message="账号凭据已删除")
+
+    def remove_mail_account(
+        self,
+        account_id: str,
+        *,
+        cleanup_credentials: bool = False,
+        cleanup_oauth_token: bool = False,
+    ) -> ServiceResult:
+        """软移除账号；本地邮件、附件、发件与审计默认全部保留。"""
+        self.initialize()
+        account = query_mail_account(self.cfg.db_path, account_id)
+        if account is None:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="account_not_found",
+                message="邮箱账号不存在或已移除",
+            )
+        facts = account_owned_fact_counts(self.cfg.db_path, account_id)
+        cleanup_errors: list[str] = []
+        token_path: Path | None = None
+        if cleanup_oauth_token and account["provider"] == "gmail":
+            try:
+                _credentials_path, token_path = self._account_router.oauth_paths(
+                    account_id
+                )
+            except (AccountRuntimeError, CredentialError, OSError, ValueError) as exc:
+                cleanup_errors.append(str(exc))
+        try:
+            record = remove_mail_account_record(self.cfg.db_path, account_id)
+        except (ValueError, sqlite3.Error) as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="account_remove_failed",
+                message=str(exc),
+            )
+        if cleanup_credentials:
+            for kind in (ACCOUNT_IMAP_SECRET, ACCOUNT_SMTP_SECRET):
+                try:
+                    self._credentials.delete_for_account(account_id, kind)
+                    legacy_name = self._legacy_credential_name(account, kind)
+                    if legacy_name:
+                        self._credentials.delete(legacy_name)
+                except CredentialError as exc:
+                    cleanup_errors.append(str(exc))
+        if token_path is not None:
+            try:
+                token_path.unlink(missing_ok=True)
+            except OSError as exc:
+                cleanup_errors.append(str(exc))
+        status = OperationStatus.PARTIAL if cleanup_errors else OperationStatus.SUCCESS
+        return ServiceResult(
+            status,
+            error_code="credential_cleanup_partial" if cleanup_errors else None,
+            message=(
+                "账号已移除，本地历史数据已保留；部分凭据清理失败"
+                if cleanup_errors
+                else "账号已移除，本地历史邮件与发件记录已保留"
+            ),
+            details={
+                "account": record,
+                "preserved_facts": facts,
+                "credential_cleanup_requested": cleanup_credentials,
+                "oauth_cleanup_requested": cleanup_oauth_token,
+                "cleanup_errors": cleanup_errors,
+            },
+        )
+
+    def _legacy_credential_name(
+        self, account: dict[str, Any], secret_kind: str
+    ) -> str | None:
+        """仅为精确匹配的兼容账号返回旧 Credential Manager key。"""
+        provider = str(account.get("provider") or "")
+        address = str(account.get("email_address") or "").casefold()
+        if (
+            provider == "gmail"
+            and secret_kind == ACCOUNT_IMAP_SECRET
+            and address == self.cfg.gmail_address.casefold()
+        ):
+            return GMAIL_IMAP_SECRET
+        if (
+            provider == "qq"
+            and secret_kind == ACCOUNT_SMTP_SECRET
+            and address == self.cfg.qq_email.casefold()
+        ):
+            return QQ_SMTP_SECRET
+        return None
+
     def list_mail_accounts(self) -> ServiceResult:
         """返回统一账号及 mailbox 基础事实，供 GUI 和统一 MCP 展示。"""
         synced = self.synchronize_mail_accounts()
         if not synced.ok:
             return synced
-        return ServiceResult(OperationStatus.SUCCESS, details=synced.details)
+        accounts: list[dict[str, Any]] = []
+        for raw in list(synced.details.get("accounts") or []):
+            account = dict(raw)
+            account_id = str(account["account_id"])
+            settings = dict(account.get("provider_settings") or {})
+            legacy_kind = (
+                GMAIL_IMAP_SECRET
+                if account["provider"] == "gmail"
+                and account["email_address"].casefold()
+                == self.cfg.gmail_address.casefold()
+                else QQ_SMTP_SECRET
+                if account["provider"] == "qq"
+                and account["email_address"].casefold()
+                == self.cfg.qq_email.casefold()
+                else None
+            )
+            try:
+                if (
+                    account["provider"] == "gmail"
+                    and settings.get("receive_backend") == "gmail_api"
+                ):
+                    runtime = self._account_router.context(
+                        account_id, require_enabled=False
+                    ).config
+                    oauth = get_oauth_state(runtime)
+                    account["auth_state"] = oauth.get("state")
+                    account["credential_configured"] = oauth.get("state") in {
+                        "READY",
+                        "TOKEN_EXPIRED_REFRESHABLE",
+                    }
+                else:
+                    credential_states = self._credentials.account_status(
+                        account_id
+                    )
+                    if legacy_kind:
+                        legacy_value = self._credentials.get(legacy_kind)
+                        if legacy_value:
+                            expected_kind = (
+                                ACCOUNT_IMAP_SECRET
+                                if account["provider"] == "gmail"
+                                else ACCOUNT_SMTP_SECRET
+                            )
+                            credential_states[expected_kind] = True
+                    account["credential_states"] = credential_states
+                    required_kinds = []
+                    if account["provider"] == "gmail":
+                        required_kinds.append(ACCOUNT_IMAP_SECRET)
+                    elif account["provider"] == "qq":
+                        required_kinds.append(ACCOUNT_SMTP_SECRET)
+                    else:
+                        if settings.get("imap_host"):
+                            required_kinds.append(ACCOUNT_IMAP_SECRET)
+                        if settings.get("smtp_host"):
+                            required_kinds.append(ACCOUNT_SMTP_SECRET)
+                    account["credential_configured"] = bool(
+                        required_kinds
+                    ) and all(
+                        credential_states.get(kind, False)
+                        for kind in required_kinds
+                    )
+                    account["auth_state"] = (
+                        "CONFIGURED"
+                        if account["credential_configured"]
+                        else "AUTH_REQUIRED"
+                    )
+            except (CredentialError, AccountRuntimeError, OSError, ValueError):
+                account["credential_configured"] = False
+                account["auth_state"] = "CREDENTIAL_UNAVAILABLE"
+            state = get_auto_receive_state(
+                self.cfg.db_path, account_id=account_id
+            )
+            account["sync_state"] = {
+                key: state.get(key)
+                for key in (
+                    "enabled", "last_check_at", "last_success_at", "last_result",
+                    "last_error", "next_check_at", "consecutive_global_failures",
+                )
+            }
+            account["connection_status"] = (
+                state.get("last_result") or "not_tested"
+            )
+            accounts.append(account)
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            details={
+                "accounts": accounts,
+                "mailboxes": synced.details.get("mailboxes", []),
+            },
+        )
 
     def list_mail_provider_adapters(self) -> ServiceResult:
         self.initialize()
@@ -667,6 +1387,360 @@ class ApplicationService:
         ]
         return ServiceResult(
             OperationStatus.SUCCESS, details={"providers": adapters}
+        )
+
+    def test_mail_account_connection(self, account_id: str) -> ServiceResult:
+        """按账号测试已实现连接面；只认证，不收件也不发件。"""
+        self.initialize()
+        try:
+            context = self._account_router.context(account_id)
+            account = context.account
+            runtime_cfg = context.config
+            provider = str(account["provider"])
+            if provider == "gmail":
+                if _effective_receive_backend(runtime_cfg) == "gmail_api":
+                    from agent_mail_bridge.gmail_api_auth import (
+                        reverify_gmail_authorization,
+                    )
+
+                    return reverify_gmail_authorization(runtime_cfg)
+                from agent_mail_bridge.mail_receive import _connect_imap
+
+                connection = _connect_imap(runtime_cfg)
+                try:
+                    connection.logout()
+                finally:
+                    try:
+                        connection.shutdown()
+                    except Exception:
+                        pass
+                return ServiceResult(
+                    OperationStatus.SUCCESS,
+                    message="Gmail IMAP 连接正常",
+                    details={"account_id": account_id, "protocol": "imap"},
+                )
+            if provider == "qq":
+                details = test_smtp_connection(
+                    settings={
+                        "smtp_host": runtime_cfg.qq_smtp_host,
+                        "smtp_port": runtime_cfg.qq_smtp_port,
+                        "smtp_security": "ssl",
+                        "connect_timeout": runtime_cfg.qq_smtp_connect_timeout,
+                    },
+                    username=runtime_cfg.qq_email,
+                    secret=runtime_cfg.qq_auth_code,
+                )
+                return ServiceResult(
+                    OperationStatus.SUCCESS,
+                    message="QQ SMTP 连接正常",
+                    details={"account_id": account_id, **details},
+                )
+            if provider == "generic_imap_smtp":
+                settings = dict(account.get("provider_settings") or {})
+                checks: dict[str, Any] = {}
+                if settings.get("imap_host"):
+                    discovered = discover_imap_mailboxes(
+                        settings=settings,
+                        username=str(account["email_address"]),
+                        secret=runtime_cfg.gmail_app_password,
+                    )
+                    checks["imap"] = {
+                        "authenticated": True,
+                        "mailbox_count": len(discovered["mailboxes"]),
+                        "capabilities": discovered["capabilities"],
+                    }
+                if settings.get("smtp_host"):
+                    checks["smtp"] = test_smtp_connection(
+                        settings=settings,
+                        username=str(account["email_address"]),
+                        secret=runtime_cfg.qq_auth_code,
+                    )
+                if not checks:
+                    raise ProviderFoundationError(
+                        "server_not_configured",
+                        "尚未配置 IMAP 或 SMTP 服务器",
+                    )
+                return ServiceResult(
+                    OperationStatus.SUCCESS,
+                    message="Generic 邮箱连接测试通过",
+                    details={"account_id": account_id, "checks": checks},
+                )
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="provider_not_implemented",
+                message="该 Provider 尚未接通连接测试",
+            )
+        except AccountRuntimeError as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code=exc.error_code,
+                message=str(exc),
+            )
+        except CredentialError as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="credential_read_failed",
+                message=str(exc),
+            )
+        except ProviderFoundationError as exc:
+            return ServiceResult(
+                OperationStatus.AUTH_REQUIRED
+                if exc.error_code.endswith("auth_required")
+                else OperationStatus.FAILED,
+                error_code=exc.error_code,
+                message=str(exc),
+                needs_auth=exc.error_code.endswith("auth_required"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="account_connection_failed",
+                message=str(exc),
+            )
+
+    def discover_mail_account_mailboxes(
+        self, account_id: str
+    ) -> ServiceResult:
+        """发现并保存 IMAP 目录事实，不据临时缺失删除历史目录。"""
+        self.initialize()
+        try:
+            context = self._account_router.context(account_id)
+            account = context.account
+            runtime_cfg = context.config
+            provider = str(account["provider"])
+            if provider == "gmail":
+                if _effective_receive_backend(runtime_cfg) != "imap":
+                    raise ProviderFoundationError(
+                        "folder_discovery_not_available",
+                        "Gmail API 账号不使用 IMAP 目录发现",
+                    )
+                settings = {
+                    "imap_host": runtime_cfg.gmail_imap_host,
+                    "imap_port": runtime_cfg.gmail_imap_port,
+                    "imap_security": "ssl",
+                }
+                username = runtime_cfg.gmail_address
+                secret = runtime_cfg.gmail_app_password
+            elif provider == "generic_imap_smtp":
+                settings = dict(account.get("provider_settings") or {})
+                username = str(account["email_address"])
+                secret = runtime_cfg.gmail_app_password
+            else:
+                raise ProviderFoundationError(
+                    "folder_discovery_not_available",
+                    "该 Provider 当前没有 IMAP 目录发现能力",
+                )
+            discovered = discover_imap_mailboxes(
+                settings=settings,
+                username=username,
+                secret=secret,
+            )
+            mailboxes = upsert_mailboxes(
+                self.cfg.db_path, account_id, discovered["mailboxes"]
+            )
+            checkpoints = {
+                str(item["external_ref"]): item["checkpoint"]
+                for item in discovered["mailboxes"]
+                if item.get("checkpoint")
+            }
+            if checkpoints:
+                save_auto_receive_state(
+                    self.cfg.db_path,
+                    account_id=account_id,
+                    checkpoint=json.dumps(
+                        {"mailboxes": checkpoints},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                )
+            return ServiceResult(
+                OperationStatus.SUCCESS,
+                message=f"已发现 {len(mailboxes)} 个邮箱目录",
+                details={
+                    "account_id": account_id,
+                    "capabilities": discovered["capabilities"],
+                    "mailboxes": mailboxes,
+                },
+            )
+        except AccountRuntimeError as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code=exc.error_code,
+                message=str(exc),
+            )
+        except CredentialError as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="credential_read_failed",
+                message=str(exc),
+            )
+        except ProviderFoundationError as exc:
+            return ServiceResult(
+                OperationStatus.AUTH_REQUIRED
+                if exc.error_code.endswith("auth_required")
+                else OperationStatus.FAILED,
+                error_code=exc.error_code,
+                message=str(exc),
+                needs_auth=exc.error_code.endswith("auth_required"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="folder_discovery_failed",
+                message=str(exc),
+            )
+
+    def sync_due_mail_accounts(
+        self,
+        *,
+        force: bool = False,
+        now: datetime | None = None,
+    ) -> ServiceResult:
+        """逐账号调度收件；单账号失败不会阻断其余账号。"""
+        self.initialize()
+        current = now or datetime.now()
+        global_state = get_auto_receive_state(self.cfg.db_path)
+        accounts = [
+            account
+            for account in query_mail_accounts(
+                self.cfg.db_path, enabled_only=True
+            )
+            if account.get("receive_enabled")
+        ]
+        results: list[dict[str, Any]] = []
+        saved_total = 0
+        failed_total = 0
+        for account in accounts:
+            account_id = str(account["account_id"])
+            state = get_auto_receive_state(
+                self.cfg.db_path, account_id=account_id
+            )
+            if not state.get("enabled") and not force:
+                continue
+            next_check = _parse_datetime(state.get("next_check_at"))
+            if next_check and next_check > current and not force:
+                continue
+            try:
+                result = self.receive(account_id=account_id, automatic=True)
+            except Exception as exc:  # noqa: BLE001
+                result = ReceiveResult(
+                    OperationStatus.FAILED,
+                    backend="",
+                    error_code="account_sync_failed",
+                    message=f"账号同步异常：{type(exc).__name__}",
+                    failed=1,
+                )
+            interval = max(30, int(state.get("interval_seconds") or 60))
+            failure_count = int(
+                state.get("consecutive_global_failures") or 0
+            )
+            if result.status in {
+                OperationStatus.SUCCESS,
+                OperationStatus.NO_CHANGES,
+                OperationStatus.PARTIAL,
+            }:
+                failure_count = 0
+                delay = interval
+                last_success_at = current.strftime("%Y-%m-%d %H:%M:%S")
+            elif result.status == OperationStatus.CANCELLED:
+                delay = interval
+                last_success_at = state.get("last_success_at")
+            else:
+                failure_count += 1
+                delay = min(
+                    900,
+                    (30, 60, 120, 300, 600, 900)[
+                        min(failure_count - 1, 5)
+                    ],
+                )
+                last_success_at = state.get("last_success_at")
+                failed_total += 1
+            next_check_at = (current + timedelta(seconds=delay)).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            save_auto_receive_state(
+                self.cfg.db_path,
+                account_id=account_id,
+                enabled=bool(state.get("enabled")),
+                interval_seconds=interval,
+                last_check_at=current.strftime("%Y-%m-%d %H:%M:%S"),
+                last_success_at=last_success_at,
+                last_result=result.status.value,
+                last_error=None if result.ok else result.message,
+                consecutive_global_failures=failure_count,
+                next_check_at=next_check_at,
+            )
+            saved_total += int(result.saved)
+            results.append(
+                {
+                    "account_id": account_id,
+                    "status": result.status.value,
+                    "saved": int(result.saved),
+                    "failed": int(result.failed),
+                    "error_code": result.error_code,
+                    "next_check_at": next_check_at,
+                }
+            )
+        if failed_total:
+            status = OperationStatus.PARTIAL
+        elif saved_total:
+            status = OperationStatus.SUCCESS
+        else:
+            status = OperationStatus.NO_CHANGES
+        next_checks = [
+            parsed
+            for account in accounts
+            if (
+                parsed := _parse_datetime(
+                    get_auto_receive_state(
+                        self.cfg.db_path,
+                        account_id=str(account["account_id"]),
+                    ).get("next_check_at")
+                )
+            )
+        ]
+        coordinator_delay = min(
+            30, max(1, int(global_state.get("interval_seconds") or 60))
+        )
+        coordinator_next = min(next_checks) if next_checks else (
+            current + timedelta(seconds=coordinator_delay)
+        )
+        checked_at = current.strftime("%Y-%m-%d %H:%M:%S")
+        save_auto_receive_state(
+            self.cfg.db_path,
+            account_id=None,
+            broadcast_accounts=False,
+            enabled=bool(global_state.get("enabled")),
+            interval_seconds=int(global_state.get("interval_seconds") or 60),
+            last_check_at=checked_at,
+            last_success_at=(
+                checked_at
+                if results and failed_total < len(results)
+                else global_state.get("last_success_at")
+            ),
+            last_result=status.value,
+            last_error=(
+                f"{failed_total} 个账号同步失败"
+                if failed_total
+                else None
+            ),
+            consecutive_global_failures=0,
+            next_check_at=coordinator_next.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        return ServiceResult(
+            status,
+            error_code="account_sync_partial" if failed_total else None,
+            message=(
+                f"已检查 {len(results)} 个账号，新增 {saved_total} 封，"
+                f"失败 {failed_total} 个账号"
+            ),
+            details={
+                "accounts_checked": len(results),
+                "saved": saved_total,
+                "failed_accounts": failed_total,
+                "results": results,
+            },
         )
 
     def send_file(
@@ -809,6 +1883,7 @@ class ApplicationService:
     def send_user_selected_mail(
         self,
         *,
+        from_account_id: str | None = None,
         recipient: str | None = None,
         subject: str | None,
         body_text: str,
@@ -817,12 +1892,30 @@ class ApplicationService:
     ) -> SendResult:
         """发送一封用户编写的邮件；全局文件信任仅限本次 GUI 操作。"""
         self.initialize()
+        runtime_cfg = self.cfg
+        if from_account_id:
+            try:
+                runtime_cfg = self._account_router.context(
+                    from_account_id, capability="send"
+                ).config
+            except AccountRuntimeError as exc:
+                return SendResult(
+                    OperationStatus.FAILED,
+                    error_code=exc.error_code,
+                    message=str(exc),
+                )
+            except CredentialError as exc:
+                return SendResult(
+                    OperationStatus.FAILED,
+                    error_code="credential_read_failed",
+                    message=str(exc),
+                )
         raw = send_outbound_mail(
             subject=subject,
             body_text=body_text,
             attachment_paths=attachment_paths,
             links=links,
-            cfg=self.cfg,
+            cfg=runtime_cfg,
             recipient=recipient,
             source_origin="manual_gui",
         )
@@ -836,13 +1929,16 @@ class ApplicationService:
             outbound_id=str(raw.get("outbound_id") or ""),
             send_status=str(raw.get("send_status") or "not_sent"),
             subject=str(raw.get("subject") or subject or ""),
-            to_email=str(raw.get("to") or recipient or self.cfg.owner_gmail),
+            to_email=str(raw.get("to") or recipient or runtime_cfg.owner_gmail),
             sent_at=str(raw.get("sent_at") or ""),
             attachment_count=int(raw.get("attachment_count") or 0),
             link_count=int(raw.get("link_count") or 0),
             error_code=raw.get("error_code"),
             message=str(raw.get("error") or "发送完成"),
-            details={"body_text": str(raw.get("body_text") or body_text or "")},
+            details={
+                "body_text": str(raw.get("body_text") or body_text or ""),
+                "from_account_id": from_account_id or "",
+            },
         )
 
     def submit_result(
@@ -1066,9 +2162,36 @@ class ApplicationService:
         )
         return stable_request_id, call_id
 
-    def get_oauth_status(self) -> ServiceResult:
+    def get_oauth_status(
+        self, account_id: str | None = None
+    ) -> ServiceResult:
         """获取 Gmail API 授权状态，不刷新也不打开浏览器。"""
-        state = get_oauth_state(self.cfg)
+        if account_id:
+            self.initialize()
+        oauth_cfg = self.cfg
+        if account_id:
+            try:
+                context = self._account_router.context(
+                    account_id, require_enabled=False
+                )
+                if context.account.get("provider") != "gmail":
+                    raise AccountRuntimeError(
+                        "oauth_not_supported", "该账号不使用 Gmail OAuth"
+                    )
+                oauth_cfg = context.config
+            except AccountRuntimeError as exc:
+                return ServiceResult(
+                    OperationStatus.FAILED,
+                    error_code=exc.error_code,
+                    message=str(exc),
+                )
+            except CredentialError as exc:
+                return ServiceResult(
+                    OperationStatus.FAILED,
+                    error_code="credential_read_failed",
+                    message=str(exc),
+                )
+        state = get_oauth_state(oauth_cfg)
         status = (
             OperationStatus.SUCCESS
             if state["state"] in {"READY", "TOKEN_EXPIRED_REFRESHABLE"}
@@ -1081,7 +2204,11 @@ class ApplicationService:
         )
 
     def import_oauth_credentials(
-        self, source: str | Path, *, replace: bool = False
+        self,
+        source: str | Path,
+        *,
+        replace: bool = False,
+        account_id: str | None = None,
     ) -> ServiceResult:
         """验证并把 OAuth 客户端配置导入当前用户的受控目录。"""
         from agent_mail_bridge.oauth_storage import (
@@ -1090,10 +2217,30 @@ class ApplicationService:
             validate_oauth_credentials_file,
         )
 
+        if account_id:
+            self.initialize()
+        destination = self.cfg.gmail_api_credentials_path
+        if account_id:
+            try:
+                destination, _token_path = self._account_router.oauth_paths(
+                    account_id
+                )
+            except AccountRuntimeError as exc:
+                return ServiceResult(
+                    OperationStatus.FAILED,
+                    error_code=exc.error_code,
+                    message=str(exc),
+                )
+            except CredentialError as exc:
+                return ServiceResult(
+                    OperationStatus.FAILED,
+                    error_code="credential_read_failed",
+                    message=str(exc),
+                )
         try:
             target = import_oauth_credentials(
                 Path(source),
-                destination=self.cfg.gmail_api_credentials_path,
+                destination=destination,
                 replace=replace,
             )
         except FileExistsError as exc:
@@ -1135,14 +2282,26 @@ class ApplicationService:
     def create_gmail_oauth_session(
         self,
         *,
+        account_id: str | None = None,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
         timeout_seconds: float = 300.0,
     ):
         """创建一次可取消 OAuth 会话；创建本身不执行网络或浏览器操作。"""
         from agent_mail_bridge.gmail_api_auth import GmailOAuthSession
 
+        oauth_cfg = self.cfg
+        if account_id:
+            self.initialize()
+            context = self._account_router.context(
+                account_id, require_enabled=False
+            )
+            if context.account.get("provider") != "gmail":
+                raise AccountRuntimeError(
+                    "oauth_not_supported", "该账号不使用 Gmail OAuth"
+                )
+            oauth_cfg = context.config
         return GmailOAuthSession(
-            self.cfg,
+            oauth_cfg,
             progress_callback=progress_callback,
             timeout_seconds=timeout_seconds,
         )
@@ -1150,6 +2309,7 @@ class ApplicationService:
     def authorize_gmail_api(
         self,
         *,
+        account_id: str | None = None,
         session=None,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
         timeout_seconds: float = 300.0,
@@ -1157,16 +2317,43 @@ class ApplicationService:
         """执行显式 OAuth 会话；GUI 必须从后台 Worker 调用。"""
         self.initialize()
         active_session = session or self.create_gmail_oauth_session(
+            account_id=account_id,
             progress_callback=progress_callback,
             timeout_seconds=timeout_seconds,
         )
         return active_session.run()
 
-    def clear_gmail_oauth_token(self) -> ServiceResult:
+    def clear_gmail_oauth_token(
+        self, account_id: str | None = None
+    ) -> ServiceResult:
         """清除本地 Token，但绝不删除 Desktop credentials。"""
         from agent_mail_bridge.gmail_api_auth import clear_local_gmail_token
 
-        return clear_local_gmail_token(self.cfg)
+        oauth_cfg = self.cfg
+        if account_id:
+            self.initialize()
+            try:
+                context = self._account_router.context(
+                    account_id, require_enabled=False
+                )
+                if context.account.get("provider") != "gmail":
+                    raise AccountRuntimeError(
+                        "oauth_not_supported", "该账号不使用 Gmail OAuth"
+                    )
+                oauth_cfg = context.config
+            except AccountRuntimeError as exc:
+                return ServiceResult(
+                    OperationStatus.FAILED,
+                    error_code=exc.error_code,
+                    message=str(exc),
+                )
+            except CredentialError as exc:
+                return ServiceResult(
+                    OperationStatus.FAILED,
+                    error_code="credential_read_failed",
+                    message=str(exc),
+                )
+        return clear_local_gmail_token(oauth_cfg)
 
     def get_today_files(self) -> ServiceResult:
         self.initialize()
@@ -1528,13 +2715,20 @@ class ApplicationService:
                 OperationStatus.FAILED, error_code="invalid_range", message=str(exc)
             )
 
-        sync_before = self.get_mail_sync_status().details
+        sync_account_id = account_id or current_receive_account_id(self.cfg)
+        sync_before = self.get_mail_sync_status(
+            account_id=sync_account_id
+        ).details
         sync_triggered = False
         sync_error: dict[str, str] | None = None
         cache_is_stale = sync_before.get("freshness") != "fresh"
         if ensure_fresh and cache_is_stale:
             sync_triggered = True
-            received = self.receive(automatic=True, wait_for_process_lock=5.0)
+            received = self.receive(
+                account_id=account_id,
+                automatic=True,
+                wait_for_process_lock=5.0,
+            )
             if received.error_code in {"sync_in_progress", "receive_busy"}:
                 return ServiceResult(
                     OperationStatus.CANCELLED,
@@ -1546,7 +2740,7 @@ class ApplicationService:
             success_at = now_text if received.ok else sync_before.get("last_success_at")
             save_auto_receive_state(
                 self.cfg.db_path,
-                account_id=current_receive_account_id(self.cfg),
+                account_id=sync_account_id,
                 last_check_at=now_text,
                 last_success_at=success_at,
                 last_result=received.message,
@@ -1593,7 +2787,9 @@ class ApplicationService:
                 OperationStatus.FAILED, error_code="invalid_mail_query", message=str(exc)
             )
         messages = [_mail_search_summary(row) for row in rows]
-        sync_after = self.get_mail_sync_status().details
+        sync_after = self.get_mail_sync_status(
+            account_id=sync_account_id
+        ).details
         return ServiceResult(
             OperationStatus.SUCCESS,
             message="未找到匹配邮件" if not messages else f"找到 {len(messages)} 封邮件",
@@ -1744,14 +2940,28 @@ class ApplicationService:
             details=details,
         )
 
-    def get_mail_sync_status(self) -> ServiceResult:
+    def get_mail_sync_status(
+        self, account_id: str | None = None
+    ) -> ServiceResult:
         """返回持久化调度、新鲜度、重试和跨进程同步状态。"""
         self.initialize()
-        account_id = current_receive_account_id(self.cfg)
-        state = get_auto_receive_state(self.cfg.db_path, account_id=account_id)
-        retries = count_receive_retries(self.cfg.db_path, account_id=account_id)
+        target_account_id = account_id or current_receive_account_id(self.cfg)
+        if account_id and query_mail_account(
+            self.cfg.db_path, target_account_id
+        ) is None:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="account_not_found",
+                message="邮箱账号不存在或已移除",
+            )
+        state = get_auto_receive_state(
+            self.cfg.db_path, account_id=target_account_id
+        )
+        retries = count_receive_retries(
+            self.cfg.db_path, account_id=target_account_id
+        )
         newest = query_mail_messages(
-            self.cfg.db_path, account_id=account_id, limit=1
+            self.cfg.db_path, account_id=target_account_id, limit=1
         )
         latest_local_at = None
         if newest:
@@ -1763,20 +2973,30 @@ class ApplicationService:
         local_age = max(0, int((now - latest_local).total_seconds())) if latest_local else None
         threshold = int(self.cfg.mcp_mail_freshness_seconds)
         freshness = "unknown" if age is None else "fresh" if age <= threshold else "stale"
-        lock_path = self.cfg.data_root_path / ".locks" / "receive.lock"
+        lock_paths = [
+            self.cfg.data_root_path
+            / ".locks"
+            / f"receive-{target_account_id}.lock"
+        ]
+        if account_id is None:
+            lock_paths.append(
+                self.cfg.data_root_path / ".locks" / "receive.lock"
+            )
         details = {
             **state,
             **retries,
             "enabled": bool(state.get("enabled")),
             "background_status": "running" if state.get("enabled") else "stopped",
-            "is_syncing": not is_lock_available(lock_path),
+            "is_syncing": any(
+                not is_lock_available(lock_path) for lock_path in lock_paths
+            ),
             "freshness": freshness,
             "freshness_threshold_seconds": threshold,
             "data_age_seconds": age,
             "latest_local_mail_at": latest_local_at,
             "latest_local_mail_age_seconds": local_age,
             "last_error": _redact_text(str(state.get("last_error") or ""), self.cfg),
-            "account_id": account_id,
+            "account_id": target_account_id,
             "accounts": query_mail_accounts(self.cfg.db_path, enabled_only=True),
         }
         return ServiceResult(OperationStatus.SUCCESS, details=details)
@@ -2151,7 +3371,12 @@ class ApplicationService:
                 OperationStatus.CANCELLED, error_code="restore_confirmation_required",
                 message="恢复前必须明确确认",
             )
-        if self._receive_lock.locked() or not self._maintenance_lock.acquire(blocking=False):
+        with self._account_receive_locks_guard:
+            receive_busy = any(
+                lock.locked()
+                for lock in self._account_receive_locks.values()
+            )
+        if receive_busy or not self._maintenance_lock.acquire(blocking=False):
             return ServiceResult(
                 OperationStatus.CANCELLED, error_code="maintenance_busy",
                 message="当前有任务运行，暂不能恢复数据库",
@@ -2208,6 +3433,7 @@ class ApplicationService:
         self.initialize()
         backend = _effective_receive_backend(self.cfg)
         oauth = get_oauth_state(self.cfg)
+        accounts_result = self.list_mail_accounts()
         return ServiceResult(
             OperationStatus.SUCCESS,
             details={
@@ -2216,8 +3442,8 @@ class ApplicationService:
                 "imap": "configured" if self.cfg.gmail_address and self.cfg.gmail_app_password else "not_configured",
                 "gmail_api": oauth,
                 "qq_smtp": "configured" if self.cfg.qq_email and self.cfg.qq_auth_code else "not_configured",
-                "mail_accounts": query_mail_accounts(
-                    self.cfg.db_path, enabled_only=True
+                "mail_accounts": accounts_result.details.get(
+                    "accounts", []
                 ),
             },
         )

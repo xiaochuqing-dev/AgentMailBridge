@@ -205,6 +205,75 @@ def import_oauth_credentials(
     return target
 
 
+def account_oauth_paths(
+    *,
+    account_id: str,
+    legacy_credentials_path: Path | str,
+    legacy_token_path: Path | str,
+) -> tuple[Path, Path]:
+    """返回按账号隔离的 Desktop client 副本和 Token 路径。"""
+    normalized_id = str(account_id or "").strip().casefold()
+    if not re.fullmatch(r"acct_[0-9a-f]{24}", normalized_id):
+        raise OAuthImportError("invalid_account_id", "account_id 格式无效")
+    credentials = Path(legacy_credentials_path).expanduser().resolve()
+    token = Path(legacy_token_path).expanduser().resolve()
+    common_parent = (
+        credentials.parent
+        if credentials.parent == token.parent
+        else token.parent
+    )
+    account_root = common_parent / "accounts" / normalized_id
+    return account_root / "credentials.json", account_root / "token.json"
+
+
+def ensure_account_oauth_storage(
+    *,
+    account_id: str,
+    legacy_credentials_path: Path | str,
+    legacy_token_path: Path | str,
+    copy_legacy: bool,
+) -> tuple[Path, Path]:
+    """为匹配的 legacy Gmail 一次性复制 OAuth 文件；不删除或改写旧文件。"""
+    credentials_target, token_target = account_oauth_paths(
+        account_id=account_id,
+        legacy_credentials_path=legacy_credentials_path,
+        legacy_token_path=legacy_token_path,
+    )
+    if not copy_legacy:
+        return credentials_target, token_target
+    migration_marker = credentials_target.parent / ".legacy-import-complete"
+    if migration_marker.exists():
+        return credentials_target, token_target
+    legacy_credentials = Path(legacy_credentials_path).expanduser().resolve()
+    legacy_token = Path(legacy_token_path).expanduser().resolve()
+    if not credentials_target.exists() and legacy_credentials.exists():
+        import_oauth_credentials(
+            legacy_credentials,
+            destination=credentials_target,
+            replace=False,
+        )
+    if not token_target.exists() and legacy_token.exists():
+        try:
+            token_bytes = legacy_token.read_bytes()
+        except OSError as exc:
+            raise OAuthImportError(
+                "token_unreadable", "旧 OAuth Token 无法读取，原文件保持不变"
+            ) from exc
+        _atomic_replace_bytes(
+            token_target,
+            token_bytes,
+            error_code="token_save_failed",
+            error_message="按账号迁移 OAuth Token 失败，原有 Token 已保留",
+        )
+    _atomic_replace_bytes(
+        migration_marker,
+        b"completed\n",
+        error_code="oauth_migration_marker_failed",
+        error_message="按账号 OAuth 迁移状态保存失败，原有 OAuth 文件已保留",
+    )
+    return credentials_target, token_target
+
+
 def atomic_write_private_text(
     target: Path | str,
     text: str,

@@ -66,7 +66,8 @@ OUTBOUND_ID_HEADER = "X-AgentMailBridge-Outbound-ID"
 
 
 def _sender_account_ref(cfg: AppConfig) -> str:
-    return f"qq:{cfg.qq_email.strip().casefold() or 'unconfigured'}"
+    provider = str(getattr(cfg, "runtime_provider", "") or "qq").strip().casefold()
+    return f"{provider}:{cfg.qq_email.strip().casefold() or 'unconfigured'}"
 
 
 def _outbound_id_for_request(request_id: str) -> str:

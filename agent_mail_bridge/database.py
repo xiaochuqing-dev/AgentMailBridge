@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS mail_accounts (
     capabilities_json TEXT NOT NULL DEFAULT '[]',
     provider_settings_json TEXT NOT NULL DEFAULT '{}',
     source TEXT NOT NULL DEFAULT 'legacy_config',
+    removed_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(provider, email_address COLLATE NOCASE)
@@ -538,8 +539,12 @@ _RECEIVE_RULE_EVALUATIONS_V14_COLUMNS = {
     "account_id": "TEXT",
 }
 
+_MAIL_ACCOUNTS_V141_COLUMNS = {
+    "removed_at": "TEXT",
+}
+
 MULTI_ACCOUNT_MIGRATION_KEY = "multi_account_core_v1"
-MULTI_ACCOUNT_SCHEMA_VERSION = 1
+MULTI_ACCOUNT_SCHEMA_VERSION = 2
 LEGACY_UNKNOWN_ACCOUNT_ID = stable_account_id("generic", "legacy-unknown")
 
 RECEIVE_RETRY_DELAYS_SECONDS = (60, 300, 1800, 7200)
@@ -570,6 +575,7 @@ def init_db(
             _migrate_mail_packages_v14(conn)
             _migrate_outbound_messages_v14(conn)
             _migrate_receive_rule_evaluations_v14(conn)
+            _add_missing_columns(conn, "mail_accounts", _MAIL_ACCOUNTS_V141_COLUMNS)
             _migrate_multi_account_core(conn, tuple(legacy_accounts or ()))
             _ensure_unique_indexes(conn)
             _backfill_legacy_outbound_messages(conn)
@@ -694,13 +700,13 @@ def _upsert_account_record(conn: sqlite3.Connection, account: MailAccount) -> No
             email_address=excluded.email_address,
             display_name=excluded.display_name,
             auth_type=excluded.auth_type,
-            receive_enabled=excluded.receive_enabled,
-            send_enabled=excluded.send_enabled,
-            enabled=excluded.enabled,
+            receive_enabled=mail_accounts.receive_enabled,
+            send_enabled=mail_accounts.send_enabled,
+            enabled=mail_accounts.enabled,
             data_namespace=excluded.data_namespace,
             capabilities_json=excluded.capabilities_json,
             provider_settings_json=excluded.provider_settings_json,
-            source=excluded.source,
+            source=mail_accounts.source,
             updated_at=excluded.updated_at
         """,
         {**values, "created_at": now, "updated_at": now},
@@ -1704,12 +1710,24 @@ def multi_account_migration_needed(db_path: Path | str) -> bool:
             }
             if column not in columns:
                 return True
+        account_columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(mail_accounts)"
+            ).fetchall()
+        }
+        if "removed_at" not in account_columns:
+            return True
         row = connection.execute(
             "SELECT status, schema_version FROM migration_metadata "
             "WHERE migration_key = ?",
             (MULTI_ACCOUNT_MIGRATION_KEY,),
         ).fetchone()
-        return not row or row["status"] != "completed" or int(row["schema_version"]) < 1
+        return (
+            not row
+            or row["status"] != "completed"
+            or int(row["schema_version"]) < MULTI_ACCOUNT_SCHEMA_VERSION
+        )
     finally:
         connection.close()
 
@@ -1733,9 +1751,14 @@ def sync_mail_accounts(
 
 
 def query_mail_accounts(
-    db_path: Path | str, *, enabled_only: bool = False
+    db_path: Path | str, *, enabled_only: bool = False, include_removed: bool = False
 ) -> list[dict[str, Any]]:
-    clause = " WHERE enabled = 1" if enabled_only else ""
+    predicates: list[str] = []
+    if enabled_only:
+        predicates.append("enabled = 1")
+    if not include_removed:
+        predicates.append("removed_at IS NULL")
+    clause = f" WHERE {' AND '.join(predicates)}" if predicates else ""
     with _get_conn(db_path) as conn:
         rows = conn.execute(
             "SELECT * FROM mail_accounts"
@@ -1761,16 +1784,187 @@ def query_mail_accounts(
 
 
 def get_mail_account(
-    db_path: Path | str, account_id: str
+    db_path: Path | str, account_id: str, *, include_removed: bool = False
 ) -> dict[str, Any] | None:
     return next(
         (
             item
-            for item in query_mail_accounts(db_path)
+            for item in query_mail_accounts(
+                db_path, include_removed=include_removed
+            )
             if item["account_id"] == str(account_id)
         ),
         None,
     )
+
+
+def create_mail_account(
+    db_path: Path | str, account: MailAccount
+) -> dict[str, Any]:
+    """创建或恢复同一稳定身份的账号；不触碰历史邮件或秘密。"""
+    with _get_conn(db_path) as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            _upsert_account_record(conn, account)
+            conn.execute(
+                """
+                UPDATE mail_accounts
+                SET enabled = ?, receive_enabled = ?, send_enabled = ?,
+                    removed_at = NULL, updated_at = ?
+                WHERE account_id = ?
+                """,
+                (
+                    1 if account.enabled else 0,
+                    1 if account.receive_enabled else 0,
+                    1 if account.send_enabled else 0,
+                    _now(),
+                    account.account_id,
+                ),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    result = get_mail_account(db_path, account.account_id)
+    if result is None:
+        raise sqlite3.IntegrityError("账号创建后无法读取")
+    return result
+
+
+def update_mail_account(
+    db_path: Path | str,
+    account_id: str,
+    *,
+    display_name: str | None = None,
+    auth_type: str | None = None,
+    receive_enabled: bool | None = None,
+    send_enabled: bool | None = None,
+    enabled: bool | None = None,
+    capabilities: Iterable[str] | None = None,
+    provider_settings: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """更新可变账号属性；provider、邮箱地址与稳定 ID 不可原地改变。"""
+    changes: dict[str, Any] = {}
+    if display_name is not None:
+        changes["display_name"] = str(display_name).strip()
+    if auth_type is not None:
+        changes["auth_type"] = str(auth_type).strip()
+    if receive_enabled is not None:
+        changes["receive_enabled"] = 1 if receive_enabled else 0
+    if send_enabled is not None:
+        changes["send_enabled"] = 1 if send_enabled else 0
+    if enabled is not None:
+        changes["enabled"] = 1 if enabled else 0
+    if capabilities is not None:
+        changes["capabilities_json"] = json.dumps(
+            sorted({str(item) for item in capabilities if str(item)}),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    if provider_settings is not None:
+        changes["provider_settings_json"] = json.dumps(
+            provider_settings,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    if not changes:
+        result = get_mail_account(db_path, account_id)
+        if result is None:
+            raise ValueError("邮箱账号不存在")
+        return result
+    changes["updated_at"] = _now()
+    assignments = ", ".join(f"{name} = :{name}" for name in changes)
+    with _get_conn(db_path) as conn:
+        cursor = conn.execute(
+            f"UPDATE mail_accounts SET {assignments} "
+            "WHERE account_id = :account_id AND removed_at IS NULL",
+            {**changes, "account_id": str(account_id)},
+        )
+        if cursor.rowcount != 1:
+            conn.rollback()
+            raise ValueError("邮箱账号不存在或已移除")
+        if enabled is False:
+            conn.execute(
+                "UPDATE account_sync_states SET enabled = 0, next_check_at = NULL, "
+                "updated_at = ? WHERE account_id = ?",
+                (_now(), str(account_id)),
+            )
+        conn.commit()
+    result = get_mail_account(db_path, account_id)
+    if result is None:
+        raise ValueError("邮箱账号不存在")
+    return result
+
+
+def remove_mail_account(
+    db_path: Path | str, account_id: str
+) -> dict[str, Any]:
+    """保守移除账号：停止运行时并保留所有历史 ownership。"""
+    removed_at = _now()
+    with _get_conn(db_path) as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """
+                UPDATE mail_accounts
+                SET enabled = 0, receive_enabled = 0, send_enabled = 0,
+                    removed_at = ?, updated_at = ?
+                WHERE account_id = ? AND removed_at IS NULL
+                """,
+                (removed_at, removed_at, str(account_id)),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("邮箱账号不存在或已移除")
+            conn.execute(
+                """
+                UPDATE account_sync_states
+                SET enabled = 0, next_check_at = NULL, updated_at = ?
+                WHERE account_id = ?
+                """,
+                (removed_at, str(account_id)),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    result = get_mail_account(db_path, account_id, include_removed=True)
+    if result is None:
+        raise ValueError("邮箱账号不存在")
+    return result
+
+
+def account_owned_fact_counts(
+    db_path: Path | str, account_id: str
+) -> dict[str, int]:
+    """返回软移除提示所需的非敏感历史数量。"""
+    queries = {
+        "mail_packages": (
+            "SELECT COUNT(*) FROM mail_packages WHERE account_id = ?",
+            account_id,
+        ),
+        "received_messages": (
+            "SELECT COUNT(*) FROM received_messages WHERE account_id = ?",
+            account_id,
+        ),
+        "outbound_messages": (
+            "SELECT COUNT(*) FROM outbound_messages WHERE from_account_id = ?",
+            account_id,
+        ),
+        "sent_files": (
+            "SELECT COUNT(*) FROM sent_files WHERE from_account_id = ?",
+            account_id,
+        ),
+        "receive_retries": (
+            "SELECT COUNT(*) FROM receive_retries WHERE account_id = ?",
+            account_id,
+        ),
+    }
+    with _get_conn(db_path) as conn:
+        return {
+            name: int(conn.execute(sql, (value,)).fetchone()[0])
+            for name, (sql, value) in queries.items()
+        }
 
 
 def query_mailboxes(
@@ -1788,6 +1982,53 @@ def query_mailboxes(
                 "SELECT * FROM mailboxes ORDER BY account_id, mailbox_role, external_ref"
             ).fetchall()
     return [dict(row) for row in rows]
+
+
+def upsert_mailboxes(
+    db_path: Path | str,
+    account_id: str,
+    mailboxes: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """幂等保存 Provider 发现的目录事实；不删除暂时未返回的旧目录。"""
+    if get_mail_account(db_path, account_id) is None:
+        raise ValueError("邮箱账号不存在或已移除")
+    now = _now()
+    with _get_conn(db_path) as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for item in mailboxes:
+                external_ref = str(item.get("external_ref") or "").strip()
+                if not external_ref:
+                    continue
+                mailbox_id = stable_mailbox_id(account_id, external_ref)
+                conn.execute(
+                    """
+                    INSERT INTO mailboxes
+                        (mailbox_id, account_id, external_ref, display_name,
+                         mailbox_role, enabled, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                    ON CONFLICT(mailbox_id) DO UPDATE SET
+                        external_ref=excluded.external_ref,
+                        display_name=excluded.display_name,
+                        mailbox_role=excluded.mailbox_role,
+                        enabled=1,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        mailbox_id,
+                        account_id,
+                        external_ref,
+                        str(item.get("display_name") or external_ref),
+                        str(item.get("mailbox_role") or "other"),
+                        now,
+                        now,
+                    ),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return query_mailboxes(db_path, account_id=account_id)
 
 
 def outbound_mail_migration_needed(db_path: Path | str) -> bool:
@@ -3086,6 +3327,7 @@ def save_auto_receive_state(
     db_path: Path | str,
     *,
     account_id: str | None = None,
+    broadcast_accounts: bool = True,
     **changes: Any,
 ) -> dict[str, Any]:
     """以白名单字段更新单行调度状态，跨重启保留真实运行事实。"""
@@ -3099,42 +3341,53 @@ def save_auto_receive_state(
     current.update(values)
     now = _now()
     with _get_conn(db_path) as conn:
-        conn.execute(
-            """
-            INSERT INTO auto_receive_state
-                (id, enabled, interval_seconds, last_check_at, last_success_at,
-                 last_result, last_error, consecutive_global_failures,
-                 next_check_at, checkpoint, updated_at)
-            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                enabled=excluded.enabled,
-                interval_seconds=excluded.interval_seconds,
-                last_check_at=excluded.last_check_at,
-                last_success_at=excluded.last_success_at,
-                last_result=excluded.last_result,
-                last_error=excluded.last_error,
-                consecutive_global_failures=excluded.consecutive_global_failures,
-                next_check_at=excluded.next_check_at,
-                checkpoint=excluded.checkpoint,
-                updated_at=excluded.updated_at
-            """,
-            (
-                1 if current.get("enabled") else 0,
-                max(30, int(current.get("interval_seconds") or 60)),
-                current.get("last_check_at"), current.get("last_success_at"),
-                current.get("last_result"), current.get("last_error"),
-                max(0, int(current.get("consecutive_global_failures") or 0)),
-                current.get("next_check_at"), current.get("checkpoint"), now,
-            ),
+        if account_id is None:
+            conn.execute(
+                """
+                INSERT INTO auto_receive_state
+                    (id, enabled, interval_seconds, last_check_at, last_success_at,
+                     last_result, last_error, consecutive_global_failures,
+                     next_check_at, checkpoint, updated_at)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    enabled=excluded.enabled,
+                    interval_seconds=excluded.interval_seconds,
+                    last_check_at=excluded.last_check_at,
+                    last_success_at=excluded.last_success_at,
+                    last_result=excluded.last_result,
+                    last_error=excluded.last_error,
+                    consecutive_global_failures=excluded.consecutive_global_failures,
+                    next_check_at=excluded.next_check_at,
+                    checkpoint=excluded.checkpoint,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    1 if current.get("enabled") else 0,
+                    max(30, int(current.get("interval_seconds") or 60)),
+                    current.get("last_check_at"), current.get("last_success_at"),
+                    current.get("last_result"), current.get("last_error"),
+                    max(0, int(current.get("consecutive_global_failures") or 0)),
+                    current.get("next_check_at"), current.get("checkpoint"), now,
+                ),
+            )
+        target_account_ids = (
+            [account_id]
+            if account_id
+            else [
+                str(row["account_id"])
+                for row in conn.execute(
+                    "SELECT account_id FROM mail_accounts "
+                    "WHERE receive_enabled = 1 AND enabled = 1"
+                ).fetchall()
+            ]
+            if broadcast_accounts
+            else []
         )
-        target_account_ids = [account_id] if account_id else [
-            str(row["account_id"])
-            for row in conn.execute(
-                "SELECT account_id FROM mail_accounts "
-                "WHERE receive_enabled = 1 AND enabled = 1"
-            ).fetchall()
-        ]
         for target_account_id in filter(None, target_account_ids):
+            account_state = get_auto_receive_state(
+                db_path, account_id=str(target_account_id)
+            )
+            account_state.update(values)
             conn.execute(
                 """
                 INSERT INTO account_sync_states
@@ -3157,12 +3410,24 @@ def save_auto_receive_state(
                 """,
                 (
                     target_account_id,
-                    1 if current.get("enabled") else 0,
-                    max(30, int(current.get("interval_seconds") or 60)),
-                    current.get("last_check_at"), current.get("last_success_at"),
-                    current.get("last_result"), current.get("last_error"),
-                    max(0, int(current.get("consecutive_global_failures") or 0)),
-                    current.get("next_check_at"), current.get("checkpoint"), now,
+                    1 if account_state.get("enabled") else 0,
+                    max(30, int(account_state.get("interval_seconds") or 60)),
+                    account_state.get("last_check_at"),
+                    account_state.get("last_success_at"),
+                    account_state.get("last_result"),
+                    account_state.get("last_error"),
+                    max(
+                        0,
+                        int(
+                            account_state.get(
+                                "consecutive_global_failures"
+                            )
+                            or 0
+                        ),
+                    ),
+                    account_state.get("next_check_at"),
+                    account_state.get("checkpoint"),
+                    now,
                 ),
             )
         conn.commit()

@@ -12,6 +12,9 @@ google-api-python-client>=2.0.0
 google-auth-httplib2>=0.2.0
 google-auth-oauthlib>=1.0.0
 
+# Generic IMAP/SMTP Foundation：成熟 UID、LIST、SPECIAL-USE 与国际化目录解析
+IMAPClient>=3.0,<4
+
 # 第二批次正式桌面界面；项目只使用 QtCore/QtGui/QtNetwork/QtWidgets。
 # 使用 Essentials 避免安装未使用的 WebEngine、Multimedia 等 Addons。
 PySide6-Essentials>=6.8,<7

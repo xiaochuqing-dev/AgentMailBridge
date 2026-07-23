@@ -1,7 +1,8 @@
 """Provider/Adapter 能力注册表。
 
-Adapter 在 v1.4 第一阶段只声明稳定边界并指向既有实现，不重新实现协议。
-Generic IMAP/SMTP 与 Microsoft 仅登记未来接入能力，不会被误报为已支持。
+Adapter 声明稳定能力边界并指向既有实现，不重复实现协议。
+Generic IMAP/SMTP 只接通连接测试与目录发现基础；Microsoft 仍为 planned，
+两者都不会被误报为已正式支持收发。
 """
 
 from __future__ import annotations
@@ -46,11 +47,14 @@ _ADAPTERS = {
     "generic_imap_smtp": ProviderAdapter(
         provider="generic_imap_smtp",
         display_name="标准 IMAP/SMTP",
-        authentication_types=("password", "app_password", "oauth2"),
-        available_capabilities=("receive", "send"),
-        implemented_capabilities=(),
+        authentication_types=("password", "app_password"),
+        available_capabilities=(
+            "receive", "send", "connection_test", "folder_discovery"
+        ),
+        implemented_capabilities=("connection_test", "folder_discovery"),
         receive_backends=("imap",),
         send_backends=("smtp",),
+        status="planned",
     ),
     "microsoft": ProviderAdapter(
         provider="microsoft",

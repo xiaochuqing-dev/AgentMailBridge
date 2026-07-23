@@ -66,7 +66,8 @@ class ArchiveResult:
 
 def stable_account_ref(cfg: AppConfig) -> str:
     address = canonical_gmail_address(cfg.gmail_address)
-    return f"gmail:{address}" if address else "gmail:legacy-unknown"
+    provider = str(getattr(cfg, "runtime_provider", "") or "gmail").strip().casefold()
+    return f"{provider}:{address}" if address else f"{provider}:legacy-unknown"
 
 
 def stable_package_id(account_ref: str, message_id: str) -> str:

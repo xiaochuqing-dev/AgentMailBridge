@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -16,6 +17,21 @@ SECRET_ENV_KEYS = {
     GMAIL_IMAP_SECRET: "GMAIL_APP_PASSWORD",
     QQ_SMTP_SECRET: "QQ_AUTH_CODE",
 }
+ACCOUNT_IMAP_SECRET = "imap_password"
+ACCOUNT_SMTP_SECRET = "smtp_password"
+ACCOUNT_SECRET_KINDS = {ACCOUNT_IMAP_SECRET, ACCOUNT_SMTP_SECRET}
+_ACCOUNT_ID_PATTERN = re.compile(r"^acct_[0-9a-f]{24}$")
+
+
+def account_credential_name(account_id: str, secret_kind: str) -> str:
+    """生成不含邮箱地址的按账号 Credential Manager key。"""
+    normalized_id = str(account_id or "").strip().casefold()
+    normalized_kind = str(secret_kind or "").strip().casefold()
+    if not _ACCOUNT_ID_PATTERN.fullmatch(normalized_id):
+        raise CredentialError("account_id 格式无效")
+    if normalized_kind not in ACCOUNT_SECRET_KINDS:
+        raise CredentialError("账号凭据类型无效")
+    return f"account:{normalized_id}:{normalized_kind}"
 
 
 class CredentialError(RuntimeError):
@@ -164,6 +180,38 @@ class CredentialService:
 
     def delete(self, name: str) -> None:
         self.backend.delete(name)
+
+    def get_for_account(
+        self,
+        account_id: str,
+        secret_kind: str,
+        *,
+        legacy_name: str | None = None,
+        migrate_legacy: bool = False,
+    ) -> str | None:
+        """读取按账号秘密；只有明确匹配的 legacy 账号才能指定旧 key 回退。"""
+        name = account_credential_name(account_id, secret_kind)
+        value = self.get(name)
+        if value or not legacy_name:
+            return value
+        legacy_value = self.get(legacy_name)
+        if legacy_value and migrate_legacy:
+            self.set(name, legacy_value)
+        return legacy_value
+
+    def set_for_account(
+        self, account_id: str, secret_kind: str, value: str
+    ) -> None:
+        self.set(account_credential_name(account_id, secret_kind), value)
+
+    def delete_for_account(self, account_id: str, secret_kind: str) -> None:
+        self.delete(account_credential_name(account_id, secret_kind))
+
+    def account_status(self, account_id: str) -> dict[str, bool]:
+        return {
+            kind: bool(self.get(account_credential_name(account_id, kind)))
+            for kind in sorted(ACCOUNT_SECRET_KINDS)
+        }
 
     def status(self) -> dict[str, bool]:
         return {name: bool(self.get(name)) for name in SECRET_ENV_KEYS}
