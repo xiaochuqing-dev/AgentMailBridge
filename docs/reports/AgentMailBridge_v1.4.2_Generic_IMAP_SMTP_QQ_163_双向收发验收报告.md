@@ -180,8 +180,12 @@ CONDITIONALLY PASS。
 
 ## 34. Commits
 
-提交前状态：待生成。完成 Git 提交后将在本报告补记实际 commit。
+- `65174d7 feat: enable generic IMAP SMTP mail providers`
+- `316ab14 test: cover generic mail provider runtime`
+- `f3a7690 docs: document v1.4.2 design and validation`
+
+本节的交付状态补记使用独立文档提交承载，避免改写以上已验收提交。
 
 ## 35. Push status
 
-提交前状态：待执行。目标为 `origin/master`，禁止 force push；不创建 Tag、GitHub Release 或 Release Assets。
+PASS。2026-07-23 已正常推送 `10eea93..f3a7690` 到 `origin/master`，未使用 force push。当前状态补记将在随后一个文档提交中同步到同一主分支。不创建 Tag、GitHub Release 或 Release Assets。
