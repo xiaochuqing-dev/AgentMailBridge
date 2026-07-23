@@ -222,10 +222,12 @@ Outlook/Microsoft 继续为 planned。
 
 实现提交：`28f08e73b352e3623fd792ba1ece022b462cf2b4`，`feat: harden provider validation for v1.4.3`
 
-文档与交付状态提交将在本报告首次提交后补记。
+验收文档提交：`5c3ee22fe53976b073647d311cf0bc45f197068c`，`docs: record v1.4.3 validation evidence`
+
+最终 push 状态补记使用独立文档提交。
 
 ## 37. push status
 
-当前状态：PENDING。最终文档提交和 GitHub push 完成后，将在本报告中补记远端 commit 和验证结果。
+状态：PASS。实现与包含本报告的验收文档已通过普通 `git push origin master` 推送到 `https://github.com/xiaochuqing-dev/AgentMailBridge.git`，远端 `master` 已更新到 `5c3ee22fe53976b073647d311cf0bc45f197068c`。最终状态补记提交完成后继续普通推送，并再次核对远端 HEAD。
 
 本阶段没有创建 Tag、GitHub Release 或公开 Release Assets。
