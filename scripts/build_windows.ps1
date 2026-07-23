@@ -10,6 +10,10 @@ $Version = (& python -c "from agent_mail_bridge import __version__; print(__vers
 if ($LASTEXITCODE -ne 0 -or -not $Version) { throw "Unable to read product version." }
 
 & (Join-Path $PSScriptRoot "clean_build.ps1")
+$PreflightArgs = @((Join-Path $PSScriptRoot "full_suite_preflight.py"))
+if ($SkipTests) { $PreflightArgs += "--skip-tests" }
+& python @PreflightArgs
+if ($LASTEXITCODE -ne 0) { throw "Full Suite Preflight failed." }
 if (-not $SkipTests) {
     & python -m pytest -q
     if ($LASTEXITCODE -ne 0) { throw "Automated tests failed." }

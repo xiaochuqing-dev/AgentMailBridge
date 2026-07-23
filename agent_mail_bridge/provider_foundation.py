@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import socket
 import smtplib
 import ssl
 from dataclasses import dataclass
@@ -96,6 +97,99 @@ class ProviderFoundationError(ValueError):
         self.error_code = error_code
 
 
+def mailbox_text(value: Any) -> str:
+    """把 IMAPClient 或兼容服务端返回的目录名规范为 Unicode。"""
+    if not isinstance(value, bytes):
+        return str(value)
+    try:
+        from imapclient.imap_utf7 import decode as decode_imap_utf7
+
+        return decode_imap_utf7(value)
+    except (ImportError, TypeError, UnicodeError, ValueError):
+        return value.decode("utf-8", errors="replace")
+
+
+def classify_protocol_error(
+    protocol: str, exc: Exception
+) -> tuple[str, str]:
+    """生成可诊断但不包含服务端原文或凭据的连接错误。"""
+    normalized_protocol = str(protocol or "").strip().casefold()
+    prefix = "imap" if normalized_protocol == "imap" else "smtp"
+    label = prefix.upper()
+    if isinstance(exc, ProviderFoundationError):
+        return exc.error_code, str(exc)
+    text = str(exc).casefold()
+    class_name = type(exc).__name__.casefold()
+    if isinstance(exc, ssl.SSLError) or any(
+        marker in text for marker in ("ssl", "tls", "certificate")
+    ):
+        return f"{prefix}_tls_failed", f"{label} TLS 连接失败"
+    if isinstance(exc, (socket.timeout, TimeoutError)) or any(
+        marker in text for marker in ("timeout", "timed out")
+    ):
+        return f"{prefix}_timeout", f"{label} 连接超时"
+    if any(
+        marker in text
+        for marker in (
+            "too many login",
+            "too many connection",
+            "rate limit",
+            "temporarily blocked",
+            "try again later",
+        )
+    ):
+        return f"{prefix}_rate_limited", f"{label} 连接频率受限，请稍后重试"
+    if (
+        isinstance(exc, smtplib.SMTPAuthenticationError)
+        or "loginerror" in class_name
+        or any(
+            marker in text
+            for marker in (
+                "authenticationfailed",
+                "authentication failed",
+                "invalid credential",
+                "invalid password",
+                "[auth",
+            )
+        )
+    ):
+        return (
+            f"{prefix}_auth_failed",
+            f"{label} 认证失败，请检查账号授权码或应用专用密码",
+        )
+    if (
+        isinstance(
+            exc,
+            (
+                ConnectionRefusedError,
+                socket.gaierror,
+            ),
+        )
+        or any(
+            marker in text
+            for marker in (
+                "[unavailable]",
+                "connection refused",
+                "network is unreachable",
+                "no route to host",
+                "name or service not known",
+            )
+        )
+    ):
+        return f"{prefix}_unavailable", f"{label} 服务器暂时不可用"
+    if (
+        isinstance(exc, smtplib.SMTPServerDisconnected)
+        or isinstance(exc, (ConnectionAbortedError, ConnectionResetError))
+        or "abort" in class_name
+        or any(
+            marker in text
+            for marker in ("bye", "disconnect", "connection reset")
+        )
+    ):
+        return f"{prefix}_disconnected", f"{label} 连接已断开"
+    return f"{prefix}_connection_failed", f"{label} 连接失败：{type(exc).__name__}"
+
+
 def detect_provider_profile(email_address: str) -> ProviderProfile | None:
     domain = str(email_address or "").strip().casefold().partition("@")[2]
     return next(
@@ -181,7 +275,7 @@ def _mailbox_role(flags: Any, name: str) -> str:
     for flag, role in SPECIAL_USE_ROLES.items():
         if flag in normalized_flags:
             return role
-    if str(name).casefold() == "inbox":
+    if mailbox_text(name).casefold() == "inbox":
         return "inbox"
     return "other"
 
@@ -208,14 +302,15 @@ def discover_imap_mailboxes(
             ) from exc
         client_factory = IMAPClient
     use_ssl = safe["imap_security"] == SECURITY_SSL
-    client = client_factory(
-        safe["imap_host"],
-        port=safe["imap_port"],
-        ssl=use_ssl,
-        timeout=safe["connect_timeout"],
-        use_uid=True,
-    )
+    client: Any | None = None
     try:
+        client = client_factory(
+            safe["imap_host"],
+            port=safe["imap_port"],
+            ssl=use_ssl,
+            timeout=safe["connect_timeout"],
+            use_uid=True,
+        )
         if not use_ssl:
             client.starttls(ssl_context=ssl.create_default_context())
         client.login(str(username).strip(), secret)
@@ -227,10 +322,11 @@ def discover_imap_mailboxes(
         )
         mailboxes: list[dict[str, Any]] = []
         for flags, delimiter, name in client.list_folders():
-            role = _mailbox_role(flags, str(name))
+            normalized_name = mailbox_text(name)
+            role = _mailbox_role(flags, normalized_name)
             item: dict[str, Any] = {
-                "external_ref": str(name),
-                "display_name": str(name),
+                "external_ref": normalized_name,
+                "display_name": normalized_name,
                 "delimiter": (
                     delimiter.decode("ascii", errors="ignore")
                     if isinstance(delimiter, bytes)
@@ -253,11 +349,17 @@ def discover_imap_mailboxes(
                 }
             mailboxes.append(item)
         return {"capabilities": capabilities, "mailboxes": mailboxes}
+    except ProviderFoundationError:
+        raise
+    except Exception as exc:
+        code, message = classify_protocol_error("imap", exc)
+        raise ProviderFoundationError(code, message) from exc
     finally:
-        try:
-            client.logout()
-        except Exception:
-            pass
+        if client is not None:
+            try:
+                client.logout()
+            except Exception:
+                pass
 
 
 def test_smtp_connection(
@@ -277,20 +379,21 @@ def test_smtp_connection(
     context = ssl.create_default_context()
     smtp_factory = smtp_factory or smtplib.SMTP
     smtp_ssl_factory = smtp_ssl_factory or smtplib.SMTP_SSL
-    if safe["smtp_security"] == SECURITY_SSL:
-        client = smtp_ssl_factory(
-            safe["smtp_host"],
-            safe["smtp_port"],
-            timeout=safe["connect_timeout"],
-            context=context,
-        )
-    else:
-        client = smtp_factory(
-            safe["smtp_host"],
-            safe["smtp_port"],
-            timeout=safe["connect_timeout"],
-        )
+    client: Any | None = None
     try:
+        if safe["smtp_security"] == SECURITY_SSL:
+            client = smtp_ssl_factory(
+                safe["smtp_host"],
+                safe["smtp_port"],
+                timeout=safe["connect_timeout"],
+                context=context,
+            )
+        else:
+            client = smtp_factory(
+                safe["smtp_host"],
+                safe["smtp_port"],
+                timeout=safe["connect_timeout"],
+            )
         client.ehlo()
         if safe["smtp_security"] == SECURITY_STARTTLS:
             client.starttls(context=context)
@@ -301,11 +404,17 @@ def test_smtp_connection(
             "smtp_port": safe["smtp_port"],
             "authenticated": True,
         }
+    except ProviderFoundationError:
+        raise
+    except Exception as exc:
+        code, message = classify_protocol_error("smtp", exc)
+        raise ProviderFoundationError(code, message) from exc
     finally:
-        try:
-            client.quit()
-        except Exception:
+        if client is not None:
             try:
-                client.close()
+                client.quit()
             except Exception:
-                pass
+                try:
+                    client.close()
+                except Exception:
+                    pass

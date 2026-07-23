@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import mimetypes
 import hashlib
+import re
 import socket
 import smtplib
 import ssl
@@ -759,24 +760,76 @@ def _smtp_send_with_stage(cfg: AppConfig, msg: EmailMessage) -> None:
 
 
 def _classify_smtp_error(exc: Exception, *, default_stage: str) -> str:
-    if isinstance(exc, smtplib.SMTPAuthenticationError):
-        return "auth"
-    if isinstance(exc, smtplib.SMTPRecipientsRefused):
-        return "recipient_rejected"
-    if isinstance(exc, smtplib.SMTPSenderRefused):
-        return "sender_rejected"
     if isinstance(exc, (ssl.SSLError, smtplib.SMTPNotSupportedError)):
         return "tls"
     if isinstance(exc, (socket.timeout, TimeoutError)):
         return "timeout"
-    code = int(getattr(exc, "smtp_code", 0) or 0)
-    if code == 552:
-        return "message_too_large"
-    if code == 421:
+    if isinstance(
+        exc,
+        (
+            smtplib.SMTPServerDisconnected,
+            ConnectionAbortedError,
+            ConnectionResetError,
+        ),
+    ):
+        return "disconnected"
+    if isinstance(exc, (ConnectionRefusedError, socket.gaierror)):
         return "server_unavailable"
-    if 400 <= code < 500:
+    codes = _smtp_response_codes(exc)
+    has_temporary = any(400 <= code < 500 for code in codes)
+    if isinstance(exc, smtplib.SMTPAuthenticationError):
+        return "temporary" if has_temporary else "auth"
+    if isinstance(exc, smtplib.SMTPRecipientsRefused):
+        return "temporary" if has_temporary else "recipient_rejected"
+    if isinstance(exc, smtplib.SMTPSenderRefused):
+        return "temporary" if has_temporary else "sender_rejected"
+    if 421 in codes:
+        return "server_unavailable"
+    if has_temporary:
         return "temporary"
+    if 552 in codes or _smtp_has_enhanced_status(exc, "5.3.4"):
+        return "message_too_large"
+    if any(500 <= code < 600 for code in codes):
+        return "permanent"
     return default_stage
+
+
+def _smtp_response_codes(exc: Exception) -> tuple[int, ...]:
+    values: list[Any] = [getattr(exc, "smtp_code", 0)]
+    if isinstance(exc, smtplib.SMTPRecipientsRefused):
+        values.extend(
+            response[0]
+            for response in exc.recipients.values()
+            if isinstance(response, tuple) and response
+        )
+    result: list[int] = []
+    for value in values:
+        try:
+            code = int(value or 0)
+        except (TypeError, ValueError):
+            continue
+        if code:
+            result.append(code)
+    return tuple(result)
+
+
+def _smtp_has_enhanced_status(exc: Exception, status: str) -> bool:
+    values: list[Any] = [getattr(exc, "smtp_error", b"")]
+    if isinstance(exc, smtplib.SMTPRecipientsRefused):
+        values.extend(
+            response[1]
+            for response in exc.recipients.values()
+            if isinstance(response, tuple) and len(response) > 1
+        )
+    pattern = re.compile(rf"(?<!\d){re.escape(status)}(?!\d)")
+    return any(
+        pattern.search(
+            value.decode("ascii", errors="ignore")
+            if isinstance(value, bytes)
+            else str(value)
+        )
+        for value in values
+    )
 
 
 def _smtp_error_message(stage: str) -> str:
@@ -786,9 +839,11 @@ def _smtp_error_message(stage: str) -> str:
         "sender_rejected": "SMTP 服务器拒绝发件身份",
         "tls": "SMTP TLS 协商失败",
         "timeout": "SMTP 连接超时",
+        "disconnected": "SMTP 连接意外断开，请稍后重试",
         "message_too_large": "SMTP 服务器拒绝超大邮件",
         "server_unavailable": "SMTP 服务器暂时不可用",
         "temporary": "SMTP 服务器返回临时错误，请稍后重试",
+        "permanent": "SMTP 服务器永久拒绝本次发送，请检查邮件内容和账号策略",
         "connect": "SMTP 连接失败",
         "send": "SMTP 发送失败",
     }.get(stage, "SMTP 操作失败")

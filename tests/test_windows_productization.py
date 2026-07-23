@@ -183,7 +183,7 @@ def test_oauth_credentials_are_validated_and_copied_atomically(tmp_path: Path):
 
 
 def test_product_version_is_shared_with_mcp():
-    assert __version__ == "1.4.2"
+    assert __version__ == "1.4.3"
     assert SERVER_VERSION == __version__
 
 
@@ -197,10 +197,10 @@ def test_windows_version_resources_match_product_version():
     root = Path(__file__).resolve().parents[1]
     for name in ("version_info.txt", "version_info_mcp.txt"):
         content = (root / "packaging" / "windows" / name).read_text(encoding="utf-8")
-        assert "filevers=(1, 4, 2, 0)" in content
-        assert "prodvers=(1, 4, 2, 0)" in content
-        assert "u'FileVersion', u'1.4.2'" in content
-        assert "u'ProductVersion', u'1.4.2'" in content
+        assert "filevers=(1, 4, 3, 0)" in content
+        assert "prodvers=(1, 4, 3, 0)" in content
+        assert "u'FileVersion', u'1.4.3'" in content
+        assert "u'ProductVersion', u'1.4.3'" in content
 
 
 def test_startup_command_supports_source_and_frozen(monkeypatch, tmp_path: Path):

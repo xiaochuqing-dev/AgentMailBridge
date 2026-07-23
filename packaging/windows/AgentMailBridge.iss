@@ -1,5 +1,5 @@
 #ifndef MyAppVersion
-  #define MyAppVersion "1.4.2"
+  #define MyAppVersion "1.4.3"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\..\dist\AgentMailBridge"

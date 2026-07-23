@@ -15,10 +15,12 @@ from typing import Any, Callable, Iterable
 
 from agent_mail_bridge.config import AppConfig, effective_incoming_runtime
 from agent_mail_bridge.database import (
-    clear_receive_retry,
+    clear_receive_retries,
     count_receive_retries,
     get_auto_receive_state,
+    get_receive_retry,
     query_due_receive_retries,
+    query_receive_retries,
     receive_retry_is_due,
     record_receive_failure,
     save_auto_receive_state,
@@ -28,7 +30,11 @@ from agent_mail_bridge.logging_setup import get_logger
 from agent_mail_bridge.mail_accounts import current_receive_account_id
 from agent_mail_bridge.mail_common import normalized_mail_from_raw
 from agent_mail_bridge.mail_processing import process_normalized_mail
-from agent_mail_bridge.provider_foundation import _mailbox_role
+from agent_mail_bridge.provider_foundation import (
+    _mailbox_role,
+    classify_protocol_error,
+    mailbox_text,
+)
 from agent_mail_bridge.utils import fmt_datetime, now_local
 
 
@@ -76,6 +82,9 @@ def receive_imap_account(
                 int(checkpoint.get("uidvalidity_reset_count") or 0) + 1
             )
             result["uidvalidity_changed"] = True
+            result["stale_retries_retired"] = _retire_stale_mailbox_retries(
+                cfg, account_id, mailbox, uidvalidity
+            )
 
         overlap_start = (
             max(1, last_uid - max(0, incoming.uid_overlap) + 1)
@@ -92,7 +101,13 @@ def receive_imap_account(
         )
         candidates = recent_overlap + new_uids[:scan_cap]
         candidates = _append_due_retry_uids(
-            cfg, account_id, mailbox, candidates, scan_cap
+            cfg,
+            account_id,
+            mailbox,
+            candidates,
+            scan_cap,
+            uidvalidity=uidvalidity,
+            accept_legacy=not validity_changed,
         )
         result["fetched"] = len(candidates)
 
@@ -100,9 +115,14 @@ def receive_imap_account(
         for batch in _chunks(candidates, DEFAULT_BATCH_SIZE):
             fetched = _fetch_with_isolation(client, batch)
             for uid in batch:
-                resource_id = _retry_resource_id(mailbox, uid)
-                if not receive_retry_is_due(
-                    cfg.db_path, "imap", resource_id, account_id=account_id
+                resource_ids = _retry_resource_ids(
+                    mailbox, uid, uidvalidity
+                )
+                resource_id = resource_ids[0]
+                if not _retry_is_due(
+                    cfg,
+                    account_id,
+                    resource_ids,
                 ):
                     result["skipped"] += 1
                     result["retry_deferred"] += 1
@@ -110,7 +130,13 @@ def receive_imap_account(
                 raw_or_error = fetched.get(uid)
                 if isinstance(raw_or_error, Exception):
                     _record_message_failure(
-                        cfg, account_id, resource_id, uid, raw_or_error, result
+                        cfg,
+                        account_id,
+                        resource_id,
+                        uid,
+                        raw_or_error,
+                        result,
+                        compatible_resource_ids=resource_ids,
                     )
                     continue
                 if not isinstance(raw_or_error, bytes):
@@ -123,6 +149,7 @@ def receive_imap_account(
                             "imap_fetch_missing", "服务器未返回该 UID 的 RFC822 原文"
                         ),
                         result,
+                        compatible_resource_ids=resource_ids,
                     )
                     continue
                 try:
@@ -141,17 +168,21 @@ def receive_imap_account(
                         )
                     if mark_seen:
                         _mark_seen(client, uid)
-                    clear_receive_retry(
-                        cfg.db_path,
-                        "imap",
-                        resource_id,
+                    clear_receive_retries(
+                        cfg.db_path, "imap", resource_ids,
                         account_id=account_id,
                     )
                     if uid > last_uid:
                         successful_new_uids.append(uid)
                 except Exception as exc:  # noqa: BLE001
                     _record_message_failure(
-                        cfg, account_id, resource_id, uid, exc, result
+                        cfg,
+                        account_id,
+                        resource_id,
+                        uid,
+                        exc,
+                        result,
+                        compatible_resource_ids=resource_ids,
                     )
 
         new_last_uid = max([last_uid, *successful_new_uids])
@@ -206,7 +237,8 @@ def rescan_imap_account(
     client: Any | None = None
     try:
         client = _connect(incoming, client_factory)
-        client.select_folder(mailbox, readonly=True)
+        selected = client.select_folder(mailbox, readonly=True)
+        uidvalidity = _response_int(selected, b"UIDVALIDITY")
         uids = sorted(
             int(uid)
             for uid in client.search(
@@ -246,10 +278,13 @@ def rescan_imap_account(
                     _record_message_failure(
                         cfg,
                         account_id,
-                        _retry_resource_id(mailbox, uid),
+                        _retry_resource_id(mailbox, uid, uidvalidity),
                         uid,
                         error,
                         result,
+                        compatible_resource_ids=_retry_resource_ids(
+                            mailbox, uid, uidvalidity
+                        ),
                     )
                     continue
                 try:
@@ -272,10 +307,13 @@ def rescan_imap_account(
                     _record_message_failure(
                         cfg,
                         account_id,
-                        _retry_resource_id(mailbox, uid),
+                        _retry_resource_id(mailbox, uid, uidvalidity),
                         uid,
                         exc,
                         result,
+                        compatible_resource_ids=_retry_resource_ids(
+                            mailbox, uid, uidvalidity
+                        ),
                     )
                 if progress_callback:
                     try:
@@ -333,10 +371,11 @@ def _refresh_mailboxes(
     try:
         discovered = []
         for flags, delimiter, name in client.list_folders():
+            normalized_name = mailbox_text(name)
             discovered.append(
                 {
-                    "external_ref": str(name),
-                    "display_name": str(name),
+                    "external_ref": normalized_name,
+                    "display_name": normalized_name,
                     "delimiter": (
                         delimiter.decode("ascii", errors="ignore")
                         if isinstance(delimiter, bytes)
@@ -348,7 +387,7 @@ def _refresh_mailboxes(
                         else str(item)
                         for item in flags
                     ],
-                    "mailbox_role": _mailbox_role(flags, str(name)),
+                    "mailbox_role": _mailbox_role(flags, normalized_name),
                 }
             )
         upsert_mailboxes(cfg.db_path, account_id, discovered)
@@ -490,16 +529,28 @@ def _record_message_failure(
     uid: int,
     exc: Exception,
     result: dict[str, Any],
+    compatible_resource_ids: Iterable[str] = (),
 ) -> None:
     message = f"处理 IMAP 邮件 uid={uid} 失败：{type(exc).__name__}"
     result["failed"] += 1
     result["errors"].append(message)
+    stale_ids = [
+        item for item in compatible_resource_ids if item != resource_id
+    ]
+    clear_receive_retries(
+        cfg.db_path, "imap", stale_ids, account_id=account_id
+    )
+    safe_error = (
+        exc.error_code
+        if isinstance(exc, ImapSyncError)
+        else f"processing_{type(exc).__name__}"
+    )
     record_receive_failure(
         cfg.db_path,
         backend="imap",
         resource_id=resource_id,
         message_id=str(uid),
-        error=str(exc),
+        error=safe_error,
         account_id=account_id,
     )
 
@@ -510,6 +561,9 @@ def _append_due_retry_uids(
     mailbox: str,
     candidates: list[int],
     scan_cap: int,
+    *,
+    uidvalidity: int,
+    accept_legacy: bool,
 ) -> list[int]:
     result = list(dict.fromkeys(candidates))
     for retry in query_due_receive_retries(
@@ -519,24 +573,109 @@ def _append_due_retry_uids(
         account_id=account_id,
     ):
         parsed = _parse_retry_resource_id(
-            str(retry.get("resource_id") or ""), mailbox
+            str(retry.get("resource_id") or ""),
+            mailbox,
+            uidvalidity=uidvalidity,
+            accept_legacy=accept_legacy,
         )
         if parsed is not None and parsed not in result:
             result.append(parsed)
     return result
 
 
-def _retry_resource_id(mailbox: str, uid: int) -> str:
+def _retry_resource_id(
+    mailbox: str, uid: int, uidvalidity: int = 0
+) -> str:
+    if uidvalidity > 0:
+        return f"{mailbox}:{uidvalidity}:{uid}"
     return f"{mailbox}:{uid}"
 
 
-def _parse_retry_resource_id(value: str, mailbox: str) -> int | None:
+def _retry_resource_ids(
+    mailbox: str, uid: int, uidvalidity: int
+) -> tuple[str, ...]:
+    values = [_retry_resource_id(mailbox, uid, uidvalidity)]
+    values.extend((f"{mailbox}:{uid}", str(uid)))
+    return tuple(dict.fromkeys(values))
+
+
+def _parse_retry_resource_id(
+    value: str,
+    mailbox: str,
+    *,
+    uidvalidity: int,
+    accept_legacy: bool,
+) -> int | None:
+    generation_parts = value.rsplit(":", 2)
+    if (
+        len(generation_parts) == 3
+        and generation_parts[0] == mailbox
+        and generation_parts[1].isdigit()
+        and generation_parts[2].isdigit()
+    ):
+        if int(generation_parts[1]) == uidvalidity:
+            return int(generation_parts[2])
+        return None
+    if not accept_legacy:
+        return None
     prefix, separator, uid_text = value.rpartition(":")
     if separator and prefix == mailbox and uid_text.isdigit():
         return int(uid_text)
     if value.isdigit():  # v1.4.1 旧 IMAP retry 兼容
         return int(value)
     return None
+
+
+def _retry_is_due(
+    cfg: AppConfig,
+    account_id: str,
+    resource_ids: Iterable[str],
+) -> bool:
+    for resource_id in resource_ids:
+        if get_receive_retry(
+            cfg.db_path,
+            "imap",
+            resource_id,
+            account_id=account_id,
+        ) is not None:
+            return receive_retry_is_due(
+                cfg.db_path,
+                "imap",
+                resource_id,
+                account_id=account_id,
+            )
+    return True
+
+
+def _retire_stale_mailbox_retries(
+    cfg: AppConfig,
+    account_id: str,
+    mailbox: str,
+    uidvalidity: int,
+) -> int:
+    stale: list[str] = []
+    for retry in query_receive_retries(
+        cfg.db_path, "imap", account_id=account_id
+    ):
+        resource_id = str(retry.get("resource_id") or "")
+        generation_parts = resource_id.rsplit(":", 2)
+        if (
+            len(generation_parts) == 3
+            and generation_parts[0] == mailbox
+            and generation_parts[1].isdigit()
+            and generation_parts[2].isdigit()
+        ):
+            if int(generation_parts[1]) != uidvalidity:
+                stale.append(resource_id)
+            continue
+        prefix, separator, uid_text = resource_id.rpartition(":")
+        if separator and prefix == mailbox and uid_text.isdigit():
+            stale.append(resource_id)
+        elif mailbox.casefold() == "inbox" and resource_id.isdigit():
+            stale.append(resource_id)
+    return clear_receive_retries(
+        cfg.db_path, "imap", stale, account_id=account_id
+    )
 
 
 def _load_mailbox_checkpoint(
@@ -604,16 +743,7 @@ def _mark_seen(client: Any, uid: int) -> None:
 def _classify_connection_error(exc: Exception) -> tuple[str, str]:
     if isinstance(exc, ImapSyncError):
         return exc.error_code, str(exc)
-    text = str(exc).casefold()
-    if "auth" in text or "login" in text or "password" in text:
-        return "imap_auth_failed", "IMAP 认证失败，请检查账号授权码或应用专用密码"
-    if "ssl" in text or "tls" in text or "certificate" in text:
-        return "imap_tls_failed", "IMAP TLS 连接失败"
-    if "timeout" in text or "timed out" in text:
-        return "imap_timeout", "IMAP 连接超时"
-    if "bye" in text or "disconnect" in text or "reset" in text:
-        return "imap_disconnected", "IMAP 连接已断开"
-    return "imap_connection_failed", f"IMAP 连接失败：{type(exc).__name__}"
+    return classify_protocol_error("imap", exc)
 
 
 def _logout(client: Any | None) -> None:
@@ -646,4 +776,5 @@ def _empty_result() -> dict[str, Any]:
         "global_error": False,
         "retry_deferred": 0,
         "uidvalidity_changed": False,
+        "stale_retries_retired": 0,
     }

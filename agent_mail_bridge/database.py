@@ -3619,6 +3619,66 @@ def query_due_receive_retries(
     return [dict(row) for row in rows]
 
 
+def query_receive_retries(
+    db_path: Path | str,
+    backend: str,
+    *,
+    limit: int = 10_000,
+    account_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """读取账号的有限重试事实，供协议代际切换时清理失效资源。"""
+    owner = account_id or LEGACY_UNKNOWN_ACCOUNT_ID
+    owners = (
+        (owner, LEGACY_UNKNOWN_ACCOUNT_ID)
+        if account_id and owner != LEGACY_UNKNOWN_ACCOUNT_ID
+        else (owner, owner)
+    )
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM receive_retries
+            WHERE account_id IN (?, ?) AND backend = ?
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (*owners, backend, max(1, min(int(limit), 10_000))),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def clear_receive_retries(
+    db_path: Path | str,
+    backend: str,
+    resource_ids: Iterable[str],
+    *,
+    account_id: str | None = None,
+) -> int:
+    """精确删除已失效的技术重试事实，不触及邮件、归档或业务历史。"""
+    identifiers = tuple(
+        dict.fromkeys(str(item) for item in resource_ids if str(item))
+    )
+    if not identifiers:
+        return 0
+    owner = account_id or LEGACY_UNKNOWN_ACCOUNT_ID
+    before = 0
+    after = 0
+    with _get_conn(db_path) as conn:
+        before = int(conn.total_changes)
+        conn.executemany(
+            """
+            DELETE FROM receive_retries
+            WHERE account_id IN (?, ?) AND backend = ? AND resource_id = ?
+            """,
+            (
+                (owner, LEGACY_UNKNOWN_ACCOUNT_ID, backend, resource_id)
+                for resource_id in identifiers
+            ),
+        )
+        after = int(conn.total_changes)
+        conn.commit()
+    return max(0, after - before)
+
+
 def record_receive_failure(
     db_path: Path | str,
     *,
