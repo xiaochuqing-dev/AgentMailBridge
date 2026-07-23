@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## 1.4.2 Generic IMAP/SMTP 与 QQ/163 双向收发 - 2026-07-23
+
+- 新增 Provider-neutral Incoming/Outgoing Runtime Config；QQ、163 与 Generic 账号通过 Account Runtime Router 复用同一个 IMAPClient 收件 Core、标准库 SMTP 发送 Core、统一邮件归档、规则、重试、调度、历史补扫和 outbound 审计，不复制既有 Gmail/QQ 协议实现。
+- IMAP 增量同步使用 mailbox 级 UIDVALIDITY、UIDNEXT、last_uid 与有限 UID overlap；UIDVALIDITY 变化时只重置对应游标，依靠 Message-ID/账号归档去重安全重扫。批量 `BODY.PEEK[]` 失败时降级到逐 UID，单封坏邮件进入有限重试而不阻断后续邮件。
+- SMTP 支持 SSL/TLS 与 STARTTLS，分阶段区分连接、TLS、认证、收件人/发件人拒绝、临时错误、超时和超大邮件；发送前后的 staging、Hash、outbound/sent ownership 与 GUI 单收件人/MCP 固定 owner 边界保持不变。
+- QQ 与 163 使用静态、可审计的 SSL profile；Generic 只按实际填写的 IMAP/SMTP host 开启能力。账号秘密继续按 account_id 分别保存在 Windows Credential Manager，不写 SQLite、报告或日志。
+- Multi-Account schema 升级到 v3，事务内幂等开放存量 QQ/Generic 能力；不移动归档、不改写 raw.eml、不重算历史 Hash，也不覆盖以后用户的启停选择。
+- GUI 新增 163 账号入口，QQ/163 授权码同时配置账号隔离的 IMAP/SMTP 凭据；连接测试只认证和发现目录，不收信、不发信。Gmail scope 仍严格且唯一为 `gmail.readonly`，Outlook/Microsoft 仍为 planned。
+- Python、GUI、MCP、EXE metadata 与 Inno Setup 版本统一升级为 1.4.2。QQ、163、Generic 的自动化协议与归档验收完成；真实账号网络 E2E 因无独立测试凭据明确标记 NOT_TESTED。
+
 ## 1.4.1 Multi-Account Runtime 与 Provider Foundation - 2026-07-23
 
 - 新增统一 Account Runtime Router，业务入口可按稳定 `account_id` 解析 Provider、运行配置、能力、Credential 与 OAuth 文件；Gmail 收件、GUI QQ 发件、历史补扫、MCP 新鲜度同步和连接测试不再只能依赖单个全局账号。

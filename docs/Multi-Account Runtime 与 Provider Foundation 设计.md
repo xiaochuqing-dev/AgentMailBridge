@@ -68,11 +68,17 @@ Google 官方文档明确：Gmail API messages.send 需要 gmail.send、gmail.co
 
 本项目安全不变量要求 Gmail scope 必须保持且只能是 gmail.readonly。因此 v1.4.1 不扩大 scope、不触发存量用户重新授权，也不把 Gmail 标记为支持发件。Gmail 发件保留为 planned。若以后单独立项，必须先完成权限模型、MCP 发件边界、重新授权迁移和真实 E2E。
 
-## Generic IMAP/SMTP Foundation 决策
+## v1.4.2 Generic IMAP/SMTP Core 决策
 
-不自行解析复杂 LIST、UID、国际化目录、SPECIAL-USE、IDLE 或 MODSEQ 响应。Foundation 采用 New BSD 许可的 IMAPClient 作为未来 Generic IMAP 解析层，SMTP 继续复用 Python 标准库 smtplib 和 email。
+不自行解析复杂 LIST、UID、国际化目录和 SPECIAL-USE 响应。Generic IMAP Core 使用 New BSD 许可的 IMAPClient；SMTP Core 继续复用 Python 标准库 smtplib 和 email。QQ、163、Generic 只提供 profile 与账号配置，不复制协议、归档、规则、调度或重试实现。
 
-本阶段只把 profile、TLS 配置校验、连接测试、目录发现、SPECIAL-USE 映射、UIDVALIDITY checkpoint 结构和 adapter 边界建立起来。QQ 收件、163、Outlook、Yahoo 和任意 Generic 账号的正式持续同步仍需各自真实服务器验证，未验证前保持 experimental 或 planned。
+增量同步采用 polling、mailbox 级 UIDVALIDITY/UIDNEXT/last_uid checkpoint、有限 UID overlap 和有界批量 `BODY.PEEK[]`。UIDVALIDITY 改变时只重置对应 mailbox 游标，再依靠账号级 Message-ID/provider id 唯一事实去重。批量 fetch 异常时逐 UID 降级，单封失败进入既有有限重试，成功邮件继续归档。当前只记录 HIGHESTMODSEQ，不宣称支持 IDLE、CONDSTORE 或 QRESYNC；这些优化在真实 Provider 兼容矩阵建立前不进入正式协议面。
+
+SMTP 仅允许 SSL/TLS 或 STARTTLS，认证与发送分阶段执行，并把连接、TLS、认证、发件人/收件人拒绝、超时、临时错误和超大邮件转换为稳定错误。MIME、发送 staging、四阶段 Hash、outbound/sent archive 和 GUI/MCP 权限边界继续复用现有实现。
+
+QQ 与 163 profile 来自 Thunderbird ISPDB 的公开端点事实，使用完整邮箱地址作为用户名、993/SSL IMAP 和 465/SSL SMTP。QQ 官方说明确认第三方客户端使用邮箱生成的授权码而非网页登录密码。163 个人邮箱官方说明在本次环境中无法稳定取得，因此只把公开 ISPDB profile 作为实现默认值，真实账号 E2E 必须保持 NOT_TESTED，不能误报为官方验收。
+
+本版自动化完成协议、迁移、归档与 GUI 路由验证，但没有独立 QQ、163 或任意 Generic 测试账号。Adapter 状态使用 `implementation_ready_e2e_required`，明确区分“实现已接通”与“真实网络已验收”。Outlook/Microsoft 仍为 planned。
 
 ## 许可证边界
 

@@ -26,6 +26,8 @@
 
 可选输入 `account_id`，且不受邮件读取开关阻断。返回指定或当前收件账号、已启用账号摘要，以及 enabled、background_status、is_syncing、freshness、阈值、数据年龄、最近本地邮件时间、上次检查/成功/结果、下次检查和该账号重试计数。freshness 为 fresh、stale 或 unknown。
 
+Gmail、QQ、163 与 Generic 都使用同一个工具和 DTO。指定 `account_id` 时只读取该账号的同步状态；QQ、163 与 Generic 的 checkpoint 由 mailbox 级 UIDVALIDITY、UIDNEXT、last_uid 和策略摘要组成，不含用户名、授权码或服务器响应原文。
+
 ## submit_result
 
 输入与既有版本相同：file_path 必填，title 与稳定 request_id 可选，不接受任意 recipient。读取开关关闭不影响发送，实际目标始终由 `OWNER_GMAIL` 控制。成功、duplicate 和 SMTP 已接受但归档失败不会被客户端误判为协议错误；路径、类型、大小、配置、速率和 Hash 失败返回稳定业务状态。

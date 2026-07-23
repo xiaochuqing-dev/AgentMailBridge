@@ -1,8 +1,8 @@
 # AgentMailBridge GUI 使用说明
 
-AgentMailBridge 1.4.1 的用户入口只有 `AgentMailBridge.exe`。
+AgentMailBridge 1.4.2 的用户入口只有 `AgentMailBridge.exe`。
 
-顶部主工作区只有“收件”和“发件”。左侧统一“邮箱账号”列表展示真实 Provider、地址、能力和启停状态。“添加邮箱账号”可创建第二个 Gmail、第二个 QQ 或 Generic IMAP/SMTP 基础账号，不覆盖已有身份；动态账号页提供启停、按账号凭据、连接测试、IMAP 目录发现、按账号 OAuth 和保守移除。移除默认保留本地邮件与发件事实，凭据和 Token 只有在用户明确勾选时清理。
+顶部主工作区只有“收件”和“发件”。左侧统一“邮箱账号”列表展示真实 Provider、地址、能力和启停状态。“添加邮箱账号”可创建 Gmail、QQ、163 或 Generic IMAP/SMTP 账号，不覆盖已有身份；动态账号页提供启停、按账号凭据、连接测试、IMAP 目录发现、按账号 OAuth 和保守移除。移除默认保留本地邮件与发件事实，凭据和 Token 只有在用户明确勾选时清理。
 
 收件页以一封邮件一条紧凑记录展示主题、发件人、内容摘要、时间、状态和操作；资源数量优先显示在摘要首行，正文预览按实际列宽限制为约 36 个可读字符，行高稳定为约 74px。完整主题、较长正文预览和资源数量可通过 Tooltip 查看，完整正文仍在邮件详情中。双击整行任意非按钮区域或点击“查看邮件”均可进入详情。
 
@@ -15,7 +15,9 @@ AgentMailBridge 1.4.1 的用户入口只有 `AgentMailBridge.exe`。
 - 设置 > 高级设置：网络模式、Runtime Paths、配置迁移和脱敏高级诊断。
 - 关于：版本、产品定位、仓库、LICENSE、第三方说明和本地优先说明。
 
-Gmail API、Gmail IMAP 和 QQ SMTP 分别使用专属账号页，保存后同步到统一账号模型。Gmail IMAP 密码和 QQ 授权码保存在 Windows Credential Manager，界面只显示固定掩码；账号表不保存密码、Token 或 Client Secret。替换 OAuth 客户端配置需确认，不会静默删除 token。
+Gmail API 与 Gmail IMAP 使用专属认证页。QQ 和 163 使用邮箱服务生成的授权码，共享给同一账号的 IMAP 与 SMTP；Generic 可分别填写 IMAP 和 SMTP 凭据。所有秘密保存在 Windows Credential Manager，界面只显示固定掩码；账号表不保存密码、Token 或 Client Secret。替换 OAuth 客户端配置需确认，不会静默删除 token。
+
+QQ 与 163 新账号默认使用 993/SSL 的 IMAP 和 465/SSL 的 SMTP。配置前需在邮箱网页设置中启用相应服务并生成授权码，不能填写网页登录密码。Generic 只允许 SSL/TLS 或 STARTTLS；保存后应先执行“测试连接”和“发现目录”，确认服务端、端口、TLS 模式、账号格式和凭据均兼容，再启用自动收件或正式发件。
 
 Gmail API 页只接受 Google Cloud 的 Desktop app `credentials.json`。导入成功后会显示 Desktop app 类型、可用的项目 ID 和 Client ID 脱敏尾号；Web application JSON、非 Google 官方端点或非法回环地址会被明确拒绝。新文件验证或写入失败时，旧凭据和旧 Token 保持不变。
 
@@ -31,7 +33,7 @@ Token 交换成功后会继续验证 Gmail Profile 和当前配置账号。Gmail
 
 自动收件默认每 60 秒检查一次，最低 30 秒。开启或应用启动后约 3 秒首次检查；收件页实时显示正常运行、正在检查或连接退避，以及上次检查、上次成功、下次检查、最近结果和待重试邮件。页面刷新和应用重启后状态从 SQLite 恢复。
 
-自动检查间隔表示“多久运行一次”，重叠 lookback 表示“每次增量向前回看多久”，改变间隔不会自动补回更早邮件。“立即收取”只检查当前增量范围；“历史补扫”可选择最近 24 小时、7 天、30 天或自定义日期，按页扫描并显示匹配、新增、已归档、规则不匹配和失败，可安全取消。规则跳过不是永久完成，修改规则后可再次补扫；已归档邮件按 Message-ID/provider id 去重。补扫不删除邮件，Gmail API 保持只读，IMAP 使用 `BODY.PEEK[]` 不标记已读，并与自动收件共用进程内和跨进程锁。
+自动检查间隔表示“多久运行一次”，Gmail 重叠 lookback 或 Generic IMAP 的 UID overlap 表示“每次增量向前重查多少”，改变间隔不会自动补回更早邮件。“立即收取”只检查当前增量范围；“历史补扫”可选择最近 24 小时、7 天、30 天或自定义日期，按页扫描并显示匹配、新增、已归档、规则不匹配和失败，可安全取消。规则跳过不是永久完成，修改规则后可再次补扫；已归档邮件按账号、Message-ID/provider id 去重。补扫不删除邮件，Gmail API 保持只读，IMAP 使用 `BODY.PEEK[]` 不标记已读，并与自动收件共用进程内和跨进程锁。
 
 今日邮件使用“主题、发件人、内容、收取时间、状态、操作”六列。From 显示 RFC 解码后的显示名和地址，不出现 encoded-word；普通主题优先完整显示，正文保持严格摘要。邮件详情上半区为可滚动正文，下半区为可滚动资源，纵向分隔可拖动并在当前会话记住位置；默认正文约 380px，小窗口仍至少 240px。图片、附件、链接与下载仅在非空时显示独立分区，长中文文件名可换行且 Tooltip 保留全名。
 
