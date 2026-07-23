@@ -4,7 +4,7 @@
 
 v1.4.2 在既有 Multi-Account Runtime 上补齐标准 IMAP 收件和标准 SMTP 发件，让 QQ、163 与 Generic 账号复用同一协议 Core。它不替换 Gmail API/IMAP Adapter，不增加 Gmail scope，不拆分 MCP，不建立第二套归档、调度、重试或发件审计，也不把 Outlook 当作密码型 Generic 账号。
 
-实现完成不等于真实服务端验收。v1.4.3 当前环境仍没有独立 QQ、163 或 Generic 测试凭据，真实网络收发为 NOT_TESTED。用户必须先在账号页完成连接测试。
+实现完成不等于真实服务端验收。v1.4.4 已用本机安全凭据完成 QQ 与 163 的真实双向收发和富 MIME 验收；Generic 仍没有独立第三方测试账号，保持 NOT_TESTED。用户新增账号后仍应先完成连接测试。
 
 ## 开源调研结论
 
@@ -66,7 +66,15 @@ QQ 与 163 profile 使用完整邮箱地址、IMAP 993 SSL、SMTP 465 SSL、INBO
 
 Multi-Account schema v3 在升级事务中幂等开放存量 QQ 的双向能力，并按存量 Generic host 开启对应能力。迁移只更新账号元数据，不移动归档、不改写 raw.eml、不重算 Hash，也不删除凭据。
 
-Provider Adapter 状态为 `implementation_ready_e2e_required`。这表示代码、自动化和打包链路可以交付，但真实 Provider 的认证策略、频率限制、特殊目录和服务器差异仍需用户账号验证。Outlook/Microsoft 保持 planned。
+v1.4.4 中 QQ 与 163 Provider Adapter 状态为 `supported`；Generic 保持 `implementation_ready_e2e_required`，Outlook/Microsoft 保持 planned。
+
+## v1.4.4 真实 Provider 收口
+
+QQ 与 163 均完成真实登录、目录、首轮收件、第二轮增量、进程重启后继续、SMTP、自发自收与四向互发。每条互发验证发件 staging/sent archive Hash、目标 IMAP 到达、raw.eml、Mail Package、account_id ownership 和收件附件 Hash；两个 Provider 的 HTML、inline image、中文、多附件和零字节附件也通过。
+
+163 的 LOGIN 可以成功，但未声明客户端身份时 SELECT INBOX 返回 Unsafe Login。解决方案由 Provider Profile 的 `imap_id_enabled` 驱动，在认证后发送只含真实产品名和版本的 RFC 2971 ID。连接发现与持续同步共用同一扩展点；QQ 和 Generic 默认关闭，不在业务层散落 provider 条件。
+
+QQ 真实验收发现兼容配置卡更新旧 Credential key 后，统一账号专属槽仍保留旧值。GUI 保存现在同步精确匹配 QQ 账号的 IMAP/SMTP 槽，不影响其他 QQ 账号。旧邮件原始非 ASCII From Header 返回 `Header` 对象的问题也已在共享解析入口修复，失败 UID 到期重试后归零。
 
 ## 资料
 

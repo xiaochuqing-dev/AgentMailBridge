@@ -1,6 +1,6 @@
 # AgentMailBridge MCP 使用说明
 
-AgentMailBridge v1.4.3 MCP 是本机按需启动的统一 stdio 服务。它不按 Provider 拆分，不监听端口、不常驻、不创建快捷方式或托盘；stdin 关闭后服务退出。七工具、`submit_result` 参数、只读 Gmail scope 和固定 owner 安全边界保持兼容。Gmail、QQ、163 与 Generic 的本地归档都由同一个服务按可选 `account_id` 查询。
+AgentMailBridge v1.4.4 MCP 是本机按需启动的统一 stdio 服务。它不按 Provider 拆分，不监听端口、不常驻、不创建快捷方式或托盘；stdin 关闭后服务退出。七工具、`submit_result` 参数、只读 Gmail scope 和固定 owner 安全边界保持兼容。Gmail、QQ、163 与 Generic 的本地归档都由同一个服务按可选 `account_id` 查询。
 
 从左侧“Agent / MCP”页面复制唯一的标准 JSON 配置。安装版 command 指向安装目录中的 `AgentMailBridgeMCP.exe` 且 args 为空；源码版为：
 

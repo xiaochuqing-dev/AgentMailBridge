@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## 1.4.4 QQ + 163 Real Provider Closure - 2026-07-24
+
+- QQ 与 163 完成真实 IMAP/SMTP、目录发现、增量、重启后继续、自发自收和四向互发验收；中文主题/正文/附件名、HTML、inline image、多附件、零字节附件、raw.eml、Mail Package、ownership 与收发 Hash 链通过，两个 Provider 升级为正式支持。
+- 163 Profile 新增配置驱动的 RFC 2971 IMAP ID。客户端只发送真实产品名和版本，不包含邮箱地址、设备标识或凭据；Generic Core 不含散落的 Provider 分支。
+- 修复旧 QQ 配置页更新授权码后统一账号仍使用旧凭据槽的问题；兼容卡保存后会同步同一 QQ 账号的 IMAP/SMTP Credential Manager 槽。
+- 修复旧邮件地址头含原始非 ASCII 字节时 `Header` 对象触发单邮件 TypeError；失败邮件继续隔离，修复后到期重试全部成功。
+- Provider-neutral 收件保留 IMAP 后端稳定错误码，不再把 QQ/163 认证失败误报为 OAuth；Provider 验收证据现在明确区分 PASS、PARTIAL 与 FAIL。
+- 新增受控互发与富 MIME 验收脚本；脚本只允许已配置 QQ/163 账号，不接收命令行密码，网络与真实发件必须显式确认。未创建 Tag 或 GitHub Release。
+
 ## 1.4.3 Provider Validation & Hardening - 2026-07-23
 
 - 新增 `scripts/provider_validation.py`，只使用已配置账号和 Windows Credential Manager 凭据生成无正文、无地址、无秘密的结构化验收证据；必须显式确认网络访问，真实发件另需独立确认，默认不会发信。

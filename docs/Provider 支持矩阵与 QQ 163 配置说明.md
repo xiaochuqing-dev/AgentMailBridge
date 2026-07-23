@@ -5,12 +5,12 @@
 | Provider | Auth | Login | Folder | Receive | Incremental | Send | Attachment | Restart | Error | Status |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Gmail | Desktop OAuth `gmail.readonly` 或应用专用密码 | 收件已验证 | Gmail API/IMAP 已实现 | 正式支持 | 已实现并长期回归 | planned | 收件已支持 | 已支持 | 已支持 | receive supported |
-| QQ | 授权码 | NOT_TESTED | LIST/SPECIAL-USE 已实现，真实名称 NOT_TESTED | implementation ready | 自动化通过，真实 NOT_TESTED | implementation ready | 自动化通过，真实 NOT_TESTED | 自动化通过，真实 NOT_TESTED | 自动化通过，真实 NOT_TESTED | `implementation_ready_e2e_required` |
-| 163 | 授权码 | NOT_TESTED | LIST/SPECIAL-USE 已实现，真实名称 NOT_TESTED | implementation ready | 自动化通过，真实 NOT_TESTED | implementation ready | 自动化通过，真实 NOT_TESTED | 自动化通过，真实 NOT_TESTED | 自动化通过，真实 NOT_TESTED | `implementation_ready_e2e_required` |
+| QQ | 授权码 | PASS | PASS，真实发现 7 个目录 | PASS | PASS，第二轮无变化且无待重试 | PASS | PASS，含中文名、多附件、零字节、HTML、inline image | PASS | PASS，旧 Header 隔离重试已收口 | `supported` |
+| 163 | 授权码 | PASS | PASS，真实发现 INBOX、已发送、草稿箱、已删除、垃圾邮件、病毒文件夹 | PASS | PASS，第二轮无变化且无待重试 | PASS | PASS，含中文名、多附件、零字节、HTML、inline image | PASS | PASS，RFC 2971 IMAP ID quirk 已收口 | `supported` |
 | Generic-Test | 账号级 IMAP/SMTP secret | NOT_TESTED | LIST/SPECIAL-USE 已实现 | implementation ready | 自动化通过，真实 NOT_TESTED | implementation ready | 自动化通过，真实 NOT_TESTED | 自动化通过，真实 NOT_TESTED | 自动化通过，真实 NOT_TESTED | `implementation_ready_e2e_required` |
 | Outlook/Microsoft | 未来 MSAL/PKCE/OAuth | 未实现 | 未实现 | planned | planned | planned | planned | planned | planned | planned |
 
-QQ、163 与 Generic 共用 Generic IMAP/SMTP Core、统一 Mail Package、Mail Facts、调度、重试、历史补扫和 outbound archive。v1.4.3 把 IMAP 重试身份收紧为 mailbox、UIDVALIDITY、UID，统一解码国际化目录，并把协议错误转换为不含服务端敏感原文的稳定分类。Provider profile 只保存服务器默认值和少量差异，不复制协议代码。
+QQ、163 与 Generic 共用 Generic IMAP/SMTP Core、统一 Mail Package、Mail Facts、调度、重试、历史补扫和 outbound archive。v1.4.4 根据真实证据只在 163 Profile 开启 RFC 2971 IMAP ID，并保持 QQ/163 业务处理、解析、归档与调度共享。Provider profile 只保存服务器默认值和少量差异，不复制协议代码。
 
 ## QQ 配置
 
@@ -38,8 +38,9 @@ QQ、163 与 Generic 共用 Generic IMAP/SMTP Core、统一 Mail Package、Mail 
 - SMTP：`smtp.163.com`，465，SSL/TLS
 - 用户名：完整 163 邮箱地址
 - 收件目录：INBOX
+- IMAP 扩展：登录后发送最小 RFC 2971 ID，仅含真实产品名与版本
 
-本次环境无法可靠取得 163 个人邮箱官方帮助页，也没有独立 163 测试账号。以上服务器默认值来自 Thunderbird ISPDB；因此 163 真实登录、目录、收信、发信和回收验证保持 NOT_TESTED。
+真实服务端允许 LOGIN，但在未发送 ID 时于 SELECT INBOX 返回 Unsafe Login。网易官方 Java 示例、RFC 2971、Mozilla 与 isync 的兼容记录均指向登录后发送客户端 ID。AgentMailBridge 不发送邮箱地址、设备标识或虚构身份；修复后真实目录、增量、自发自收与 QQ 双向互发均通过。
 
 ## Generic 配置
 
@@ -54,9 +55,11 @@ Generic 至少配置 IMAP 或 SMTP 之一。端口必须为 1 至 65535，传输
 ```powershell
 python scripts\provider_validation.py --account-id <account_id> --confirm-network --output evidence.json
 python scripts\provider_validation.py --account-id <account_id> --confirm-network --confirm-real-send --output evidence.json
+python scripts\provider_interop_validation.py --from-account-id <account_id> --to-account-id <account_id> --confirm-network --confirm-real-send --output interop.json
+python scripts\provider_mime_receive_validation.py --from-account-id <account_id> --to-account-id <account_id> --confirm-network --confirm-real-send --output mime.json
 ```
 
-只有证据同时覆盖 login、folder、receive、incremental、send、attachment、receive-back、restart/reconnect 和核心错误路径，且没有 P0/P1，才能人工复核并升级正式支持状态。当前仓库没有安全测试账号，QQ、163、Generic-Test 均保持 NOT_TESTED。
+只有证据同时覆盖 login、folder、receive、incremental、send、attachment、receive-back、restart/reconnect 和核心错误路径，且没有 P0/P1，才能人工复核并升级正式支持状态。QQ 与 163 已满足门槛并正式支持；Generic-Test 没有独立第三方真实账号，继续保持 NOT_TESTED 与 `implementation_ready_e2e_required`。
 
 ## 安全说明
 
@@ -67,3 +70,5 @@ python scripts\provider_validation.py --account-id <account_id> --confirm-networ
 - QQ 官方授权码说明：https://help.mail.qq.com/detail/106/985
 - Thunderbird QQ profile：https://github.com/thunderbird/autoconfig/blob/master/ispdb/qq.com.xml
 - Thunderbird 163 profile：https://github.com/thunderbird/autoconfig/blob/master/ispdb/163.com.xml
+- RFC 2971：https://www.rfc-editor.org/info/rfc2971/
+- 网易 IMAP ID 示例：https://help.mail.163.com/faqDetail.do?code=d7a5dc8471cd0c0e8b4b8f4f8e49998b374173cfe9171305fa1ce630d7f67ac2eda07326646e6eb0

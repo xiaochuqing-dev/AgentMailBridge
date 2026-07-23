@@ -1,5 +1,7 @@
 # MCP 邮件读取工具说明
 
+v1.4.4 的 QQ 与 163 真实归档继续复用同一套 MCP 邮件读取工具和 account_id 过滤，没有新增 Provider 专用 MCP。真实双向收发已验证归档 ownership、raw.eml、资源与 Hash；本机全局邮件读取开关仍保持默认关闭，因此本轮真实账号的 MCP 正文读取标记为 NOT_TESTED，打包 MCP 的七工具列表、UTF-8 stdio、默认拒绝与固定发送边界已通过 smoke。
+
 ## search_mails
 
 输入支持 query、time_scope、recent_days、date_from/date_to、subject、sender、recipient、has_attachments、status、sort、limit、offset、ensure_fresh、allow_cached、`account_id`、兼容 `account_ref` 和 mailbox_ref。省略账号时查询全部归档账号，指定 `account_id` 时严格按账号过滤；同时请求 `ensure_fresh` 时只同步该账号，不替代 GUI 历史补扫。

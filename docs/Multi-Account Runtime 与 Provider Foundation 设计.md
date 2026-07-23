@@ -76,7 +76,7 @@ Google 官方文档明确：Gmail API messages.send 需要 gmail.send、gmail.co
 
 SMTP 仅允许 SSL/TLS 或 STARTTLS，认证与发送分阶段执行，并把连接、TLS、认证、发件人/收件人拒绝、超时、临时错误和超大邮件转换为稳定错误。MIME、发送 staging、四阶段 Hash、outbound/sent archive 和 GUI/MCP 权限边界继续复用现有实现。
 
-QQ 与 163 profile 来自 Thunderbird ISPDB 的公开端点事实，使用完整邮箱地址作为用户名、993/SSL IMAP 和 465/SSL SMTP。QQ 官方说明确认第三方客户端使用邮箱生成的授权码而非网页登录密码。163 个人邮箱官方说明在本次环境中无法稳定取得，因此只把公开 ISPDB profile 作为实现默认值，真实账号 E2E 必须保持 NOT_TESTED，不能误报为官方验收。
+QQ 与 163 profile 最初来自 Thunderbird ISPDB 的公开端点事实，使用完整邮箱地址作为用户名、993/SSL IMAP 和 465/SSL SMTP。QQ 官方说明确认第三方客户端使用邮箱生成的授权码而非网页登录密码。v1.4.2 当时尚无真实账号证据，因此保持 NOT_TESTED；v1.4.4 已由后述真实 Provider 决策替代该阶段性结论。
 
 本版自动化完成协议、迁移、归档与 GUI 路由验证，但没有独立 QQ、163 或任意 Generic 测试账号。Adapter 状态使用 `implementation_ready_e2e_required`，明确区分“实现已接通”与“真实网络已验收”。Outlook/Microsoft 仍为 planned。
 
@@ -85,6 +85,12 @@ QQ 与 163 profile 来自 Thunderbird ISPDB 的公开端点事实，使用完整
 真实验收继续通过同一个 ApplicationService 和 AccountRuntimeRouter 执行，不建立 Provider 专属测试后门，也不把 secret 放入参数、JSON 或报告。`scripts/provider_validation.py` 只接受 account_id；网络和真实发件分别显式确认，证据只保留状态、错误码和计数。
 
 UID retry 归属从 account + mailbox + UID 收紧为 account + mailbox + UIDVALIDITY + UID。UIDVALIDITY 改变时，旧代际 retry 已失去协议身份，允许只删除这些技术重试；邮件 package、raw.eml、附件、业务历史和 Hash 均不受影响。Provider 状态仍由真实证据人工升级，不由连接脚本自动修改。
+
+## v1.4.4 真实 Provider 决策
+
+真实证据确认 QQ 与 163 可继续共享 AccountRuntimeRouter、Generic IMAP/SMTP Core、解析、归档、重试、调度和 outbound。163 唯一新增差异是 Profile 驱动的 RFC 2971 IMAP ID；运行时只接收布尔扩展开关，不感知 Provider 名称。旧 163 账号通过 profile_id 默认值兼容，无 schema migration。
+
+QQ 与 163 的四向互发、富 MIME、附件 Hash 和 ownership 均通过，Adapter/Profile 状态分别升级为 supported。Generic 没有第三方真实服务器矩阵，继续保持 implementation_ready_e2e_required；Gmail send 与 Microsoft 仍不进入本阶段。
 
 ## 许可证边界
 

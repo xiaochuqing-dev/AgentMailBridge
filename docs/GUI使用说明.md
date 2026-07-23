@@ -1,6 +1,6 @@
 # AgentMailBridge GUI 使用说明
 
-AgentMailBridge 1.4.3 的用户入口只有 `AgentMailBridge.exe`。
+AgentMailBridge 1.4.4 的用户入口只有 `AgentMailBridge.exe`。
 
 顶部主工作区只有“收件”和“发件”。左侧统一“邮箱账号”列表展示真实 Provider、地址、能力和启停状态。“添加邮箱账号”可创建 Gmail、QQ、163 或 Generic IMAP/SMTP 账号，不覆盖已有身份；动态账号页提供启停、按账号凭据、连接测试、IMAP 目录发现、按账号 OAuth 和保守移除。移除默认保留本地邮件与发件事实，凭据和 Token 只有在用户明确勾选时清理。
 
@@ -15,7 +15,7 @@ AgentMailBridge 1.4.3 的用户入口只有 `AgentMailBridge.exe`。
 - 设置 > 高级设置：网络模式、Runtime Paths、配置迁移和脱敏高级诊断。
 - 关于：版本、产品定位、仓库、LICENSE、第三方说明和本地优先说明。
 
-Gmail API 与 Gmail IMAP 使用专属认证页。QQ 和 163 使用邮箱服务生成的授权码，共享给同一账号的 IMAP 与 SMTP；Generic 可分别填写 IMAP 和 SMTP 凭据。所有秘密保存在 Windows Credential Manager，界面只显示固定掩码；账号表不保存密码、Token 或 Client Secret。替换 OAuth 客户端配置需确认，不会静默删除 token。
+Gmail API 与 Gmail IMAP 使用专属认证页。QQ 和 163 使用邮箱服务生成的授权码，共享给同一账号的 IMAP 与 SMTP；Generic 可分别填写 IMAP 和 SMTP 凭据。所有秘密保存在 Windows Credential Manager，界面只显示固定掩码；账号表不保存密码、Token 或 Client Secret。兼容 QQ 卡更新授权码时会同步精确匹配统一账号的两个凭据槽。替换 OAuth 客户端配置需确认，不会静默删除 token。
 
 QQ 与 163 新账号默认使用 993/SSL 的 IMAP 和 465/SSL 的 SMTP。配置前需在邮箱网页设置中启用相应服务并生成授权码，不能填写网页登录密码。Generic 只允许 SSL/TLS 或 STARTTLS；保存后应先执行“测试连接”和“发现目录”，确认服务端、端口、TLS 模式、账号格式和凭据均兼容，再启用自动收件或正式发件。
 

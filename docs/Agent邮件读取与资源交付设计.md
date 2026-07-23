@@ -1,5 +1,7 @@
 # Agent 邮件读取与资源交付设计
 
+v1.4.4 不改变全局一次性 opt-in、DATA_ROOT、授权工作区或固定结果收件人边界。QQ 与 163 真实邮件归档通过统一 account_id、package、resource、raw.eml 和 Hash 链进入既有读取层；没有增加 Provider 专用工具，也没有扩大 Agent 的发送账号或收件人权限。
+
 ## 产品边界
 
 AgentMailBridge v1.4.1 保留通用 Agent 邮件读取能力，并在同一个 MCP 中使用稳定账号归属与可选账号过滤。`search_mails` 省略 `account_id` 时读取统一本地视图，指定时只读取该账号；`ensure_fresh` 通过 Account Runtime Router 同步指定或兼容当前账号，不替代 GUI 历史补扫。GUI 的自由发件账号选择不会扩展到 MCP。
