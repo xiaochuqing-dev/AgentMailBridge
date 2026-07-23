@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## 1.4.3 Provider Validation & Hardening - 2026-07-23
+
+- 新增 `scripts/provider_validation.py`，只使用已配置账号和 Windows Credential Manager 凭据生成无正文、无地址、无秘密的结构化验收证据；必须显式确认网络访问，真实发件另需独立确认，默认不会发信。
+- IMAP 单邮件重试改为 mailbox、UIDVALIDITY、UID 三元身份。UIDVALIDITY 变化时只清理该账号对应 mailbox 的旧代际技术重试，不删除邮件、归档或业务历史，避免旧 UID 失败状态误伤新邮件。
+- IMAP 目录统一解码为 Unicode，保留 LIST delimiter、flags 与 SPECIAL-USE 事实；服务端连接错误转换为稳定的认证、TLS、超时、限流、不可用和断开分类，不把完整响应或凭据写入结果与重试表。
+- SMTP 按 RFC 5321 区分 4xx 临时失败和 5xx 永久失败，覆盖临时认证、临时收件人拒绝、断线、服务不可用和增强状态 `5.3.4` 超大邮件；错误提示保持可诊断且不回显服务端敏感原文。
+- 新增 `scripts/full_suite_preflight.py` 并接入 Windows 构建：完整 pytest 前统一检查 v1.4.3 版本、Provider 状态、schema、硬编码断言、`git diff --check`、compileall 和定向测试，减少因元数据不一致重复运行全量测试。
+- Python、GUI、MCP、EXE metadata 与 Inno Setup 版本统一升级为 1.4.3。QQ、163、Generic 仍为 `implementation_ready_e2e_required`；本环境没有独立安全测试账号，真实 E2E 保持 NOT_TESTED，未创建 Tag 或 GitHub Release。
+
 ## 1.4.2 Generic IMAP/SMTP 与 QQ/163 双向收发 - 2026-07-23
 
 - 新增 Provider-neutral Incoming/Outgoing Runtime Config；QQ、163 与 Generic 账号通过 Account Runtime Router 复用同一个 IMAPClient 收件 Core、标准库 SMTP 发送 Core、统一邮件归档、规则、重试、调度、历史补扫和 outbound 审计，不复制既有 Gmail/QQ 协议实现。

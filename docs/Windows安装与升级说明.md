@@ -1,12 +1,14 @@
 # Windows 安装、升级与卸载
 
-运行 `AgentMailBridge-1.4.2-Setup.exe`。默认安装到 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需管理员权限。开始菜单和可选桌面快捷方式只指向 `AgentMailBridge.exe`；内部 `AgentMailBridgeMCP.exe` 不创建快捷方式或开机启动项。
+运行 `AgentMailBridge-1.4.3-Setup.exe`。默认安装到 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需管理员权限。开始菜单和可选桌面快捷方式只指向 `AgentMailBridge.exe`；内部 `AgentMailBridgeMCP.exe` 不创建快捷方式或开机启动项。
+
+从 v1.4.2 升级到 v1.4.3 不增加数据库 schema。IMAP 单邮件重试从 `mailbox:uid` 逐步迁移为 `mailbox:uidvalidity:uid`；只有服务端 UIDVALIDITY 确认变化时才清理同账号同 mailbox 的旧代际技术重试，邮件、raw.eml、附件、账号、OAuth、Credential 和 Hash 不变。
 
 从 v1.4.1 升级时，首次启动在原有升级备份与事务边界内把 Multi-Account schema 升级到 v3。存量 QQ 账号获得 IMAP 收件能力，存量 Generic 账号按已填写的 IMAP/SMTP host 开启对应能力；迁移不移动邮件目录、不改写 raw.eml、不重算历史 Hash。升级后应分别测试连接，再决定是否启用真实自动收件。
 
 从 v1.3.0 或 v1.4.0 升级前，正常退出主窗口和托盘，再运行新版安装器覆盖安装。首次启动在需要时创建并校验 `before_v1_4_multi_account` SQLite 在线备份，在同一可回滚事务中补齐 Multi-Account schema v2 与软移除状态。旧 Gmail/QQ 配置继续映射为稳定账号；兼容凭据只向地址精确匹配的账号回退，OAuth 文件按账号安全复制且旧文件保留。迁移不移动邮件目录、不改写 `raw.eml` 或历史 Hash。
 
-升级后应核对“邮箱账号”列表、Gmail/QQ 原配置、收件与发件历史、Agent/MCP 七工具，并运行数据库 quick_check。v1.4.2 可新增同 Provider 多账号、163 与 Generic IMAP/SMTP 收发；QQ、163、Generic 在实际使用前必须用自己的账号完成连接测试。Outlook/Microsoft 仍未接通。
+升级后应核对“邮箱账号”列表、Gmail/QQ 原配置、收件与发件历史、Agent/MCP 七工具，并运行数据库 quick_check。v1.4.3 继续支持同 Provider 多账号、163 与 Generic IMAP/SMTP 收发；QQ、163、Generic 在实际使用前必须用自己的测试账号完成连接测试和真实 E2E。Outlook/Microsoft 仍未接通。
 
 从 v1.2.1 升级到 v1.3.0 前，正常退出主窗口和托盘，再运行新版安装器覆盖安装。程序文件会替换，`%LOCALAPPDATA%\AgentMailBridge` 下的 `.env`、OAuth credentials/token、SQLite、邮件 package、raw.eml、附件、工作区和日志不会删除，Windows Credential Manager 中的 Gmail IMAP/QQ SMTP secret 也不由安装器清理。
 
@@ -24,7 +26,7 @@
 
 从 Windows“已安装的应用”卸载时，程序、Qt、快捷方式、安装记录和失效开机启动值会删除；配置、OAuth、凭据和用户数据默认保留。重新安装后可继续识别。
 
-v1.4.2 发布前验收应覆盖完整 pytest、clean build、主 EXE packaged self-test、七工具 MCP packaged smoke、按账号凭据/OAuth/锁/调度隔离、v1.3/v1.4 模拟迁移、IMAP UIDVALIDITY/重叠/坏邮件隔离、SMTP SSL/STARTTLS/拒绝分类、raw/附件 Hash、秘密扫描和数据保留。真实安装器覆盖升级或真实 Provider 收发若未在安全隔离环境执行，必须标记 NOT_TESTED，不能用自动化或源码测试替代。
+v1.4.3 发布前先运行 `python scripts\full_suite_preflight.py`，再覆盖完整 pytest、clean build、主 EXE packaged self-test、七工具 MCP packaged smoke、按账号凭据/OAuth/锁/调度隔离、v1.3/v1.4 模拟迁移、IMAP UIDVALIDITY 代际重试、SMTP 临时/永久拒绝分类、raw/附件 Hash、秘密扫描和数据保留。真实安装器覆盖升级或真实 Provider 收发若未在安全隔离环境执行，必须标记 NOT_TESTED，不能用自动化或源码测试替代。
 
 MCP packaged smoke 还必须以 UTF-8 向 `AgentMailBridgeMCP.exe` 写入 initialize、tools/list、每个 tools/call、malformed JSON、未知 method 和 EOF；验证读取开关关闭/开启、中文正文、附件、prepare Hash 和兼容 submit_result。不得通过修改控制台 code page 或手工 Copy-Item 规避问题。安装后桌面快捷方式仍只能指向 `AgentMailBridge.exe`，MCP EXE 不创建快捷方式。
 

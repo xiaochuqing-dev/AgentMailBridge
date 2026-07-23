@@ -36,7 +36,7 @@ Use `runtime_paths.py`. Frozen program files are read-only under the install dir
 - New mail, mailbox, sync, retry and outbound facts must carry account ownership. Keep `account_ref` only as a backward-compatible v1.3 field.
 - Database ownership migration must be transactional, idempotent and preceded by the normal upgrade backup. Do not move old package directories, rewrite raw.eml or recalculate historical hashes merely to change ownership metadata.
 - One AgentMailBridge MCP serves all accounts. New reads may filter by `account_id`; do not split provider-specific MCP servers.
-- Gmail send, QQ receive, 163, Outlook and Generic IMAP/SMTP remain unimplemented until their own verified stages. Provider catalog entries must not be presented as working capabilities.
+- Gmail send and Outlook remain unimplemented. QQ、163 与 Generic IMAP/SMTP 已实现但在真实 E2E 通过前必须保持 implementation ready / E2E required，不得表述为正式支持。
 
 ## MCP reliability invariants
 
@@ -110,7 +110,7 @@ Use `runtime_paths.py`. Frozen program files are read-only under the install dir
 - Normal automatic no-change checks must not create permanent `app_events` noise; scheduler health belongs in `auto_receive_state`.
 - `app_events` retention may delete only technical events. It must never delete business history, outbound records, MCP audit, retry state, mail packages, resources, raw mail or attachments.
 - File-log rotation and SQLite event retention are separate mechanisms and must both remain bounded.
-- AgentMailBridge v1.4.2 is the current product version. Provider-neutral IMAP/SMTP runtime、mailbox 级 UID checkpoint、Generic 正式收发代码路径和 QQ/163 双向实现已完成；QQ/163 真实账号 E2E 未通过前必须标记为 implementation ready / E2E required。Gmail send、Outlook/Microsoft 和 Unified Inbox 最终产品化仍属未来范围。
+- AgentMailBridge v1.4.3 is the current product version. Provider Validation 工具、Full Suite Preflight、UIDVALIDITY 代际化重试、目录解码和协议错误脱敏已完成；QQ、163、Generic 真实 E2E 未通过前必须标记为 implementation ready / E2E required。Gmail send、Outlook/Microsoft 和 Unified Inbox 最终产品化仍属未来范围。
 
 ## History and managed-file invariants
 

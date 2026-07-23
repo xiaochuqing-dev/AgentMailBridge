@@ -80,6 +80,12 @@ QQ 与 163 profile 来自 Thunderbird ISPDB 的公开端点事实，使用完整
 
 本版自动化完成协议、迁移、归档与 GUI 路由验证，但没有独立 QQ、163 或任意 Generic 测试账号。Adapter 状态使用 `implementation_ready_e2e_required`，明确区分“实现已接通”与“真实网络已验收”。Outlook/Microsoft 仍为 planned。
 
+## v1.4.3 Provider Validation 决策
+
+真实验收继续通过同一个 ApplicationService 和 AccountRuntimeRouter 执行，不建立 Provider 专属测试后门，也不把 secret 放入参数、JSON 或报告。`scripts/provider_validation.py` 只接受 account_id；网络和真实发件分别显式确认，证据只保留状态、错误码和计数。
+
+UID retry 归属从 account + mailbox + UID 收紧为 account + mailbox + UIDVALIDITY + UID。UIDVALIDITY 改变时，旧代际 retry 已失去协议身份，允许只删除这些技术重试；邮件 package、raw.eml、附件、业务历史和 Hash 均不受影响。Provider 状态仍由真实证据人工升级，不由连接脚本自动修改。
+
 ## 许可证边界
 
 Thunderbird Autoconfig 为 MPL-2.0，Mailspring Sync 为 GPL-3.0，Cypht 为 LGPL-2.1，email-mcp 为 LGPL-3.0，Nextcloud Mail 为 AGPL-3.0。AgentMailBridge 只借鉴账号、运行时、失败隔离、目录和调度思想，不复制这些项目的业务源码、资源或配置数据库。

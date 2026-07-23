@@ -4,7 +4,7 @@
 
 v1.4.2 在既有 Multi-Account Runtime 上补齐标准 IMAP 收件和标准 SMTP 发件，让 QQ、163 与 Generic 账号复用同一协议 Core。它不替换 Gmail API/IMAP Adapter，不增加 Gmail scope，不拆分 MCP，不建立第二套归档、调度、重试或发件审计，也不把 Outlook 当作密码型 Generic 账号。
 
-实现完成不等于真实服务端验收。本版没有独立 QQ、163 或 Generic 测试凭据，真实网络收发为 NOT_TESTED。用户必须先在账号页完成连接测试。
+实现完成不等于真实服务端验收。v1.4.3 当前环境仍没有独立 QQ、163 或 Generic 测试凭据，真实网络收发为 NOT_TESTED。用户必须先在账号页完成连接测试。
 
 ## 开源调研结论
 
@@ -38,9 +38,9 @@ QQ 与 163 的一个授权码会写入同一 account_id 下的 IMAP 和 SMTP 两
 
 增量同步从 `last_uid - uid_overlap + 1` 搜索，重取少量旧 UID 并处理有限的新 UID。重取项由统一归档判定 duplicate，不创建第二个 package。到期 retry 可脱离普通窗口追加到候选。
 
-UIDVALIDITY 改变表示原 UID 空间失效。程序把该 mailbox 的 last_uid 重置为 0、增加 reset count，再有界重扫；正式归档仍按账号与邮件身份去重。不会移动包、重写 raw.eml 或重算历史 Hash。
+UIDVALIDITY 改变表示原 UID 空间失效。程序把该 mailbox 的 last_uid 重置为 0、增加 reset count，清理同账号同 mailbox 的旧 UID 代际技术重试，再有界重扫；正式归档仍按账号与邮件身份去重。不会移动包、重写 raw.eml 或重算历史 Hash。
 
-fetch 使用 25 个 UID 一批的 `BODY.PEEK[]`。批量异常或缺项时逐 UID 再取；单封失败记录 `mailbox:uid` retry，成功新 UID 才推进 checkpoint。目录 LIST 刷新失败只告警，不阻断已配置 INBOX。
+fetch 使用 25 个 UID 一批的 `BODY.PEEK[]`。批量异常或缺项时逐 UID 再取；单封失败记录 `mailbox:uidvalidity:uid` retry，成功新 UID 才推进 checkpoint。旧 `mailbox:uid` 与纯 UID retry 只在 UIDVALIDITY 未改变时兼容读取。目录 LIST 刷新失败只告警，不阻断已配置 INBOX。
 
 历史补扫使用 SINCE/BEFORE、page size 与 scan cap，支持取消和进度，不推进普通增量 checkpoint。Date Header 只用于范围复核，无法解析时使用本地当前时间安全退化。
 
@@ -48,9 +48,17 @@ fetch 使用 25 个 UID 一批的 `BODY.PEEK[]`。批量异常或缺项时逐 UI
 
 Outgoing Runtime 只允许 `ssl` 或 `starttls`。SSL 直接建立 TLS；STARTTLS 要求 EHLO、升级 TLS、再次 EHLO。随后使用账号邮箱和该账号 secret 登录，再发送现有 EmailMessage。
 
-错误稳定分类为 connect、tls、auth、recipient_rejected、sender_rejected、timeout、temporary、server_unavailable、message_too_large 和 send。日志只写阶段和产品化原因，不写用户名、授权码或服务器响应中的秘密。
+错误稳定分类为 connect、tls、auth、recipient_rejected、sender_rejected、timeout、disconnected、temporary、permanent、server_unavailable、message_too_large 和 send。RFC 5321 的 4xx 归为可重试临时失败，5xx 归为永久拒绝；增强状态 `5.3.4` 归为超大邮件。日志只写阶段和产品化原因，不写用户名、授权码或服务器响应中的秘密。
 
 GUI 可选择具备 send 能力的账号并输入一个明确合法收件人。MCP `submit_result` 的 schema、固定 `OWNER_GMAIL`、默认 QQ 兼容配置和允许路径完全不变；Generic 账号不会自动获得 MCP 任意外发权限。
+
+## v1.4.3 验收与错误硬化
+
+`scripts/provider_validation.py` 复用 ApplicationService、AccountRuntimeRouter 和 Credential Manager，不接受命令行 secret。网络测试与真实发件分别要求显式确认；证据只记录 account_id、Provider、状态、错误码和计数，不保存邮箱地址、邮件正文、目录名、授权码或完整服务端响应。
+
+连接测试统一把 IMAP/SMTP 异常转换为认证、TLS、超时、限流、不可用、断开或通用连接错误。单邮件重试表只保存稳定错误码或异常类型，不再保存可能夹带服务端原文的异常字符串。LIST 返回 bytes 时使用 IMAP modified UTF-7 解码，避免中文目录显示为 Python bytes 字面量；SPECIAL-USE 仍是首选事实，未验证的目录名称不新增猜测规则。
+
+完整 pytest 前运行 `scripts/full_suite_preflight.py`，先核对版本、Provider 状态、schema、硬编码断言、diff、compileall 和定向回归。Windows 构建已接入同一 Preflight；`-SkipTests` 仅跳过测试，仍执行一致性与语法检查。
 
 ## Provider 与迁移
 
@@ -66,6 +74,9 @@ Provider Adapter 状态为 `implementation_ready_e2e_required`。这表示代码
 - SPECIAL-USE RFC 6154：https://www.rfc-editor.org/info/rfc6154/
 - IMAPClient：https://imapclient.readthedocs.io/
 - Python smtplib：https://docs.python.org/3/library/smtplib.html
+- TLS for Email RFC 8314：https://www.rfc-editor.org/rfc/rfc8314.html
+- SMTP RFC 5321：https://www.rfc-editor.org/rfc/rfc5321.html
+- Enhanced Status Codes RFC 3463：https://www.rfc-editor.org/rfc/rfc3463.html
 - Thunderbird Android ImapSync：https://github.com/thunderbird/thunderbird-android/blob/main/backend/imap/src/main/java/com/fsck/k9/backend/imap/ImapSync.kt
 - Thunderbird ISPDB：https://github.com/thunderbird/autoconfig
 - QQ ISPDB profile：https://github.com/thunderbird/autoconfig/blob/master/ispdb/qq.com.xml

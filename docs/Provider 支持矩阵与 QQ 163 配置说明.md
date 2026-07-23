@@ -2,15 +2,15 @@
 
 ## 支持矩阵
 
-| Provider | Receive | Send | 认证 | 目录 | 当前状态 |
-| --- | --- | --- | --- | --- | --- |
-| Gmail | Gmail API 或 IMAP | 不支持 | Desktop OAuth `gmail.readonly` 或 Google 应用专用密码 | Gmail API/IMAP 既有能力 | 收件正式支持；发件 planned |
-| QQ | IMAP 993/SSL | SMTP 465/SSL | QQ 邮箱生成的授权码 | LIST、SPECIAL-USE | 实现与自动化通过；真实 E2E NOT_TESTED |
-| 163 | IMAP 993/SSL | SMTP 465/SSL | 163 邮箱生成的授权码 | LIST、SPECIAL-USE | 实现与自动化通过；真实 E2E NOT_TESTED |
-| Generic | 用户配置 IMAP SSL/STARTTLS | 用户配置 SMTP SSL/STARTTLS | 可分别保存 IMAP/SMTP secret | LIST、SPECIAL-USE | implementation ready；服务端兼容性待账号验证 |
-| Outlook/Microsoft | 不支持 | 不支持 | 未来 MSAL/PKCE/OAuth | 未实现 | planned |
+| Provider | Auth | Login | Folder | Receive | Incremental | Send | Attachment | Restart | Error | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Gmail | Desktop OAuth `gmail.readonly` 或应用专用密码 | 收件已验证 | Gmail API/IMAP 已实现 | 正式支持 | 已实现并长期回归 | planned | 收件已支持 | 已支持 | 已支持 | receive supported |
+| QQ | 授权码 | NOT_TESTED | LIST/SPECIAL-USE 已实现，真实名称 NOT_TESTED | implementation ready | 自动化通过，真实 NOT_TESTED | implementation ready | 自动化通过，真实 NOT_TESTED | 自动化通过，真实 NOT_TESTED | 自动化通过，真实 NOT_TESTED | `implementation_ready_e2e_required` |
+| 163 | 授权码 | NOT_TESTED | LIST/SPECIAL-USE 已实现，真实名称 NOT_TESTED | implementation ready | 自动化通过，真实 NOT_TESTED | implementation ready | 自动化通过，真实 NOT_TESTED | 自动化通过，真实 NOT_TESTED | 自动化通过，真实 NOT_TESTED | `implementation_ready_e2e_required` |
+| Generic-Test | 账号级 IMAP/SMTP secret | NOT_TESTED | LIST/SPECIAL-USE 已实现 | implementation ready | 自动化通过，真实 NOT_TESTED | implementation ready | 自动化通过，真实 NOT_TESTED | 自动化通过，真实 NOT_TESTED | 自动化通过，真实 NOT_TESTED | `implementation_ready_e2e_required` |
+| Outlook/Microsoft | 未来 MSAL/PKCE/OAuth | 未实现 | 未实现 | planned | planned | planned | planned | planned | planned | planned |
 
-QQ、163 与 Generic 共用 Generic IMAP/SMTP Core、统一 Mail Package、Mail Facts、调度、重试、历史补扫和 outbound archive。Provider profile 只保存服务器默认值和少量差异，不复制协议代码。
+QQ、163 与 Generic 共用 Generic IMAP/SMTP Core、统一 Mail Package、Mail Facts、调度、重试、历史补扫和 outbound archive。v1.4.3 把 IMAP 重试身份收紧为 mailbox、UIDVALIDITY、UID，统一解码国际化目录，并把协议错误转换为不含服务端敏感原文的稳定分类。Provider profile 只保存服务器默认值和少量差异，不复制协议代码。
 
 ## QQ 配置
 
@@ -46,6 +46,17 @@ QQ、163 与 Generic 共用 Generic IMAP/SMTP Core、统一 Mail Package、Mail 
 Generic 至少配置 IMAP 或 SMTP 之一。端口必须为 1 至 65535，传输只允许 SSL/TLS 或 STARTTLS，plain 会被拒绝。IMAP 与 SMTP 可使用不同 secret，均按 account_id 存入 Windows Credential Manager。
 
 服务器连接通过并不代表所有邮件行为均兼容。启用自动收件前应验证中文主题、HTML、附件、重复同步、目录和历史补扫；正式发件前应验证收件人拒绝、附件大小和 Sent 行为。AgentMailBridge 只保留本地 outbound/sent archive，不会擅自在远端 Sent 目录追加副本。
+
+## 真实验收方法
+
+真实网络验收必须使用独立测试账号。脚本只从现有账号和 Windows Credential Manager 读取凭据，不接受命令行密码，也不输出邮箱地址、正文、目录名或服务端原始错误。无显式网络确认时拒绝运行；无显式真实发件确认时只执行登录、目录和两轮收件：
+
+```powershell
+python scripts\provider_validation.py --account-id <account_id> --confirm-network --output evidence.json
+python scripts\provider_validation.py --account-id <account_id> --confirm-network --confirm-real-send --output evidence.json
+```
+
+只有证据同时覆盖 login、folder、receive、incremental、send、attachment、receive-back、restart/reconnect 和核心错误路径，且没有 P0/P1，才能人工复核并升级正式支持状态。当前仓库没有安全测试账号，QQ、163、Generic-Test 均保持 NOT_TESTED。
 
 ## 安全说明
 
