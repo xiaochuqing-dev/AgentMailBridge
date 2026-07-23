@@ -58,15 +58,16 @@ def test_secondary_pages_keep_parent_navigation_context(v1_window):
     assert not any(button.isChecked() for button in v1_window.tab_buttons.values())
 
 
-def test_add_account_is_a_future_extension_demo(v1_qt_app):
-    dialog = AccountTypeDialog()
+def test_add_account_is_a_real_runtime_entry(v1_qt_app, tmp_cfg):
+    dialog = AccountTypeDialog(ApplicationService(tmp_cfg))
     dialog.show()
     v1_qt_app.processEvents()
     text = _all_text(dialog)
-    assert "未来邮箱扩展入口" in text
-    assert "暂不开放新增第二个同类型账号" in text
-    assert "通过左侧账号卡片管理" in text
-    assert not hasattr(dialog, "selected_type")
+    assert "添加邮箱账号" in text
+    assert "未来邮箱扩展入口" not in text
+    assert hasattr(dialog, "email_edit")
+    assert hasattr(dialog, "provider_combo")
+    assert dialog.provider_combo.count() == 3
     dialog.close()
 
 

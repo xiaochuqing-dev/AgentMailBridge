@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy_metadata
 
 
 ROOT = Path(SPECPATH).parent.parent
@@ -18,10 +18,12 @@ common_datas = [
     (str(ROOT / "THIRD_PARTY_NOTICES.md"), "."),
 ]
 common_datas += collect_data_files("certifi")
+common_datas += copy_metadata("IMAPClient")
 common_hiddenimports = (
     collect_submodules("googleapiclient")
     + collect_submodules("google_auth_oauthlib")
     + collect_submodules("google.auth")
+    + collect_submodules("imapclient")
 )
 
 gui_analysis = Analysis(

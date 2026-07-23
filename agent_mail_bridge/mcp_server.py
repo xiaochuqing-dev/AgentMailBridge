@@ -246,7 +246,7 @@ class McpServer:
             }
             return result
         if tool_name == "get_mail_sync_status":
-            return self.service.get_mail_sync_status()
+            return self.service.get_mail_sync_status(**arguments)
         raise ValueError(f"未知工具：{tool_name}")
 
     def _audit_tool(
@@ -371,11 +371,16 @@ def _validate_tool_arguments(tool_name: str, arguments: dict[str, Any]) -> str |
             "target_subdir", "overwrite_policy",
         },
         "list_agent_workspaces": set(),
-        "get_mail_sync_status": set(),
+        "get_mail_sync_status": {"account_id"},
     }
     extra = sorted(set(arguments) - allowed[tool_name])
     if extra:
         return "不支持的参数：" + ", ".join(extra)
+    if "account_id" in arguments and (
+        not isinstance(arguments["account_id"], str)
+        or not arguments["account_id"].strip()
+    ):
+        return "account_id 必须是非空字符串"
     if tool_name in {"get_mail", "read_mail_resource", "prepare_mail_resources"}:
         identifiers = [arguments.get("mail_id"), arguments.get("package_id")]
         if sum(isinstance(value, str) and bool(value.strip()) for value in identifiers) != 1:
@@ -596,11 +601,20 @@ def _get_mail_sync_status_tool() -> dict[str, Any]:
     return {
         "name": "get_mail_sync_status",
         "title": "查询邮件同步状态",
-        "description": "返回后台自动收件状态、上次检查/成功、最近结果、下次检查、跨进程同步状态、重试数、本地数据年龄和 freshness，不读取邮件正文。",
+        "description": "返回指定或当前账号的后台自动收件状态、上次检查/成功、最近结果、下次检查、跨进程同步状态、重试数、本地数据年龄和 freshness，不读取邮件正文。",
         "annotations": _tool_annotations(
             read_only=True, idempotent=True, open_world=False
         ),
-        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "account_id": {
+                    "type": "string",
+                    "description": "可选的统一账号稳定 ID",
+                }
+            },
+            "additionalProperties": False,
+        },
         "outputSchema": _generic_output_schema(),
     }
 

@@ -86,6 +86,7 @@ from agent_mail_bridge.ui.account_management import (
     AccountTypeDialog,
     open_account_dialog,
     open_add_account_dialog,
+    open_runtime_account_dialog,
 )
 from agent_mail_bridge.ui.branding import apply_brand_label, brand_icon, find_brand_asset, provider_icon
 from agent_mail_bridge.ui.theme import (
@@ -215,12 +216,14 @@ class _HistoryRescanRunner(QRunnable):
         self,
         service: ApplicationService,
         *,
+        account_id: str | None,
         date_from: datetime,
         date_to: datetime,
         apply_receive_rule: bool,
     ):
         super().__init__()
         self.service = service
+        self.account_id = account_id
         self.date_from = date_from
         self.date_to = date_to
         self.apply_receive_rule = apply_receive_rule
@@ -238,6 +241,7 @@ class _HistoryRescanRunner(QRunnable):
 
         try:
             result = self.service.historical_rescan(
+                account_id=self.account_id,
                 date_from=self.date_from,
                 date_to=self.date_to,
                 apply_receive_rule=self.apply_receive_rule,
@@ -580,7 +584,7 @@ class BridgeWindow(QMainWindow):
         layout.setContentsMargins(10, 14, 10, 12)
         layout.setSpacing(8)
 
-        self.add_account_button = QPushButton("＋  添加邮箱账号")
+        self.add_account_button = QPushButton("添加邮箱账号")
         self.add_account_button.setObjectName("primaryButton")
         self.add_account_button.setFixedHeight(46)
         self.add_account_button.clicked.connect(self.open_add_account)
@@ -607,6 +611,7 @@ class BridgeWindow(QMainWindow):
         self.qq_card.clicked.connect(lambda: self.open_account(AccountTypeDialog.QQ))
         self.account_cards_layout.addWidget(self.gmail_card)
         self.account_cards_layout.addWidget(self.qq_card)
+        self._dynamic_account_cards: list[AccountCard] = []
         self.account_cards_layout.addStretch(1)
         self.account_list_scroll = QScrollArea()
         self.account_list_scroll.setObjectName("accountListScroll")
@@ -953,6 +958,13 @@ class BridgeWindow(QMainWindow):
         self.interval_combo.setFixedWidth(145)
         self.interval_combo.currentIndexChanged.connect(self._reschedule_auto_receive)
         tools.addWidget(self.interval_combo)
+        tools.addWidget(QLabel("账号"))
+        self.receive_account_combo = QComboBox()
+        self.receive_account_combo.setMinimumWidth(190)
+        self.receive_account_combo.setToolTip(
+            "手动收取、连接测试和历史补扫使用这里选择的账号"
+        )
+        tools.addWidget(self.receive_account_combo)
         tools.addStretch(1)
         self.inbox_test_button = self._button("测试当前连接", self.test_connection)
         receive = self._button("立即收取", self.receive, primary=True, icon_kind="mail")
@@ -1115,6 +1127,15 @@ class BridgeWindow(QMainWindow):
         form = QVBoxLayout(card)
         form.setContentsMargins(18, 14, 18, 14)
         form.setSpacing(8)
+
+        sender_row = QHBoxLayout()
+        sender_row.addWidget(QLabel("发件账号"))
+        self.send_account_combo = QComboBox()
+        self.send_account_combo.setToolTip(
+            "只列出已启用并已接通发件能力的账号"
+        )
+        sender_row.addWidget(self.send_account_combo, 1)
+        form.addLayout(sender_row)
 
         recipient_row = QHBoxLayout()
         recipient_row.addWidget(QLabel("收件人 To"))
@@ -2561,13 +2582,105 @@ class BridgeWindow(QMainWindow):
             button.setAutoExclusive(True)
 
     def open_add_account(self) -> None:
-        open_add_account_dialog(self.service, self)
-        self.show_message("已查看邮箱扩展说明；现有账号未被修改", "normal")
+        if open_add_account_dialog(self.service, self):
+            self.refresh()
+            self.show_message("邮箱账号已添加", "success")
 
     def open_account(self, account_type: str) -> None:
         if open_account_dialog(self.service, account_type, self):
             self.refresh()
             self.show_message("邮箱账号配置已更新", "success")
+
+    def open_runtime_account(self, account_id: str) -> None:
+        if open_runtime_account_dialog(self.service, account_id, self):
+            self.refresh()
+            self.show_message("邮箱账号已更新", "success")
+
+    def _rebuild_runtime_account_cards(
+        self, accounts: list[dict[str, Any]]
+    ) -> None:
+        for card in self._dynamic_account_cards:
+            self.account_cards_layout.removeWidget(card)
+            card.deleteLater()
+        self._dynamic_account_cards.clear()
+        legacy_identities = {
+            ("gmail", str(self.service.cfg.gmail_address or "").casefold()),
+            ("qq", str(self.service.cfg.qq_email or "").casefold()),
+        }
+        colors = {
+            "gmail": "#EA4335",
+            "qq": "#21A4E8",
+            "generic_imap_smtp": "#6F7585",
+        }
+        names = {
+            "gmail": "Gmail",
+            "qq": "QQ 邮箱",
+            "generic_imap_smtp": "Generic 邮箱",
+        }
+        for account in accounts:
+            provider = str(account.get("provider") or "")
+            email_address = str(account.get("email_address") or "")
+            if (provider, email_address.casefold()) in legacy_identities:
+                continue
+            capabilities: list[str] = []
+            if account.get("receive_enabled"):
+                capabilities.append("收件")
+            if account.get("send_enabled"):
+                capabilities.append("发件")
+            if not capabilities and provider == "generic_imap_smtp":
+                capabilities.append("连接测试与目录发现")
+            capability_text = "当前能力：" + " · ".join(
+                capabilities or ["尚未接通"]
+            )
+            card = AccountCard(
+                provider_icon(provider),
+                str(account.get("display_name") or names.get(provider, provider)),
+                email_address or "未配置",
+                capability_text,
+                colors.get(provider, "#6F7585"),
+            )
+            configured = bool(
+                account.get("enabled")
+                and account.get("credential_configured")
+            )
+            card.set_configured(configured)
+            if not account.get("enabled"):
+                card.status_tag.setText("已停用")
+            elif not account.get("credential_configured"):
+                card.status_tag.setText("需认证")
+            auth_text = {
+                "READY": "已授权",
+                "TOKEN_EXPIRED_REFRESHABLE": "可自动刷新",
+                "CONFIGURED": "已配置",
+                "AUTH_REQUIRED": "需要认证",
+                "CREDENTIAL_UNAVAILABLE": "凭据不可用",
+            }.get(str(account.get("auth_state") or ""), "未检查")
+            connection_text = {
+                "success": "最近成功",
+                "no_changes": "最近检查正常，无新邮件",
+                "partial": "最近部分完成",
+                "failed": "最近失败",
+                "not_tested": "未检查",
+            }.get(
+                str(account.get("connection_status") or ""),
+                "已有运行记录",
+            )
+            card.setToolTip(
+                f"稳定账号 ID：{account.get('account_id')}\n"
+                f"数据命名空间：{account.get('data_namespace')}\n"
+                f"认证状态：{auth_text}\n"
+                f"最近连接/同步：{connection_text}"
+            )
+            account_id = str(account.get("account_id") or "")
+            card.clicked.connect(
+                lambda account_id=account_id: self.open_runtime_account(
+                    account_id
+                )
+            )
+            self.account_cards_layout.insertWidget(
+                self.account_cards_layout.count() - 1, card
+            )
+            self._dynamic_account_cards.append(card)
 
     def save_receive_preferences(
         self,
@@ -2751,9 +2864,14 @@ class BridgeWindow(QMainWindow):
     def receive(self) -> None:
         sender = self.sender()
         button = sender if isinstance(sender, QPushButton) else None
+        account_id = str(
+            self.receive_account_combo.currentData() or ""
+        )
         self._run_task(
             "正在连接 Gmail 并检查当前增量范围",
-            self.service.receive,
+            lambda: self.service.receive(
+                account_id=account_id or None
+            ),
             self._show_receive_result,
             button=button,
             working_text="收取中…",
@@ -2914,6 +3032,10 @@ class BridgeWindow(QMainWindow):
         self._history_rescan_stats.setText("正在查询指定历史范围…")
         runner = _HistoryRescanRunner(
             self.service,
+            account_id=str(
+                self.receive_account_combo.currentData() or ""
+            )
+            or None,
             date_from=date_from,
             date_to=date_to,
             apply_receive_rule=apply_receive_rule,
@@ -3160,6 +3282,10 @@ class BridgeWindow(QMainWindow):
             )
             return
         total_size = sum(item.size for item in self.send_selections)
+        from_account_id = str(
+            self.send_account_combo.currentData() or ""
+        )
+        sender_text = self.send_account_combo.currentText() or "当前 QQ 发件账号"
         confirmation = QMessageBox.question(
             self,
             "确认发送邮件",
@@ -3168,6 +3294,7 @@ class BridgeWindow(QMainWindow):
             f"正文：{'有' if body.strip() else '无'}\n"
             f"附件：{len(self.send_selections)} 个，共 {format_size(total_size)}\n"
             f"链接：{len(self.send_links)} 个\n"
+            f"发件账号：{sender_text}\n"
             f"实际收件人：{recipient}\n\n"
             "确认后才会连接 QQ SMTP。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -3184,7 +3311,12 @@ class BridgeWindow(QMainWindow):
         self._run_task(
             "正在校验并发送这一封邮件，请勿重复点击",
             lambda: self._send_composition_if_unchanged(
-                recipient, subject, body, snapshots, links
+                recipient,
+                subject,
+                body,
+                snapshots,
+                links,
+                from_account_id=from_account_id,
             ),
             self._show_send_result,
             button=self.send_action_button,
@@ -3198,6 +3330,7 @@ class BridgeWindow(QMainWindow):
         body: str,
         snapshots: list[SendFileSelection],
         links: list[dict[str, str]],
+        from_account_id: str = "",
     ) -> ServiceResult:
         if any(not item.is_unchanged() for item in snapshots):
             return ServiceResult(
@@ -3206,6 +3339,7 @@ class BridgeWindow(QMainWindow):
                 message="确认后附件发生变化，已阻止发送",
             )
         return self.service.send_user_selected_mail(
+            from_account_id=from_account_id or None,
             recipient=recipient,
             subject=subject or None,
             body_text=body,
@@ -3360,6 +3494,16 @@ class BridgeWindow(QMainWindow):
     def test_connection(self) -> None:
         sender = self.sender()
         button = sender if isinstance(sender, QPushButton) else None
+        account_id = str(
+            self.receive_account_combo.currentData() or ""
+        )
+        if account_id:
+            self._diagnose(
+                "正在测试所选收件账号连接",
+                lambda: self.service.test_mail_account_connection(account_id),
+                button,
+            )
+            return
         backend = self.service.cfg.gmail_receive_backend
         if backend == "gmail_api" or (backend == "auto" and self.service.cfg.gmail_api_configured):
             self._diagnose("正在测试 Gmail API 连接", self.service.diagnose_gmail_api, button)
@@ -3811,6 +3955,55 @@ class BridgeWindow(QMainWindow):
             self.gmail_card.set_configured(bool(cfg.gmail_address))
             self.qq_card.set_configured(bool(cfg.qq_email))
             accounts = list(status.get("mail_accounts") or [])
+            self._rebuild_runtime_account_cards(accounts)
+            selected_receiver = str(
+                self.receive_account_combo.currentData() or ""
+            )
+            self.receive_account_combo.blockSignals(True)
+            self.receive_account_combo.clear()
+            for account in accounts:
+                if not (
+                    account.get("enabled")
+                    and account.get("receive_enabled")
+                    and "receive" in set(account.get("capabilities") or ())
+                ):
+                    continue
+                self.receive_account_combo.addItem(
+                    (
+                        f"{account.get('display_name') or account.get('provider')} "
+                        f"({account.get('email_address')})"
+                    ),
+                    str(account.get("account_id") or ""),
+                )
+            receiver_index = self.receive_account_combo.findData(
+                selected_receiver
+            )
+            if receiver_index >= 0:
+                self.receive_account_combo.setCurrentIndex(receiver_index)
+            self.receive_account_combo.blockSignals(False)
+            selected_sender = str(
+                self.send_account_combo.currentData() or ""
+            )
+            self.send_account_combo.blockSignals(True)
+            self.send_account_combo.clear()
+            for account in accounts:
+                if not (
+                    account.get("enabled")
+                    and account.get("send_enabled")
+                    and "send" in set(account.get("capabilities") or ())
+                ):
+                    continue
+                label = (
+                    f"{account.get('display_name') or account.get('provider')} "
+                    f"({account.get('email_address')})"
+                )
+                self.send_account_combo.addItem(
+                    label, str(account.get("account_id") or "")
+                )
+            sender_index = self.send_account_combo.findData(selected_sender)
+            if sender_index >= 0:
+                self.send_account_combo.setCurrentIndex(sender_index)
+            self.send_account_combo.blockSignals(False)
             for card, provider, address in (
                 (self.gmail_card, "gmail", cfg.gmail_address),
                 (self.qq_card, "qq", cfg.qq_email),
@@ -5832,7 +6025,7 @@ class BridgeWindow(QMainWindow):
         self.auto_switch.setChecked(enabled)
         self._loading_auto_receive = False
         self._sync_manual_receive_actions()
-        self.service.save_auto_receive_state(
+        self.service.save_all_auto_receive_states(
             enabled=enabled,
             interval_seconds=seconds,
         )
@@ -5846,7 +6039,7 @@ class BridgeWindow(QMainWindow):
         if self._loading_auto_receive:
             return
         self._sync_manual_receive_actions()
-        self.service.save_auto_receive_state(
+        self.service.save_all_auto_receive_states(
             enabled=enabled,
             interval_seconds=self._auto_seconds(),
             consecutive_global_failures=0 if enabled else self.auto_failures,
@@ -5871,7 +6064,9 @@ class BridgeWindow(QMainWindow):
     def _reschedule_auto_receive(self) -> None:
         if self._loading_auto_receive:
             return
-        self.service.save_auto_receive_state(interval_seconds=self._auto_seconds())
+        self.service.save_all_auto_receive_states(
+            interval_seconds=self._auto_seconds()
+        )
         if hasattr(self, "auto_switch") and self.auto_switch.isChecked():
             self._schedule_auto_receive()
 
@@ -5881,17 +6076,9 @@ class BridgeWindow(QMainWindow):
         if self.task_active:
             self._schedule_auto_receive(5)
             return
-        now_text = datetime.now().isoformat(sep=" ", timespec="seconds")
-        self.service.save_auto_receive_state(
-            last_check_at=now_text,
-            last_result="checking",
-        )
-        self._update_auto_receive_status(
-            self.service.get_auto_receive_state().details
-        )
         self._run_task(
-            "自动收件正在运行",
-            lambda: self.service.receive(automatic=True),
+            "多账号自动收件正在运行",
+            self.service.sync_due_mail_accounts,
             self._finish_auto_receive,
         )
 
@@ -5926,7 +6113,7 @@ class BridgeWindow(QMainWindow):
         next_check = (datetime.now() + timedelta(seconds=delay)).isoformat(
             sep=" ", timespec="seconds"
         )
-        self.service.save_auto_receive_state(
+        self.service.save_all_auto_receive_states(
             enabled=True,
             interval_seconds=self._auto_seconds(),
             next_check_at=next_check,
@@ -5938,6 +6125,15 @@ class BridgeWindow(QMainWindow):
     def _finish_auto_receive(self, result: ServiceResult) -> None:
         self._show_receive_result(result)
         if not self.auto_switch.isChecked():
+            return
+        if "results" in result.details:
+            self.auto_failures = 0
+            self._update_auto_receive_status(
+                self.service.get_auto_receive_state().details
+            )
+            self.auto_timer.start(
+                min(30, self._auto_seconds()) * 1000
+            )
             return
         now_text = datetime.now().isoformat(sep=" ", timespec="seconds")
         if result.status in {OperationStatus.FAILED, OperationStatus.AUTH_REQUIRED}:

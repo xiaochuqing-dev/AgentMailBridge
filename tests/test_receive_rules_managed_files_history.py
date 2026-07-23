@@ -333,15 +333,21 @@ def test_rule_save_failure_keeps_previous_effective_config(
     ) == before
 
 
-def test_manual_and_automatic_receive_call_the_same_service_operation(
+def test_manual_receive_is_scoped_and_automatic_uses_multi_account_scheduler(
     specialty_window, monkeypatch
 ):
     operations = []
     calls = []
+    scheduled = []
     monkeypatch.setattr(
         specialty_window.service,
         "receive",
         lambda **kwargs: calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        specialty_window.service,
+        "sync_due_mail_accounts",
+        lambda: scheduled.append(True),
     )
     monkeypatch.setattr(
         specialty_window,
@@ -354,7 +360,14 @@ def test_manual_and_automatic_receive_call_the_same_service_operation(
     assert len(operations) == 2
     operations[0]()
     operations[1]()
-    assert calls == [{}, {"automatic": True}]
+    assert calls == [
+        {
+            "account_id": str(
+                specialty_window.receive_account_combo.currentData()
+            )
+        }
+    ]
+    assert scheduled == [True]
 
 
 def test_history_main_table_is_productized_and_detail_is_structured(

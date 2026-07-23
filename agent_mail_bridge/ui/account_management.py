@@ -10,8 +10,11 @@ from PySide6.QtGui import QCloseEvent, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
+    QCheckBox,
+    QComboBox,
     QDialog,
     QFileDialog,
+    QFormLayout,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -65,10 +68,17 @@ class _OAuthWorker(QObject):
     progress = Signal(object)
     finished = Signal(str, object)
 
-    def __init__(self, service: ApplicationService, timeout_seconds: float):
+    def __init__(
+        self,
+        service: ApplicationService,
+        timeout_seconds: float,
+        account_id: str | None = None,
+    ):
         super().__init__()
         self.service = service
+        self.account_id = account_id
         self.session = service.create_gmail_oauth_session(
+            account_id=account_id,
             progress_callback=self.progress.emit,
             timeout_seconds=timeout_seconds,
         )
@@ -76,7 +86,10 @@ class _OAuthWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
-            result = self.service.authorize_gmail_api(session=self.session)
+            result = self.service.authorize_gmail_api(
+                account_id=self.account_id,
+                session=self.session,
+            )
         except Exception as exc:  # noqa: BLE001
             result = ServiceResult(
                 OperationStatus.FAILED,
@@ -440,6 +453,11 @@ class GmailAccountDialog(_AccountDialog):
         email_label.setObjectName("fieldLabel")
         self.email_edit = QLineEdit(service.cfg.gmail_address)
         self.email_edit.setPlaceholderText("name@gmail.com")
+        if service.cfg.gmail_address:
+            self.email_edit.setReadOnly(True)
+            self.email_edit.setToolTip(
+                "账号地址是稳定身份的一部分；如需换地址，请添加新账号并移除旧账号。"
+            )
         root.addWidget(email_label)
         root.addWidget(self.email_edit)
 
@@ -1161,6 +1179,11 @@ class QQAccountDialog(_AccountDialog):
         label.setObjectName("fieldLabel")
         self.email_edit = QLineEdit(service.cfg.qq_email)
         self.email_edit.setPlaceholderText("123456@qq.com")
+        if service.cfg.qq_email:
+            self.email_edit.setReadOnly(True)
+            self.email_edit.setToolTip(
+                "账号地址是稳定身份的一部分；如需换地址，请添加新账号并移除旧账号。"
+            )
         root.addWidget(label)
         root.addWidget(self.email_edit)
         self.qq_credential = CredentialEditor(
@@ -1254,61 +1277,514 @@ class QQAccountDialog(_AccountDialog):
 
 
 class AccountTypeDialog(QDialog):
-    """v1.4.0 Provider 扩展说明，不复用已有账号编辑路由。"""
+    """创建新的统一邮箱账号，不复用旧账号编辑路由。"""
 
     GMAIL = "gmail"
     QQ = "qq"
+    GENERIC = "generic_imap_smtp"
 
-    def __init__(self, parent: QWidget | None = None):
+    def __init__(
+        self,
+        service: ApplicationService,
+        parent: QWidget | None = None,
+    ):
         super().__init__(parent)
+        self.service = service
+        self.created_account_id = ""
         self.setWindowTitle("添加邮箱账号")
         self.setModal(True)
-        self.setMinimumSize(620, 430)
+        self.setMinimumSize(680, 650)
+        self.resize(720, 700)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 22, 24, 20)
         layout.setSpacing(12)
         title = QLabel("添加邮箱账号")
         title.setObjectName("pageTitle")
         hint = QLabel(
-            "统一账号核心已就绪；这里是未来邮箱扩展入口，不会修改当前 Gmail 或 QQ 邮箱账号。"
+            "可添加多个 Gmail、QQ 或 Generic IMAP/SMTP 账号。"
+            "Generic 当前只开放连接测试和目录发现，尚未开放正式收发。"
         )
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         layout.addWidget(title)
         layout.addWidget(hint)
 
-        current = QFrame()
-        current.setObjectName("accountPanel")
-        current_layout = QVBoxLayout(current)
-        current_layout.setContentsMargins(16, 14, 16, 14)
-        current_title = QLabel("当前已支持")
-        current_title.setObjectName("sectionTitle")
-        current_layout.addWidget(current_title)
-        current_layout.addWidget(QLabel("Gmail：当前支持收件与本地归档，通过左侧账号卡片管理"))
-        current_layout.addWidget(QLabel("QQ 邮箱：当前支持发件，通过左侧账号卡片管理"))
-        layout.addWidget(current)
+        form_card = QFrame()
+        form_card.setObjectName("accountPanel")
+        form = QFormLayout(form_card)
+        form.setContentsMargins(16, 14, 16, 14)
+        form.setSpacing(10)
+        self.provider_combo = QComboBox()
+        self.provider_combo.addItem("Gmail", self.GMAIL)
+        self.provider_combo.addItem("QQ 邮箱", self.QQ)
+        self.provider_combo.addItem("Generic IMAP/SMTP", self.GENERIC)
+        self.display_name_edit = QLineEdit()
+        self.display_name_edit.setPlaceholderText("可选的账号显示名称")
+        self.email_edit = QLineEdit()
+        self.email_edit.setPlaceholderText("name@example.com")
+        self.backend_combo = QComboBox()
+        self.backend_combo.addItem("Gmail API（OAuth）", "gmail_api")
+        self.backend_combo.addItem("Gmail IMAP（应用专用密码）", "imap")
+        self.secret_edit = QLineEdit()
+        self.secret_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.secret_edit.setPlaceholderText("密码或授权码不会写入数据库")
+        form.addRow("邮箱类型", self.provider_combo)
+        form.addRow("显示名称", self.display_name_edit)
+        form.addRow("邮箱地址", self.email_edit)
+        self.backend_label = QLabel("Gmail 收件方式")
+        form.addRow(self.backend_label, self.backend_combo)
+        self.secret_label = QLabel("账号凭据")
+        form.addRow(self.secret_label, self.secret_edit)
+        layout.addWidget(form_card)
 
-        future = QFrame()
-        future.setObjectName("card")
-        future_layout = QVBoxLayout(future)
-        future_layout.setContentsMargins(16, 14, 16, 14)
-        future_title = QLabel("未来可扩展")
-        future_title.setObjectName("sectionTitle")
-        future_layout.addWidget(future_title)
-        future_layout.addWidget(QLabel("Outlook · 163 邮箱 · 企业邮箱 · 更多邮箱服务"))
-        future_note = QLabel(
-            "当前 v1.4.0 已支持多个账号事实并存；暂不开放新增第二个同类型账号，"
-            "其他邮箱 Provider 也尚未正式接通。"
-        )
-        future_note.setObjectName("hint")
-        future_note.setWordWrap(True)
-        future_layout.addWidget(future_note)
-        layout.addWidget(future)
+        self.server_panel = QFrame()
+        self.server_panel.setObjectName("card")
+        server_form = QFormLayout(self.server_panel)
+        server_form.setContentsMargins(16, 14, 16, 14)
+        server_form.setSpacing(8)
+        self.imap_host_edit = QLineEdit()
+        self.imap_port_edit = QLineEdit("993")
+        self.imap_security_combo = QComboBox()
+        self.imap_security_combo.addItem("SSL/TLS", "ssl")
+        self.imap_security_combo.addItem("STARTTLS", "starttls")
+        self.smtp_host_edit = QLineEdit()
+        self.smtp_port_edit = QLineEdit("465")
+        self.smtp_security_combo = QComboBox()
+        self.smtp_security_combo.addItem("SSL/TLS", "ssl")
+        self.smtp_security_combo.addItem("STARTTLS", "starttls")
+        server_form.addRow("IMAP 服务器", self.imap_host_edit)
+        server_form.addRow("IMAP 端口", self.imap_port_edit)
+        server_form.addRow("IMAP 安全", self.imap_security_combo)
+        server_form.addRow("SMTP 服务器", self.smtp_host_edit)
+        server_form.addRow("SMTP 端口", self.smtp_port_edit)
+        server_form.addRow("SMTP 安全", self.smtp_security_combo)
+        server_note = QLabel("不接受明文连接；凭据只进入 Windows Credential Manager。")
+        server_note.setObjectName("hint")
+        server_note.setWordWrap(True)
+        server_form.addRow(server_note)
+        layout.addWidget(self.server_panel)
+
+        self.result_label = QLabel("准备创建账号")
+        self.result_label.setObjectName("hint")
+        self.result_label.setWordWrap(True)
+        layout.addWidget(self.result_label)
         layout.addStretch(1)
-        close = QPushButton("我知道了")
-        close.setObjectName("primaryButton")
-        close.clicked.connect(self.accept)
-        layout.addWidget(close, 0, Qt.AlignmentFlag.AlignRight)
+        actions = QHBoxLayout()
+        cancel = QPushButton("取消")
+        cancel.clicked.connect(self.reject)
+        create = QPushButton("创建账号")
+        create.setObjectName("primaryButton")
+        create.clicked.connect(self.accept)
+        actions.addStretch(1)
+        actions.addWidget(cancel)
+        actions.addWidget(create)
+        layout.addLayout(actions)
+        self.provider_combo.currentIndexChanged.connect(self._provider_changed)
+        self.backend_combo.currentIndexChanged.connect(self._provider_changed)
+        self._provider_changed()
+
+    def _provider_changed(self) -> None:
+        provider = str(self.provider_combo.currentData() or "")
+        is_gmail = provider == self.GMAIL
+        is_generic = provider == self.GENERIC
+        self.backend_label.setVisible(is_gmail)
+        self.backend_combo.setVisible(is_gmail)
+        gmail_api = is_gmail and self.backend_combo.currentData() == "gmail_api"
+        self.secret_label.setText(
+            "QQ SMTP 授权码"
+            if provider == self.QQ
+            else "IMAP 应用专用密码"
+            if is_gmail
+            else "IMAP/SMTP 密码或授权码"
+        )
+        self.secret_label.setVisible(not gmail_api)
+        self.secret_edit.setVisible(not gmail_api)
+        self.server_panel.setVisible(is_generic)
+
+    def accept(self) -> None:
+        provider = str(self.provider_combo.currentData() or "")
+        settings: dict[str, Any] = {}
+        backend = ""
+        if provider == self.GMAIL:
+            backend = str(self.backend_combo.currentData() or "gmail_api")
+        elif provider == self.GENERIC:
+            settings = {
+                "imap_host": self.imap_host_edit.text().strip(),
+                "imap_port": self.imap_port_edit.text().strip(),
+                "imap_security": self.imap_security_combo.currentData(),
+                "smtp_host": self.smtp_host_edit.text().strip(),
+                "smtp_port": self.smtp_port_edit.text().strip(),
+                "smtp_security": self.smtp_security_combo.currentData(),
+            }
+        result = self.service.create_mail_account(
+            provider=provider,
+            email_address=self.email_edit.text(),
+            display_name=self.display_name_edit.text(),
+            receive_backend=backend,
+            provider_settings=settings,
+            secret=self.secret_edit.text(),
+        )
+        self.result_label.setText(result.message)
+        self.result_label.setStyleSheet(
+            f"color: {SUCCESS if result.ok else DANGER};"
+        )
+        if result.ok:
+            self.created_account_id = str(
+                result.details.get("account", {}).get("account_id") or ""
+            )
+            super().accept()
+
+
+class RuntimeAccountDialog(_AccountDialog):
+    """管理非旧配置账号的启停、凭据、连接测试、OAuth 与软移除。"""
+
+    def __init__(
+        self,
+        service: ApplicationService,
+        account_id: str,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(service, parent)
+        self.account_id = account_id
+        self.account = self._load_account()
+        self._oauth_thread: QThread | None = None
+        self._oauth_worker: _OAuthWorker | None = None
+        self._oauth_active = False
+        self._close_after_oauth = False
+        self.setWindowTitle("邮箱账号")
+        self.setMinimumSize(680, 610)
+        self.resize(740, 680)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 20, 22, 18)
+        root.setSpacing(12)
+        title = QLabel(str(self.account.get("display_name") or "邮箱账号"))
+        title.setObjectName("pageTitle")
+        identity = QLabel(
+            f"{self.account.get('email_address')}  "
+            f"Provider：{self.account.get('provider')}"
+        )
+        identity.setObjectName("hint")
+        root.addWidget(title)
+        root.addWidget(identity)
+
+        self.enabled_check = QCheckBox("启用此账号")
+        self.enabled_check.setChecked(bool(self.account.get("enabled")))
+        root.addWidget(self.enabled_check)
+
+        provider = str(self.account.get("provider") or "")
+        settings = dict(self.account.get("provider_settings") or {})
+        self.imap_secret_edit: QLineEdit | None = None
+        self.smtp_secret_edit: QLineEdit | None = None
+        if provider == "gmail" and settings.get("receive_backend") == "imap":
+            self.imap_secret_edit = self._secret_editor(
+                root, "更新 IMAP 应用专用密码"
+            )
+        elif provider == "qq":
+            self.smtp_secret_edit = self._secret_editor(
+                root, "更新 QQ SMTP 授权码"
+            )
+        elif provider == "generic_imap_smtp":
+            if settings.get("imap_host"):
+                self.imap_secret_edit = self._secret_editor(
+                    root, "更新 IMAP 密码或授权码"
+                )
+            if settings.get("smtp_host"):
+                self.smtp_secret_edit = self._secret_editor(
+                    root, "更新 SMTP 密码或授权码"
+                )
+
+        actions_card = QFrame()
+        actions_card.setObjectName("accountPanel")
+        actions_layout = QVBoxLayout(actions_card)
+        actions_layout.setContentsMargins(14, 12, 14, 12)
+        self.test_button = QPushButton("测试账号连接")
+        self.test_button.clicked.connect(self.test_connection)
+        actions_layout.addWidget(self.test_button)
+        self.discover_button = QPushButton("发现 IMAP 目录")
+        can_discover = provider == "generic_imap_smtp" or (
+            provider == "gmail"
+            and settings.get("receive_backend") == "imap"
+        )
+        self.discover_button.setVisible(can_discover)
+        self.discover_button.clicked.connect(self.discover_mailboxes)
+        actions_layout.addWidget(self.discover_button)
+
+        self.oauth_import_button = QPushButton("导入 OAuth credentials.json")
+        self.oauth_authorize_button = QPushButton("开始 Gmail OAuth 授权")
+        self.oauth_clear_button = QPushButton("清除本账号 OAuth Token")
+        self.oauth_cancel_button = QPushButton("取消正在进行的 OAuth")
+        is_oauth = provider == "gmail" and (
+            settings.get("receive_backend") == "gmail_api"
+        )
+        for button in (
+            self.oauth_import_button,
+            self.oauth_authorize_button,
+            self.oauth_clear_button,
+            self.oauth_cancel_button,
+        ):
+            button.setVisible(is_oauth)
+            actions_layout.addWidget(button)
+        self.oauth_cancel_button.hide()
+        self.oauth_import_button.clicked.connect(self.import_oauth)
+        self.oauth_authorize_button.clicked.connect(self.authorize_oauth)
+        self.oauth_clear_button.clicked.connect(self.clear_oauth)
+        self.oauth_cancel_button.clicked.connect(self.cancel_oauth)
+        root.addWidget(actions_card)
+
+        remove_card = QFrame()
+        remove_card.setObjectName("card")
+        remove_layout = QVBoxLayout(remove_card)
+        remove_layout.setContentsMargins(14, 12, 14, 12)
+        remove_note = QLabel(
+            "移除账号会停止后续收发；本地邮件、附件、发件记录和审计默认保留。"
+        )
+        remove_note.setWordWrap(True)
+        remove_layout.addWidget(remove_note)
+        self.cleanup_credentials_check = QCheckBox("同时删除本账号凭据")
+        self.cleanup_oauth_check = QCheckBox("同时删除本账号 OAuth Token")
+        self.cleanup_oauth_check.setVisible(provider == "gmail")
+        remove_layout.addWidget(self.cleanup_credentials_check)
+        remove_layout.addWidget(self.cleanup_oauth_check)
+        self.remove_button = QPushButton("移除账号")
+        self.remove_button.setObjectName("dangerButton")
+        self.remove_button.clicked.connect(self.remove_account)
+        remove_layout.addWidget(self.remove_button)
+        root.addWidget(remove_card)
+
+        self.result_label = self._status_label()
+        root.addWidget(self.result_label)
+        root.addStretch(1)
+        footer = QHBoxLayout()
+        cancel = QPushButton("关闭")
+        cancel.clicked.connect(self.reject)
+        save = QPushButton("保存")
+        save.setObjectName("primaryButton")
+        save.clicked.connect(self.accept)
+        footer.addStretch(1)
+        footer.addWidget(cancel)
+        footer.addWidget(save)
+        root.addLayout(footer)
+
+    def _load_account(self) -> dict[str, Any]:
+        result = self.service.list_mail_accounts()
+        return next(
+            (
+                dict(item)
+                for item in result.details.get("accounts", [])
+                if item.get("account_id") == self.account_id
+            ),
+            {},
+        )
+
+    @staticmethod
+    def _secret_editor(layout: QVBoxLayout, label_text: str) -> QLineEdit:
+        label = QLabel(label_text)
+        label.setObjectName("fieldLabel")
+        editor = QLineEdit()
+        editor.setEchoMode(QLineEdit.EchoMode.Password)
+        editor.setPlaceholderText("留空表示不修改")
+        layout.addWidget(label)
+        layout.addWidget(editor)
+        return editor
+
+    def test_connection(self) -> None:
+        self._running("正在测试账号连接…")
+        self._run_background(
+            lambda: self.service.test_mail_account_connection(self.account_id),
+            self._show_result,
+            button=self.test_button,
+            working_text="正在测试…",
+        )
+
+    def discover_mailboxes(self) -> None:
+        self._running("正在发现 IMAP 目录…")
+        self._run_background(
+            lambda: self.service.discover_mail_account_mailboxes(self.account_id),
+            self._show_result,
+            button=self.discover_button,
+            working_text="正在发现…",
+        )
+
+    def import_oauth(self) -> None:
+        source, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择 Google Desktop credentials.json",
+            "",
+            "JSON 文件 (*.json)",
+        )
+        if not source:
+            self._show_result(
+                ServiceResult(OperationStatus.CANCELLED, message="已取消导入")
+            )
+            return
+        result = self.service.import_oauth_credentials(
+            source, replace=False, account_id=self.account_id
+        )
+        if result.error_code == "oauth_credentials_exists":
+            answer = QMessageBox.question(
+                self,
+                "替换本账号 OAuth 客户端配置",
+                "本账号已有 credentials.json。替换不会删除 Token 或影响其他账号，是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                result = self.service.import_oauth_credentials(
+                    source, replace=True, account_id=self.account_id
+                )
+        self._show_result(result)
+
+    def authorize_oauth(self) -> None:
+        if self._oauth_active:
+            return
+        try:
+            worker = _OAuthWorker(
+                self.service, 300.0, account_id=self.account_id
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._show_result(
+                ServiceResult(
+                    OperationStatus.FAILED,
+                    error_code="oauth_session_failed",
+                    message=str(exc),
+                )
+            )
+            return
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        self._oauth_thread = thread
+        self._oauth_worker = worker
+        self._oauth_active = True
+        self.oauth_authorize_button.setEnabled(False)
+        self.oauth_cancel_button.show()
+        worker.progress.connect(
+            lambda event: self._running(
+                str(event.get("message") or "等待用户完成 OAuth 授权")
+            )
+        )
+        worker.finished.connect(self._oauth_finished)
+        worker.finished.connect(thread.quit)
+        thread.started.connect(worker.run)
+        thread.finished.connect(self._oauth_thread_finished)
+        thread.start()
+
+    @Slot(str, object)
+    def _oauth_finished(
+        self, _session_id: str, result: ServiceResult
+    ) -> None:
+        self._show_result(result)
+
+    def _oauth_thread_finished(self) -> None:
+        self._oauth_active = False
+        self.oauth_authorize_button.setEnabled(True)
+        self.oauth_cancel_button.hide()
+        self._oauth_worker = None
+        thread = self._oauth_thread
+        self._oauth_thread = None
+        if thread is not None:
+            thread.deleteLater()
+        if self._close_after_oauth:
+            self._close_after_oauth = False
+            QDialog.reject(self)
+
+    def cancel_oauth(self) -> None:
+        if self._oauth_worker is not None:
+            self._oauth_worker.session.cancel()
+            self._running("正在取消 OAuth 授权…")
+
+    def clear_oauth(self) -> None:
+        answer = QMessageBox.question(
+            self,
+            "清除本账号 OAuth Token",
+            "只清除此账号的 Token，Desktop credentials.json 和其他账号不受影响。是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._show_result(
+                self.service.clear_gmail_oauth_token(self.account_id)
+            )
+
+    def remove_account(self) -> None:
+        if self._oauth_active:
+            self._show_result(
+                ServiceResult(
+                    OperationStatus.CANCELLED,
+                    message="请先完成或取消当前 OAuth 授权",
+                )
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            "移除邮箱账号",
+            "账号将停止运行，本地历史数据会保留。是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        result = self.service.remove_mail_account(
+            self.account_id,
+            cleanup_credentials=self.cleanup_credentials_check.isChecked(),
+            cleanup_oauth_token=self.cleanup_oauth_check.isChecked(),
+        )
+        self._show_result(result)
+        if result.ok:
+            QDialog.accept(self)
+
+    def accept(self) -> None:
+        if self._oauth_active:
+            self._show_result(
+                ServiceResult(
+                    OperationStatus.CANCELLED,
+                    message="请先完成或取消当前 OAuth 授权",
+                )
+            )
+            return
+        result = self.service.update_mail_account(
+            self.account_id, enabled=self.enabled_check.isChecked()
+        )
+        if result.ok and self.imap_secret_edit is not None:
+            value = self.imap_secret_edit.text().strip()
+            if value:
+                result = self.service.set_account_credential(
+                    self.account_id, "imap_password", value
+                )
+        if result.ok and self.smtp_secret_edit is not None:
+            value = self.smtp_secret_edit.text().strip()
+            if value:
+                result = self.service.set_account_credential(
+                    self.account_id, "smtp_password", value
+                )
+        self._show_result(result)
+        if result.ok:
+            QDialog.accept(self)
+
+    def reject(self) -> None:
+        if self._oauth_active:
+            self._close_after_oauth = True
+            self.cancel_oauth()
+            return
+        super().reject()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if self._oauth_active:
+            self._close_after_oauth = True
+            self.cancel_oauth()
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+    @Slot()
+    def _prepare_application_exit(self) -> None:
+        worker = self._oauth_worker
+        thread = self._oauth_thread
+        if worker is not None:
+            worker.session.cancel()
+        if thread is not None and thread.isRunning():
+            thread.quit()
+            thread.wait()
+        super()._prepare_application_exit()
 
 
 def open_account_dialog(
@@ -1316,6 +1792,33 @@ def open_account_dialog(
     account_type: str,
     parent: QWidget | None = None,
 ) -> bool:
+    provider = {
+        AccountTypeDialog.GMAIL: "gmail",
+        AccountTypeDialog.QQ: "qq",
+    }.get(account_type)
+    configured_address = {
+        AccountTypeDialog.GMAIL: service.cfg.gmail_address,
+        AccountTypeDialog.QQ: service.cfg.qq_email,
+    }.get(account_type, "")
+    if provider and configured_address:
+        accounts = service.list_mail_accounts()
+        account = next(
+            (
+                item
+                for item in accounts.details.get("accounts", ())
+                if item.get("provider") == provider
+                and str(item.get("email_address") or "").casefold()
+                == configured_address.casefold()
+            ),
+            None,
+        )
+        if account is not None:
+            return (
+                RuntimeAccountDialog(
+                    service, str(account["account_id"]), parent
+                ).exec()
+                == QDialog.DialogCode.Accepted
+            )
     dialog: QDialog
     if account_type == AccountTypeDialog.GMAIL:
         dialog = GmailAccountDialog(service, parent)
@@ -1329,5 +1832,18 @@ def open_account_dialog(
 def open_add_account_dialog(
     service: ApplicationService, parent: QWidget | None = None
 ) -> bool:
-    del service
-    return AccountTypeDialog(parent).exec() == QDialog.DialogCode.Accepted
+    return (
+        AccountTypeDialog(service, parent).exec()
+        == QDialog.DialogCode.Accepted
+    )
+
+
+def open_runtime_account_dialog(
+    service: ApplicationService,
+    account_id: str,
+    parent: QWidget | None = None,
+) -> bool:
+    return (
+        RuntimeAccountDialog(service, account_id, parent).exec()
+        == QDialog.DialogCode.Accepted
+    )
