@@ -78,12 +78,12 @@ Use `runtime_paths.py`. Frozen program files are read-only under the install dir
 ## Frontend information architecture
 
 - The top-level work area contains only Receive and Send.
-- Agent/MCP is an independent left-side entry joined visually with History, Files & Data, Settings and About; it must not leave a detached gap.
+- Agent Integration is an independent left-side entry joined visually with History, Files & Data, Settings and About; it must not leave a detached gap.
 - Existing account configuration belongs only to unified account cards; the current Gmail and QQ cards open their provider-specific authentication views.
 - Add mailbox account creates a new unified account; it must not overwrite or silently route into an existing account identity.
 - The receive page must not contain account secrets or OAuth configuration.
 - The send page must not contain QQ account configuration.
-- Agent/MCP owns one independent page and must not be duplicated in Send or Settings.
+- Agent Integration owns one independent page and must not be duplicated in Send or Settings.
 - Advanced Settings is a secondary page reached from Settings and must not contain account-level authentication.
 - History records business actions; Files & Data manages stored objects and maintenance. Do not duplicate either list.
 - Gmail API and Gmail IMAP must use separate conditional authentication views.
@@ -110,7 +110,15 @@ Use `runtime_paths.py`. Frozen program files are read-only under the install dir
 - Normal automatic no-change checks must not create permanent `app_events` noise; scheduler health belongs in `auto_receive_state`.
 - `app_events` retention may delete only technical events. It must never delete business history, outbound records, MCP audit, retry state, mail packages, resources, raw mail or attachments.
 - File-log rotation and SQLite event retention are separate mechanisms and must both remain bounded.
-- AgentMailBridge v1.4.5 is the current product version. 隔离安装、覆盖升级、卸载保留、重装恢复、Gmail 账号级收件基线和真实 MCP 读取已进入本版验收；QQ 与 163 保持正式支持，Generic 在独立第三方真实 E2E 前仍为 implementation ready / E2E required。Gmail send、Outlook/Microsoft 和 Unified Inbox 最终产品化仍属未来范围。
+- AgentMailBridge v1.5.0 is the current product version. Agent Client identity、scoped token、逐 Client capability/account/workspace 权限、受控配置备份与恢复已进入本版验收；QQ 与 163 保持正式支持，Generic 在独立第三方真实 E2E 前仍为 implementation ready / E2E required。Gmail send、Outlook/Microsoft 和 Unified Inbox 最终产品化仍属未来范围。
+
+## Agent integration invariants
+
+- Anonymous or unknown MCP clients are denied by default; every packaged MCP session must authenticate with a registered client identity.
+- Client tokens are independently generated, hashed for validation, stored in Windows Credential Manager for GUI-managed reuse, never logged, and never grant access to mailbox credentials.
+- Authorization order is global read gate, valid enabled client, capability, account scope, workspace scope, then existing DATA_ROOT, ownership and Hash checks.
+- Paused and revoked clients are rejected on the next call without restarting other clients.
+- Managed Client configuration requires redacted preview, backup, hash/mtime conflict detection, atomic replacement and rollback; removal may delete only the AgentMailBridge entry.
 
 ## History and managed-file invariants
 

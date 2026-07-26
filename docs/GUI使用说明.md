@@ -1,6 +1,6 @@
 # AgentMailBridge GUI 使用说明
 
-AgentMailBridge 1.4.5 的用户入口只有 `AgentMailBridge.exe`。
+AgentMailBridge 1.5.0 的用户入口只有 `AgentMailBridge.exe`。
 
 顶部主工作区只有“收件”和“发件”。左侧统一“邮箱账号”列表展示真实 Provider、地址、能力和启停状态。“添加邮箱账号”可创建 Gmail、QQ、163 或 Generic IMAP/SMTP 账号，不覆盖已有身份；动态账号页提供启停、按账号凭据、连接测试、IMAP 目录发现、按账号 OAuth 和保守移除。移除默认保留本地邮件与发件事实，凭据和 Token 只有在用户明确勾选时清理。
 
@@ -8,7 +8,7 @@ AgentMailBridge 1.4.5 的用户入口只有 `AgentMailBridge.exe`。
 
 - 收件：标题右侧唯一刷新、自动收取、检查间隔和收件账号选择；连接测试、当前增量“立即收取”和可取消“历史补扫”都使用所选账号。自动收件检查所有到期账号，一个账号失败不会停止其他账号。
 - 发件：先从已启用且已正式接通 send 的账号中选择发件身份；To 默认填入 `OWNER_GMAIL` 且可由用户改成一个明确合法地址，再编辑主题、正文、附件和链接。此选择只属于 GUI，Agent/MCP 不获得任意发件账号权限。
-- Agent / MCP：独立展示 MCP 状态、全局邮件读取开关、后台同步状态、单一通用配置、两个简短示例、授权工作区和统一最近调用；不再包含旧长篇交付指令。
+- Agent 接入：连接 Claude Code、Codex、Claude Desktop 或自定义 MCP Client；按 Client 展示安装/配置状态、权限摘要、最近调用，并提供配置、测试、恢复、暂停、恢复和撤销。全局读取开关、授权工作区与最近审计仍在同一页，不建立重复入口。
 - 历史记录：以“类型、摘要、时间、状态、操作”查看收件、发件、Agent / MCP 业务记录，可按关键词或 request_id 搜索并定位关联文件；request_id、完整路径、原始状态和错误信息只在结构化详情中显示。
 - 文件与数据：通过统一受管文件数据源管理收件文件、发送归档和去重后的 Agent 结果，并提供文件详情、存储概览、备份、恢复和一致性扫描。
 - 设置：开机启动、界面主题、单次收取量和最大发送文件大小。
@@ -49,7 +49,9 @@ Token 交换成功后会继续验证 Gmail Profile 和当前配置账号。Gmail
 
 发件正文、附件和链接均可为空，但主题、正文、附件和链接不能同时为空。当前支持一个明确收件人；空地址、非法格式、多个地址和 CRLF/Header 注入会在连接 SMTP 前拒绝。发送前明确显示实际 To、主题、正文、附件和链接数量，历史保存真实 To。该 GUI 权限不会传给 Agent；MCP `submit_result` 仍固定发送到 `OWNER_GMAIL`。
 
-“Agent / MCP”中的邮件读取默认关闭。第一次启用需要确认；启用后，能启动本机 MCP 配置的 Agent 可在 GUI 关闭时搜索并读取本地归档。读取不会修改 Gmail 邮件，也不能访问凭据或 DATA_ROOT 之外的任意路径。关闭开关不影响既有 `submit_result` 回邮能力。
+“Agent 接入”中的邮件读取总开关默认关闭。第一次启用需要确认；启用后仍需 Client 身份、active 状态、capability、账号与工作区 allowlist 全部通过。未知、暂停、撤销或 token 错误 Client 默认拒绝。读取不会修改 Gmail 邮件，也不能访问凭据或 DATA_ROOT 之外的任意路径。
+
+连接向导先选择 Client 类型、能力、邮箱账号和工作区。自动配置前显示脱敏预览，确认后创建带 Hash 的备份、检查并发变化并原子写入；格式损坏时不覆盖。配置后需按提示 reload 或重启目标 Client，再执行真实 stdio initialize/tools-list 测试。恢复只使用该 Client 的备份；撤销只移除 AgentMailBridge 自身配置项并使 token 立即失效。
 
 添加工作区时会拒绝过宽或敏感目录。Agent 可把指定邮件附件受控准备到工作区的 `.agentmailbridge/mail/<mail-id>/`，程序负责原子复制、重名处理和 Hash 校验，不执行、不解压。Agent 提交结果时应使用稳定 request_id 直接传原始路径，不运行 Copy-Item、cp 或临时搬运；path_not_allowed 时提示用户授权真实工作区。
 

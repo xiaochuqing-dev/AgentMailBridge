@@ -12,6 +12,8 @@
 
 QQ、163 与 Generic 共用 Generic IMAP/SMTP Core、统一 Mail Package、Mail Facts、调度、重试、历史补扫和 outbound archive。v1.4.4 根据真实证据只在 163 Profile 开启 RFC 2971 IMAP ID，并保持 QQ/163 业务处理、解析、归档与调度共享。Provider profile 只保存服务器默认值和少量差异，不复制协议代码。
 
+v1.5.0 的 Agent Client 接入不改变 Provider 支持状态。Client 只能在其 account allowlist 内调用同一组七工具；QQ/163 正式支持、Gmail 只读收件、Generic 需第三方真实 E2E、Outlook planned 的结论不变。
+
 ## QQ 配置
 
 1. 在 QQ 邮箱网页设置中启用 IMAP/SMTP 服务并生成授权码。第三方客户端密码填写授权码，不填写 QQ 登录密码。

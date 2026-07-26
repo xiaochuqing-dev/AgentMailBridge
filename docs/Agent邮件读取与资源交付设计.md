@@ -1,10 +1,10 @@
 # Agent 邮件读取与资源交付设计
 
-v1.4.5 不改变全局一次性 opt-in、DATA_ROOT、授权工作区或固定结果收件人边界。QQ、163 与 Gmail 真实邮件归档通过统一 account_id、package、resource、raw.eml 和 Hash 链完成最终 MCP EXE 读取验收；没有增加 Provider 专用工具，也没有扩大 Agent 的发送账号或收件人权限。
+v1.5.0 在不改变 DATA_ROOT、授权工作区、固定结果收件人和七工具边界的前提下，增加 Client 身份与确定性权限链。QQ、163 与 Gmail 继续共用统一 account_id、package、resource、raw.eml 和 Hash 事实；没有增加 Provider 专用工具，也没有扩大 Agent 的发送账号或收件人权限。
 
 ## 产品边界
 
-AgentMailBridge v1.4.1 保留通用 Agent 邮件读取能力，并在同一个 MCP 中使用稳定账号归属与可选账号过滤。`search_mails` 省略 `account_id` 时读取统一本地视图，指定时只读取该账号；`ensure_fresh` 通过 Account Runtime Router 同步指定或兼容当前账号，不替代 GUI 历史补扫。GUI 的自由发件账号选择不会扩展到 MCP。
+AgentMailBridge 在同一个 MCP 中使用稳定 Client 身份和账号归属。`search_mails` 只能访问 Client allowlist：单账号时可自动收窄，完整账号集可使用统一视图，其他多账号组合必须显式指定账号。`ensure_fresh` 还需要独立 capability，并通过 Account Runtime Router 同步指定账号，不替代 GUI 历史补扫。
 
 ## 数据流
 
@@ -12,7 +12,7 @@ Provider Adapter 复用现有 Gmail API/IMAP 收件实现，先完成带 `accoun
 
 ## 授权模型
 
-`MCP_MAIL_READ_ENABLED` 是全局一次性 opt-in，默认 false，范围是能启动本机 MCP 配置的进程。它不是逐封分享，不创建 token，也不改变 Gmail `gmail.readonly` scope。关闭读取时，搜索、正文、资源和准备返回 `read_access_disabled`；同步状态与 `submit_result` 保持可用。
+`MCP_MAIL_READ_ENABLED` 保留为全局 Agent 邮件读取总开关，默认 false。其后依次校验 Client token、active 状态、capability、account allowlist、workspace allowlist，再执行 DATA_ROOT、ownership、路径、大小和 Hash 校验。旧匿名配置不获得隐式权限。Client token 只代表 AgentMailBridge 内的有限权限，不改变 Gmail `gmail.readonly` scope，也不能读取邮箱凭据。
 
 邮件读取始终以 `DATA_ROOT` 为硬边界。数据库 package_root 和每个资源路径在访问时重新解析，必须位于规范 package 内；资源 ID 必须属于指定邮件，已有 SHA-256 必须匹配。路径事实被篡改、资源缺失或 Hash 不一致都会拒绝。
 

@@ -1,8 +1,8 @@
 # AgentMailBridge
 
-AgentMailBridge v1.4.5 是面向个人用户的本地优先 Windows 邮箱桥接工具。本版完成隔离安装、覆盖升级、卸载保留和重装恢复验收，恢复 Gmail 账号级收件基线，并对 QQ、163 与 Gmail 真实本地归档完成受控 MCP 读取验收。QQ 与 163 继续正式支持；Generic IMAP/SMTP Core、本地 stdio MCP 的资源准备和固定目标结果回邮边界保持不变。
+AgentMailBridge v1.5.0 是面向个人用户的本地优先 Windows 邮箱桥接工具，也是 Claude Code、Codex、Claude Desktop 和其他 MCP Client 的确定性邮件事实后端。它不内置大模型，不理解自然语言，也不替 Agent 判断邮件相关性；用户在 GUI 中连接和授权 Agent，Agent 自己调用七个事实工具。
 
-项目不提供多租户、Agent 任意外发、通用 Gmail MCP、遥测或云同步。GUI 用户可为一次手动发件明确填写一个合法收件人；MCP `submit_result` 仍固定受 `OWNER_GMAIL` 控制。邮箱凭据、OAuth、数据库、邮件附件和归档由用户保留在本机。
+每个 Agent Client 使用稳定 `client_id`、独立 scoped token、独立 capability、邮箱账号 allowlist 和工作区 allowlist。未知、暂停或撤销 Client 默认拒绝；邮箱密码、QQ/163 授权码和 Gmail OAuth Token 不会交给 Agent。项目不提供多租户、Agent 任意外发、通用 Gmail MCP、遥测或云同步。GUI 手动发件可明确填写一个合法收件人；MCP `submit_result` 仍固定受 `OWNER_GMAIL` 控制。
 
 ## Multi-Account Runtime
 
@@ -32,7 +32,7 @@ Account Runtime Router 由 `account_id` 解析 Provider Adapter、运行配置�
 
 - 顶部主工作区只有“收件”和“发件”。
 - 左侧统一“邮箱账号”列表展示真实账号、Provider、地址、能力和启停状态；“添加邮箱账号”可创建 Gmail、QQ、163 与 Generic 账号，动态账号页可测试连接、发现目录、管理按账号凭据/OAuth，并安全移除账号。
-- 左侧独立“Agent / MCP”入口与“历史记录”“文件与数据”“设置”“关于”组成贴合的统一导航卡；高级设置是“设置 > 高级设置”的二级页面。
+- 左侧独立“Agent 接入”入口与“历史记录”“文件与数据”“设置”“关于”组成贴合的统一导航卡；高级设置是“设置 > 高级设置”的二级页面。
 - 历史记录只回答“发生过什么业务行为”，以产品化摘要、中文状态和结构化详情展示收件、发件和 Agent / MCP；文件与数据管理真实收件文件、发送归档、Agent 结果、存储概览、备份、恢复和一致性扫描。
 - 收件页不重复显示 Gmail 管理卡；正常窗口完整展示今日文件与最近日志，不出现页面级滚动，较矮窗口才启用滚动兜底。数据较多时表格内部滚动，不使用分页。
 - 收件和发件共用顶部唯一“刷新本地页面数据”入口；新配置默认接收“当前扫描范围内全部邮件”。“仅 Gmail 自发自收邮件（高级）”和自定义规则仍可明确选择；自定义规则可按发件人/域名、主题关键词和是否含附件过滤。手动、自动、Gmail API、IMAP 和 MCP 新鲜度同步共用同一业务规则。
@@ -47,7 +47,7 @@ Account Runtime Router 由 `account_id` 解析 Provider Adapter、运行配置�
 
 ## Windows 安装
 
-运行 `AgentMailBridge-1.4.5-Setup.exe`。默认安装到 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需 Python、Git 或管理员权限。桌面和开始菜单只指向 `AgentMailBridge.exe`；内部 `AgentMailBridgeMCP.exe` 不创建快捷方式、托盘或开机启动项。
+运行 `AgentMailBridge-1.5.0-Setup.exe`。默认安装到 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需 Python、Git 或管理员权限。桌面和开始菜单只指向 `AgentMailBridge.exe`；内部 `AgentMailBridgeMCP.exe` 不创建快捷方式、托盘或开机启动项。
 
 安装版数据位置：
 
@@ -57,6 +57,8 @@ Account Runtime Router 由 `account_id` 解析 Provider Adapter、运行配置�
 - 缓存：`%LOCALAPPDATA%\AgentMailBridge\Cache`
 
 覆盖升级和普通卸载不会静默删除配置、OAuth、Credential Manager 凭据或用户数据。
+
+当前候选制品没有可信代码签名时，Authenticode 会如实显示 `NotSigned`，SmartScreen 可能提示未知发布者；项目不会伪造或绕过签名状态。
 
 ## 邮箱配置
 
@@ -68,11 +70,24 @@ Gmail API 首次配置必须使用 Google Cloud 创建的 Desktop app `credentia
 
 Token 仅在 state 校验成功后交换，并通过同目录临时文件、落盘和原子替换保存。Token 交换成功但 Gmail API 暂时不可用时，会保留已取得的长期授权并允许“重新验证 Gmail API”，无需重复打开浏览器。请确保 `127.0.0.1`、`localhost` 和 `::1` 不经过代理，并在 Google Cloud 项目中启用 Gmail API。详细错误可按结构化错误码排查，见 `docs/Gmail OAuth配置与故障排查说明.md`。
 
-## Agent / MCP
+## Agent 接入与 MCP
 
-从左侧进入“Agent / MCP”。页面提供邮件读取总开关、同步状态、单一通用 MCP 配置、两个简短示例、授权工作区和统一最近调用。读取开关默认关闭；用户启用一次后，本机兼容 MCP 的 Agent 可直接搜索本地归档，不需要逐封分享、打开 GUI、复制 AppData 路径或重新上传附件。MCP 按需启动，stdin 关闭后退出，提供七个工具：
+从左侧进入“Agent 接入”。页面可创建 Codex、Claude Code、Claude Desktop 或自定义 Client，选择允许的邮箱、能力和工作区，预览并应用配置，执行真实 stdio 连接测试，查看按 Client 审计，并立即暂停、恢复或撤销。读取总开关仍默认关闭；Client 权限不能绕过总开关、`DATA_ROOT`、资源 ownership 或 Hash 校验。
 
-- `search_mails`：按最新、今天、昨天、最近若干天或日期范围搜索，支持账号、主题、发件人、收件人、附件和状态过滤；省略账号时查询全部已归档账号。
+| Client | 配置能力 | 当前边界 |
+| --- | --- | --- |
+| Codex | managed / assisted | 用户级 `config.toml` 可备份和幂等合并；未检测到安装时只复制 TOML |
+| Claude Code | managed / assisted | 用户级 `~/.claude.json` 可备份和幂等合并；项目级适配器可用 |
+| Claude Desktop | managed / assisted | Windows JSON 配置可受控合并；新版 Desktop Extension 流程仍按官方界面处理 |
+| Custom MCP | manual | 复制最小 JSON/TOML stdio 示例并自行导入 |
+
+自动写入前必须显示已隐藏 scoped token 的预览。应用时保存原文件和 Hash，检测 hash/mtime 并发冲突，使用临时文件、fsync 和原子替换；损坏配置不会覆盖，失败会恢复，用户也可恢复备份。重复连接只更新 `agent-mail-bridge` 项，不删除其他 MCP Server 或未知字段。撤销只移除本产品管理项并让该 token 立即失效。
+
+stdio 配置需要携带 Client 专属 scoped token，这是本地 Client 协议的启动身份，不是邮箱凭据。GUI 管理副本保存在 Windows Credential Manager，SQLite 只保存 token Hash；外部 Client 配置中的 scoped token 可能被同一 Windows 用户读取，因此本机同用户进程不是强隔离边界。每个 token 可单独轮换或撤销。
+
+MCP 按需启动，stdin 关闭后退出，并提供七个工具：
+
+- `search_mails`：按最新、今天、昨天、最近若干天或日期范围搜索，支持账号、主题、发件人、收件人、附件和状态过滤；账号范围始终受当前 Client allowlist 限制。
 - `get_mail`：分页读取邮件元数据、完整可读正文和资源清单。
 - `read_mail_resource`：严格按邮件归属分页读取文本、CSV/TSV、图片元数据和真实 raw.eml，二进制只返回安全描述。
 - `prepare_mail_resources`：把指定资源原子复制到授权工作区，校验大小和 SHA-256，不执行、不解压。
@@ -94,7 +109,7 @@ Token 仅在 state 校验成功后交换，并通过同目录临时文件、落�
 
 Windows MCP stdin、stdout 和 stderr 明确使用 UTF-8，首条请求可兼容 UTF-8 BOM；stdout 只输出逐行 JSON-RPC 并在每条响应后 flush。中文目录、中文文件名、空格路径和中文标题可直接提交，不需要 Agent 修改 code page 或手工执行 Copy-Item。
 
-`submit_result` 会先验证源路径仍在允许目录，再原子复制到产品受控 staging，并校验 source、staged、SMTP 附件来源与 sent 归档的大小和 SHA-256。读取、准备、同步和发送统一写入 `mcp_audit_events`，旧 `mcp_calls` 保持兼容；审计不保存完整邮件正文、附件内容或秘密。
+`submit_result` 会先验证源路径仍在允许目录，再原子复制到产品受控 staging，并校验 source、staged、SMTP 附件来源与 sent 归档的大小和 SHA-256。读取、准备、同步和发送统一写入 `mcp_audit_events`，记录 Client、能力、账号、工作区、结果、拒绝原因和 correlation id；旧 `mcp_calls` 保持兼容。审计不保存完整邮件正文、附件内容、Client token 或邮箱秘密。
 
 ## 自动收件可靠性
 
@@ -137,8 +152,8 @@ python scripts\provider_mime_receive_validation.py --from-account-id <account_id
 
 构建流程会先执行 Preflight，再运行完整 pytest、构建 GUI 与内部 MCP、执行 packaged smoke 和秘密排除扫描，并生成：
 
-- `release\AgentMailBridge-1.4.5-Setup.exe`
-- `release\AgentMailBridge-1.4.5-Windows-x64.zip`
+- `release\AgentMailBridge-1.5.0-Setup.exe`
+- `release\AgentMailBridge-1.5.0-Windows-x64.zip`
 - `release\checksums.sha256`
 
-详细说明见 `docs/GUI使用说明.md`、`docs/Gmail OAuth配置与故障排查说明.md`、`docs/MCP使用说明.md`、`docs/Agent邮件读取与资源交付设计.md`、`docs/MCP邮件读取工具说明.md`、`docs/安全与诊断说明.md`、`docs/Windows安装与升级说明.md`、`docs/统一邮件归档设计.md`、`docs/邮件事实查询说明.md` 和最终专项报告。
+详细说明见 `docs/GUI使用说明.md`、`docs/MCP使用说明.md`、`docs/Agent Client身份与权限设计.md`、`docs/Credential与Client Token说明.md`、四类 Client 接入指南、`docs/安全与诊断说明.md`、`docs/Windows安装与升级说明.md` 和最终专项报告。

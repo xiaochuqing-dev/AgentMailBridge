@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## 1.5.0 Agent Integration & Permission Foundation - 2026-07-26
+
+- “Agent / MCP”重构为“Agent 接入”：可创建 Codex、Claude Code、Claude Desktop 和自定义 MCP Client，并分别管理能力、邮箱账号、工作区、连接状态、最近调用、暂停、恢复与撤销。
+- 新增稳定 Client identity、独立 scoped token、Windows Credential Manager 管理副本、SQLite token Hash、默认拒绝和逐次身份复核；暂停、错误 token、未知 Client 与撤销均返回稳定错误码，撤销立即生效且不影响其他 Client。
+- 新增 capability/account/workspace 确定性权限链，并置于既有全局读取开关、DATA_ROOT、资源 ownership、路径和 Hash 安全检查之前；七个 MCP 工具及 `submit_result` 参数和固定目标边界保持不变。
+- 新增 Codex TOML、Claude Code JSON、Claude Desktop JSON 配置适配器：支持隐藏 token 的预览、未知字段保留、原配置备份与 Hash、幂等合并、hash/mtime 并发冲突检测、临时文件 + fsync + 原子替换、失败恢复、受管项移除和备份恢复；未安装或自定义 Client 退化为辅助配置。
+- `mcp_audit_events` 增加 client、type、display snapshot、capability、account、workspace、deny reason 和 correlation id；不记录邮件正文、附件内容、邮箱秘密或 Client token。
+- 新增 Agent Client/permission/config backup 增量 schema 和升级前数据库备份；迁移不移动 Mail Package、不改写 raw.eml、不重算历史 Hash、不扩大 Gmail `gmail.readonly` scope。
+- Gmail send、Outlook/Microsoft、Local API、内置模型、Tag 和 GitHub Release 均未进入本版。
+
 ## 1.4.5 Release Lifecycle & Gmail Baseline - 2026-07-26
 
 - 新增随机 AppId、隔离程序目录和隔离用户目录的真实安装生命周期验收：覆盖 1.4.4 安装、1.4.5 覆盖升级、数据库与 account_id、Mail Package、raw.eml、附件 Hash、OAuth 文件、Credential、调度与 GUI 设置保留，以及卸载后数据保留和重装恢复。

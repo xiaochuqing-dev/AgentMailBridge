@@ -1,8 +1,8 @@
 # Gmail OAuth 配置与故障排查说明
 
-AgentMailBridge 1.4.5 继续只接受 Google Cloud 创建的 Desktop app OAuth Client。Web application JSON 不能用于本地回环授权。每个 Gmail 的 credentials 与 Token 位于独立 `account_id` 目录；导入、授权、重新验证、CLI/主界面诊断和清除 Token 都通过同一账号路由，只作用于所选账号，不把 Token 或 Client Secret 写入账号表。
+AgentMailBridge 1.5.0 继续只接受 Google Cloud 创建的 Desktop app OAuth Client。Web application JSON 不能用于本地回环授权。每个 Gmail 的 credentials 与 Token 位于独立 `account_id` 目录；导入、授权、重新验证、CLI/主界面诊断和清除 Token 都通过同一账号路由，只作用于所选账号，不把 Token 或 Client Secret 写入账号表或 Agent Client 配置。
 
-Gmail scope 必须且只能是 `gmail.readonly`。官方 Gmail API 发件需要 `gmail.send` 或 `gmail.compose`，因此 v1.4.5 没有上线 Gmail send，也不会为了发件静默扩大 scope 或要求现有用户重新授权。
+Gmail scope 必须且只能是 `gmail.readonly`。官方 Gmail API 发件需要 `gmail.send` 或 `gmail.compose`，因此 v1.5.0 没有上线 Gmail send，也不会为了 Agent 接入或发件静默扩大 scope。
 
 ## 正确配置
 
