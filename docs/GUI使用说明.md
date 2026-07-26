@@ -1,6 +1,6 @@
 # AgentMailBridge GUI 使用说明
 
-AgentMailBridge 1.4.4 的用户入口只有 `AgentMailBridge.exe`。
+AgentMailBridge 1.4.5 的用户入口只有 `AgentMailBridge.exe`。
 
 顶部主工作区只有“收件”和“发件”。左侧统一“邮箱账号”列表展示真实 Provider、地址、能力和启停状态。“添加邮箱账号”可创建 Gmail、QQ、163 或 Generic IMAP/SMTP 账号，不覆盖已有身份；动态账号页提供启停、按账号凭据、连接测试、IMAP 目录发现、按账号 OAuth 和保守移除。移除默认保留本地邮件与发件事实，凭据和 Token 只有在用户明确勾选时清理。
 

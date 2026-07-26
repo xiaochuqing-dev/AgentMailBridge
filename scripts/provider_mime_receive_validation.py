@@ -90,7 +90,7 @@ def main() -> int:
     ).config
     outgoing = effective_outgoing_runtime(runtime_cfg)
     marker = (
-        f"[AMB-v1.4.4-E2E] MIME-{sender_provider}-to-"
+        f"[AMB-v{__version__}-E2E] MIME-{sender_provider}-to-"
         f"{recipient_provider}-{uuid.uuid4().hex}"
     )
     evidence: dict[str, Any] = {

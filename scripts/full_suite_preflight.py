@@ -18,8 +18,9 @@ from agent_mail_bridge.provider_foundation import PROVIDER_PROFILES
 from agent_mail_bridge.version import __version__
 
 
-TARGET_VERSION = "1.4.4"
+TARGET_VERSION = "1.4.5"
 TARGETED_TESTS = (
+    "tests/test_v1_4_5_release_lifecycle.py",
     "tests/test_v1_4_3_provider_hardening.py",
     "tests/test_v1_4_2_generic_mail.py",
     "tests/test_v1_4_1_multi_account_runtime.py",
@@ -46,7 +47,7 @@ def _run(command: list[str], label: str) -> None:
 
 
 def _check_version_consistency() -> None:
-    _require(__version__ == TARGET_VERSION, "version.py is not v1.4.4")
+    _require(__version__ == TARGET_VERSION, "version.py is not v1.4.5")
     version_tuple = tuple(int(part) for part in TARGET_VERSION.split(".")) + (0,)
     tuple_text = ", ".join(str(part) for part in version_tuple)
     for relative in (

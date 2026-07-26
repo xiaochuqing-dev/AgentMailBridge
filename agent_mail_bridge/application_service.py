@@ -3520,11 +3520,34 @@ class ApplicationService:
                 OperationStatus.FAILED, error_code="imap_diagnose_failed", message=str(exc)
             )
 
-    def diagnose_gmail_api(self) -> ServiceResult:
+    def diagnose_gmail_api(self, account_id: str | None = None) -> ServiceResult:
+        """按统一账号路由诊断 Gmail API，兼容尚未迁移的旧配置。"""
         self.initialize()
         from agent_mail_bridge.gmail_api_auth import reverify_gmail_authorization
 
-        return reverify_gmail_authorization(self.cfg)
+        target_account_id = account_id or current_receive_account_id(self.cfg)
+        try:
+            context = self._account_router.context(
+                target_account_id, capability="receive"
+            )
+        except AccountRuntimeError:
+            if account_id is not None:
+                return ServiceResult(
+                    OperationStatus.FAILED,
+                    error_code="account_not_found",
+                    message="Gmail 账号不存在或未启用",
+                )
+            return reverify_gmail_authorization(self.cfg)
+        if (
+            str(context.account.get("provider") or "") != "gmail"
+            or _effective_receive_backend(context.config) != "gmail_api"
+        ):
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="gmail_api_not_configured",
+                message="所选账号不是 Gmail API 收件账号",
+            )
+        return reverify_gmail_authorization(context.config)
 
     def diagnose_qq_smtp(self) -> ServiceResult:
         """连接并认证 QQ SMTP，不发送邮件。"""

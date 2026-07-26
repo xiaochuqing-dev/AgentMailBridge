@@ -1,6 +1,6 @@
 # AgentMailBridge
 
-AgentMailBridge v1.4.4 是面向个人用户的本地优先 Windows 邮箱桥接工具。QQ 与 163 已完成真实双向收发、真实自发自收、富 MIME、目录、增量、重启、调度隔离、统一归档和附件 Hash 验收，现为正式支持。163 的 RFC 2971 IMAP ID 差异集中在 Provider Profile；QQ 兼容配置与统一账号凭据保持同步。Generic IMAP/SMTP Core、本地 stdio MCP 的受控邮件读取、资源准备和固定目标结果回邮边界保持不变。
+AgentMailBridge v1.4.5 是面向个人用户的本地优先 Windows 邮箱桥接工具。本版完成隔离安装、覆盖升级、卸载保留和重装恢复验收，恢复 Gmail 账号级收件基线，并对 QQ、163 与 Gmail 真实本地归档完成受控 MCP 读取验收。QQ 与 163 继续正式支持；Generic IMAP/SMTP Core、本地 stdio MCP 的资源准备和固定目标结果回邮边界保持不变。
 
 项目不提供多租户、Agent 任意外发、通用 Gmail MCP、遥测或云同步。GUI 用户可为一次手动发件明确填写一个合法收件人；MCP `submit_result` 仍固定受 `OWNER_GMAIL` 控制。邮箱凭据、OAuth、数据库、邮件附件和归档由用户保留在本机。
 
@@ -47,7 +47,7 @@ Account Runtime Router 由 `account_id` 解析 Provider Adapter、运行配置�
 
 ## Windows 安装
 
-运行 `AgentMailBridge-1.4.4-Setup.exe`。默认安装到 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需 Python、Git 或管理员权限。桌面和开始菜单只指向 `AgentMailBridge.exe`；内部 `AgentMailBridgeMCP.exe` 不创建快捷方式、托盘或开机启动项。
+运行 `AgentMailBridge-1.4.5-Setup.exe`。默认安装到 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需 Python、Git 或管理员权限。桌面和开始菜单只指向 `AgentMailBridge.exe`；内部 `AgentMailBridgeMCP.exe` 不创建快捷方式、托盘或开机启动项。
 
 安装版数据位置：
 
@@ -137,8 +137,8 @@ python scripts\provider_mime_receive_validation.py --from-account-id <account_id
 
 构建流程会先执行 Preflight，再运行完整 pytest、构建 GUI 与内部 MCP、执行 packaged smoke 和秘密排除扫描，并生成：
 
-- `release\AgentMailBridge-1.4.4-Setup.exe`
-- `release\AgentMailBridge-1.4.4-Windows-x64.zip`
+- `release\AgentMailBridge-1.4.5-Setup.exe`
+- `release\AgentMailBridge-1.4.5-Windows-x64.zip`
 - `release\checksums.sha256`
 
 详细说明见 `docs/GUI使用说明.md`、`docs/Gmail OAuth配置与故障排查说明.md`、`docs/MCP使用说明.md`、`docs/Agent邮件读取与资源交付设计.md`、`docs/MCP邮件读取工具说明.md`、`docs/安全与诊断说明.md`、`docs/Windows安装与升级说明.md`、`docs/统一邮件归档设计.md`、`docs/邮件事实查询说明.md` 和最终专项报告。

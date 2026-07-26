@@ -1,5 +1,5 @@
 #ifndef MyAppVersion
-  #define MyAppVersion "1.4.4"
+  #define MyAppVersion "1.4.5"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\..\dist\AgentMailBridge"
@@ -7,11 +7,18 @@
 #ifndef OutputDir
   #define OutputDir "..\..\release"
 #endif
+#ifndef MyAppName
+  #define MyAppName "AgentMailBridge"
+#endif
+#ifndef MyAppId
+  #define MyAppId "{{2A4C036C-C691-42B3-A6C1-C0D7085E99F2}"
+#endif
+#ifndef MyOutputBaseFilename
+  #define MyOutputBaseFilename "AgentMailBridge-" + MyAppVersion + "-Setup"
+#endif
 
-#define MyAppName "AgentMailBridge"
 #define MyAppPublisher "AgentMailBridge Open Source Project"
 #define MyAppExeName "AgentMailBridge.exe"
-#define MyAppId "{{2A4C036C-C691-42B3-A6C1-C0D7085E99F2}"
 
 [Setup]
 AppId={#MyAppId}
@@ -27,7 +34,7 @@ PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir={#OutputDir}
-OutputBaseFilename=AgentMailBridge-{#MyAppVersion}-Setup
+OutputBaseFilename={#MyOutputBaseFilename}
 SetupIconFile=..\..\agent_mail_bridge\resources\branding\agentmailbridge.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2/ultra64

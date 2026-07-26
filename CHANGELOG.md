@@ -1,5 +1,13 @@
 # CHANGELOG
 
+## 1.4.5 Release Lifecycle & Gmail Baseline - 2026-07-26
+
+- 新增随机 AppId、隔离程序目录和隔离用户目录的真实安装生命周期验收：覆盖 1.4.4 安装、1.4.5 覆盖升级、数据库与 account_id、Mail Package、raw.eml、附件 Hash、OAuth 文件、Credential、调度与 GUI 设置保留，以及卸载后数据保留和重装恢复。
+- 修复 Gmail 诊断仍读取 legacy Token 的多账号路由回归；CLI、主界面诊断和账号卡现在统一使用 account_id 专属 credentials/Token，保持唯一 `gmail.readonly` scope。
+- 恢复本机 Gmail 账号级 OAuth、Token 验证、重启后连接和真实收件基线；Gmail 失败与恢复均不影响 QQ/163 Credential 或调度边界。
+- 新增最终 MCP EXE 真实归档读取验收，覆盖 QQ、163 与 Gmail 的 search/get/raw/body/prepare、account_id、ownership、路径白名单、UTF-8、stdout purity、EOF、审计、默认拒绝和临时 opt-in 恢复。
+- Gmail send、OAuth scope 扩展、Outlook、Sent Sync、Unified Inbox、Tag 和 GitHub Release 均未进入本版；未签名制品继续如实标记 NotSigned。
+
 ## 1.4.4 QQ + 163 Real Provider Closure - 2026-07-24
 
 - QQ 与 163 完成真实 IMAP/SMTP、目录发现、增量、重启后继续、自发自收和四向互发验收；中文主题/正文/附件名、HTML、inline image、多附件、零字节附件、raw.eml、Mail Package、ownership 与收发 Hash 链通过，两个 Provider 升级为正式支持。

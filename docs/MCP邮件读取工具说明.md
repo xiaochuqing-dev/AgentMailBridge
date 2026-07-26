@@ -1,6 +1,6 @@
 # MCP 邮件读取工具说明
 
-v1.4.4 的 QQ 与 163 真实归档继续复用同一套 MCP 邮件读取工具和 account_id 过滤，没有新增 Provider 专用 MCP。真实双向收发已验证归档 ownership、raw.eml、资源与 Hash；本机全局邮件读取开关仍保持默认关闭，因此本轮真实账号的 MCP 正文读取标记为 NOT_TESTED，打包 MCP 的七工具列表、UTF-8 stdio、默认拒绝与固定发送边界已通过 smoke。
+v1.4.5 的 QQ、163 与 Gmail 真实归档继续复用同一套 MCP 邮件读取工具和 account_id 过滤，没有新增 Provider 专用 MCP。最终 MCP EXE 已通过 search、get、raw/body read、prepare、资源 Hash、ownership、路径白名单、UTF-8、stdout purity、EOF 和审计验收。真实读取只在单个验收进程中通过环境覆盖临时启用，持久化全局开关测试前后均保持关闭。
 
 ## search_mails
 

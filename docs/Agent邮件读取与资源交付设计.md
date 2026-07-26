@@ -1,6 +1,6 @@
 # Agent 邮件读取与资源交付设计
 
-v1.4.4 不改变全局一次性 opt-in、DATA_ROOT、授权工作区或固定结果收件人边界。QQ 与 163 真实邮件归档通过统一 account_id、package、resource、raw.eml 和 Hash 链进入既有读取层；没有增加 Provider 专用工具，也没有扩大 Agent 的发送账号或收件人权限。
+v1.4.5 不改变全局一次性 opt-in、DATA_ROOT、授权工作区或固定结果收件人边界。QQ、163 与 Gmail 真实邮件归档通过统一 account_id、package、resource、raw.eml 和 Hash 链完成最终 MCP EXE 读取验收；没有增加 Provider 专用工具，也没有扩大 Agent 的发送账号或收件人权限。
 
 ## 产品边界
 

@@ -110,7 +110,7 @@ Use `runtime_paths.py`. Frozen program files are read-only under the install dir
 - Normal automatic no-change checks must not create permanent `app_events` noise; scheduler health belongs in `auto_receive_state`.
 - `app_events` retention may delete only technical events. It must never delete business history, outbound records, MCP audit, retry state, mail packages, resources, raw mail or attachments.
 - File-log rotation and SQLite event retention are separate mechanisms and must both remain bounded.
-- AgentMailBridge v1.4.4 is the current product version. QQ 与 163 已完成真实双向收发、富 MIME、目录、增量、归档、Hash、调度隔离和错误路径验收，可标记为正式支持；Generic 在独立第三方真实 E2E 前仍为 implementation ready / E2E required。Gmail send、Outlook/Microsoft 和 Unified Inbox 最终产品化仍属未来范围。
+- AgentMailBridge v1.4.5 is the current product version. 隔离安装、覆盖升级、卸载保留、重装恢复、Gmail 账号级收件基线和真实 MCP 读取已进入本版验收；QQ 与 163 保持正式支持，Generic 在独立第三方真实 E2E 前仍为 implementation ready / E2E required。Gmail send、Outlook/Microsoft 和 Unified Inbox 最终产品化仍属未来范围。
 
 ## History and managed-file invariants
 
