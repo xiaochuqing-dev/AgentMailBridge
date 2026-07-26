@@ -236,11 +236,11 @@ P0：0。P1：1，公开发布仍缺可信代码签名。P2：1，Claude Desktop
 
 ## 57. commits
 
-功能提交 c2036e1：Client identity、权限、配置适配、GUI、数据库迁移与 1.5.0 版本。测试提交 6d1c4aa：权限/配置/MCP/lifecycle 自动化、真实 Claude Code/Codex E2E 与 GUI DPI QA。文档和报告由后续独立提交收口。
+功能提交 c2036e1：Client identity、权限、配置适配、GUI、数据库迁移与 1.5.0 版本。测试提交 6d1c4aa：权限/配置/MCP/lifecycle 自动化、真实 Claude Code/Codex E2E 与 GUI DPI QA。文档与验收报告提交 6a3de65。
 
 ## 58. push status
 
-待普通 push 到 origin/master 后回填。不会 force push、改写历史、创建 Tag 或 GitHub Release。
+2026-07-26 已将功能、测试与文档提交普通 push 到 origin/master，远端到达 6a3de65。本节状态回填由独立收口提交承载并继续普通 push；最终核验要求本地 master 与 origin/master 一致。全程未 force push、改写历史、创建 Tag 或 GitHub Release。
 
 ## Client 验收矩阵
 
