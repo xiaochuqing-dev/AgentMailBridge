@@ -21,6 +21,7 @@ ACCOUNT_IMAP_SECRET = "imap_password"
 ACCOUNT_SMTP_SECRET = "smtp_password"
 ACCOUNT_SECRET_KINDS = {ACCOUNT_IMAP_SECRET, ACCOUNT_SMTP_SECRET}
 _ACCOUNT_ID_PATTERN = re.compile(r"^acct_[0-9a-f]{24}$")
+_AGENT_CLIENT_ID_PATTERN = re.compile(r"^client_[0-9a-f]{24}$")
 
 
 def account_credential_name(account_id: str, secret_kind: str) -> str:
@@ -32,6 +33,14 @@ def account_credential_name(account_id: str, secret_kind: str) -> str:
     if normalized_kind not in ACCOUNT_SECRET_KINDS:
         raise CredentialError("账号凭据类型无效")
     return f"account:{normalized_id}:{normalized_kind}"
+
+
+def agent_client_credential_name(client_id: str) -> str:
+    """生成不含显示名称或 Client 类型的 scoped token 凭据 key。"""
+    normalized_id = str(client_id or "").strip().casefold()
+    if not _AGENT_CLIENT_ID_PATTERN.fullmatch(normalized_id):
+        raise CredentialError("client_id 格式无效")
+    return f"agent-client:{normalized_id}:access-token"
 
 
 class CredentialError(RuntimeError):

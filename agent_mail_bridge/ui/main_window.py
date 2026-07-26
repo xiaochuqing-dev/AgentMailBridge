@@ -633,7 +633,7 @@ class BridgeWindow(QMainWindow):
         nav_layout.setSpacing(0)
 
         self.agent_nav_button = NavButton(
-            QIcon(line_icon_pixmap("terminal", 17, "#6F7585")), "Agent / MCP"
+            QIcon(line_icon_pixmap("terminal", 17, "#6F7585")), "Agent 接入"
         )
         self.agent_nav_button.clicked.connect(
             lambda checked=False: self.select_page("agent")
@@ -1854,8 +1854,8 @@ class BridgeWindow(QMainWindow):
 
     def _build_agent_page(self) -> QWidget:
         page, layout = self._standard_page(
-            "Agent / MCP",
-            "统一管理本机 stdio MCP 的邮件读取、资源准备、结果发送、工作区和调用审计。",
+            "Agent 接入",
+            "连接 Codex、Claude Code、Claude Desktop 或自定义 MCP Client，并分别授权邮箱、能力和工作区。",
         )
 
         status_card = QFrame()
@@ -1914,8 +1914,8 @@ class BridgeWindow(QMainWindow):
         read_header.addWidget(self.mcp_read_switch)
         read_layout.addLayout(read_header)
         read_hint = QLabel(
-            "启用后，能启动这份 MCP 配置的本机进程可按工具边界读取本地邮件归档。"
-            "不读取凭据，不修改或删除邮件，不逐封授权；可随时关闭。"
+            "启用后，已注册且通过身份、能力、账号和工作区权限的 Client 才能读取本地邮件归档。"
+            "不读取凭据，不修改或删除邮件；可随时关闭总开关。"
         )
         read_hint.setObjectName("hint")
         read_hint.setWordWrap(True)
@@ -1933,21 +1933,59 @@ class BridgeWindow(QMainWindow):
         config_card.setObjectName("card")
         config_layout = QVBoxLayout(config_card)
         config_layout.setContentsMargins(18, 14, 18, 14)
-        config_title = QLabel("统一配置")
+        config_title = QLabel("连接 Agent Client")
         config_title.setObjectName("sectionTitle")
         config_layout.addWidget(config_title)
-        config_hint = QLabel("所有兼容本地 stdio MCP 的 Agent 共用同一个服务、配置和工具。")
+        config_hint = QLabel(
+            "每个 Client 使用独立身份和 scoped token；邮箱密码、授权码和 Gmail Token 不会写入 Agent 配置。"
+        )
         config_hint.setObjectName("hint")
         config_hint.setWordWrap(True)
         config_layout.addWidget(config_hint)
         config_actions = QHBoxLayout()
         config_actions.addWidget(
-            self._button("复制 MCP 配置", lambda: self._copy_mcp_config("json"), primary=True)
+            self._button(
+                "连接 Codex",
+                lambda: self._create_agent_client_dialog("codex"),
+                primary=True,
+            )
         )
-        config_actions.addWidget(self._button("查看接入说明", self._show_mcp_setup_guide))
-        config_actions.addWidget(self._button("MCP 自检", self.run_mcp_self_check))
+        config_actions.addWidget(
+            self._button(
+                "连接 Claude Code",
+                lambda: self._create_agent_client_dialog("claude_code"),
+            )
+        )
+        config_actions.addWidget(
+            self._button(
+                "连接 Claude Desktop",
+                lambda: self._create_agent_client_dialog("claude_desktop"),
+            )
+        )
+        config_actions.addWidget(
+            self._button(
+                "自定义 MCP Client",
+                lambda: self._create_agent_client_dialog("custom"),
+            )
+        )
         config_actions.addStretch(1)
         config_layout.addLayout(config_actions)
+        self.agent_client_table = DataTable(
+            ["Client", "安装 / 配置", "权限摘要", "最近调用", "操作"]
+        )
+        self.agent_client_table.setMinimumHeight(178)
+        self.agent_client_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.NoSelection
+        )
+        self.agent_client_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        client_header = self.agent_client_table.horizontalHeader()
+        client_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        client_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        client_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        client_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        client_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        self.agent_client_table.setColumnWidth(4, 330)
+        config_layout.addWidget(self.agent_client_table)
         layout.addWidget(config_card)
 
         example_card = QFrame()
@@ -1996,9 +2034,40 @@ class BridgeWindow(QMainWindow):
         workspace_layout.addWidget(self.agent_workspace_table)
         layout.addWidget(workspace_card)
 
+        calls_header = QHBoxLayout()
         calls_title = QLabel("最近 MCP 调用")
         calls_title.setObjectName("sectionTitle")
-        layout.addWidget(calls_title)
+        calls_header.addWidget(calls_title)
+        calls_header.addStretch(1)
+        self.mcp_client_filter = QComboBox()
+        self.mcp_client_filter.addItem("全部 Client", "")
+        self.mcp_client_filter.currentIndexChanged.connect(
+            lambda _index: self._populate_mcp_history()
+        )
+        self.mcp_tool_filter = QComboBox()
+        self.mcp_tool_filter.addItems(
+            [
+                "全部工具",
+                "搜索邮件",
+                "读取邮件",
+                "读取附件",
+                "准备资源",
+                "查询同步",
+                "发送结果",
+            ]
+        )
+        self.mcp_tool_filter.currentTextChanged.connect(
+            lambda _text: self._populate_mcp_history()
+        )
+        self.mcp_status_filter = QComboBox()
+        self.mcp_status_filter.addItems(["全部状态", "成功", "拒绝", "失败"])
+        self.mcp_status_filter.currentTextChanged.connect(
+            lambda _text: self._populate_mcp_history()
+        )
+        calls_header.addWidget(self.mcp_client_filter)
+        calls_header.addWidget(self.mcp_tool_filter)
+        calls_header.addWidget(self.mcp_status_filter)
+        layout.addLayout(calls_header)
         self.mcp_table = DataTable(
             ["调用时间", "操作", "目标", "状态", "详情"]
         )
@@ -3863,6 +3932,9 @@ class BridgeWindow(QMainWindow):
             workspaces = self.service.list_agent_workspaces().details.get(
                 "workspaces", []
             )
+            agent_clients = self.service.list_agent_clients().details.get(
+                "clients", []
+            )
         except Exception as exc:  # noqa: BLE001
             return ServiceResult(
                 OperationStatus.FAILED,
@@ -3882,6 +3954,7 @@ class BridgeWindow(QMainWindow):
                 "auto_receive": auto_receive,
                 "mail_sync": mail_sync,
                 "workspaces": workspaces,
+                "agent_clients": agent_clients,
             },
         )
 
@@ -3918,6 +3991,10 @@ class BridgeWindow(QMainWindow):
             self._populate_mcp_history()
         if hasattr(self, "agent_workspace_table"):
             self._populate_agent_workspaces(result.details.get("workspaces", []))
+        if hasattr(self, "agent_client_table"):
+            self._populate_agent_clients(
+                result.details.get("agent_clients", [])
+            )
         maintenance = result.details.get("maintenance", {})
         maintenance_details = maintenance.get("details", {})
         if hasattr(self, "data_overview_values"):
@@ -4576,7 +4653,43 @@ class BridgeWindow(QMainWindow):
             "\n".join(str(path) for path in self.service.cfg.effective_allowed_send_roots)
         )
         self.mcp_table.setRowCount(0)
-        for index, row in enumerate(self.mcp_rows):
+        rows = list(self.mcp_rows)
+        if hasattr(self, "mcp_client_filter"):
+            client_id = str(self.mcp_client_filter.currentData() or "")
+            if client_id:
+                rows = [
+                    row for row in rows
+                    if str(row.get("client_id") or "") == client_id
+                ]
+        if hasattr(self, "mcp_tool_filter"):
+            tool_text = self.mcp_tool_filter.currentText()
+            if tool_text != "全部工具":
+                rows = [
+                    row for row in rows
+                    if self._mcp_operation_text(
+                        str(row.get("tool_name") or "submit_result")
+                    ) == tool_text
+                ]
+        if hasattr(self, "mcp_status_filter"):
+            status_text = self.mcp_status_filter.currentText()
+            if status_text != "全部状态":
+                def matches_status(row: dict) -> bool:
+                    status = str(row.get("status") or "").casefold()
+                    denied = bool(
+                        row.get("deny_reason_code")
+                        or status == "denied"
+                    )
+                    if status_text == "拒绝":
+                        return denied
+                    if status_text == "成功":
+                        return not denied and status in {
+                            "success", "no_changes", "partial", "duplicate", "sent"
+                        }
+                    return not denied and status not in {
+                        "success", "no_changes", "partial", "duplicate", "sent"
+                    }
+                rows = [row for row in rows if matches_status(row)]
+        for index, row in enumerate(rows):
             self.mcp_table.insertRow(index)
             tool_name = str(row.get("tool_name") or "submit_result")
             values = [
@@ -4645,9 +4758,12 @@ class BridgeWindow(QMainWindow):
         return str(row.get("mail_id") or row.get("resource_id") or row.get("request_id") or "MCP 调用")
 
     def _open_mcp_call_detail(self, row_index: int, _column: int) -> None:
-        if row_index < 0 or row_index >= len(self.mcp_rows):
+        item = self.mcp_table.item(row_index, 0)
+        if item is None:
             return
-        self._show_mcp_call_detail(self.mcp_rows[row_index])
+        row = item.data(Qt.ItemDataRole.UserRole)
+        if isinstance(row, dict):
+            self._show_mcp_call_detail(row)
 
     def _show_mcp_call_detail(self, row: dict) -> None:
         details = row.get("details") if isinstance(row.get("details"), dict) else {}
@@ -4664,6 +4780,12 @@ class BridgeWindow(QMainWindow):
                 ("调用时间", row.get("called_at") or row.get("created_at")),
                 ("操作", self._mcp_operation_text(str(row.get("tool_name") or "submit_result"))),
                 ("工具名", row.get("tool_name") or "submit_result"),
+                ("Client", row.get("display_name_snapshot") or row.get("client_name") or "旧记录"),
+                ("Client 类型", row.get("client_type") or "—"),
+                ("能力", row.get("capability") or "—"),
+                ("邮箱范围", row.get("account_id") or "—"),
+                ("工作区", row.get("workspace_id") or "—"),
+                ("拒绝原因", row.get("deny_reason_code") or "—"),
                 ("状态", self._mcp_status_text(str(row.get("status") or ""))),
                 ("错误代码", row.get("error_code")),
                 ("查询条件", row.get("query_summary")),
@@ -5398,6 +5520,495 @@ class BridgeWindow(QMainWindow):
     def _return_from_outbound_detail(self) -> None:
         self.select_page(self._detail_return_page)
 
+    def _populate_agent_clients(self, clients: list[dict] | None = None) -> None:
+        if not hasattr(self, "agent_client_table"):
+            return
+        rows = clients
+        if rows is None:
+            rows = self.service.list_agent_clients().details.get("clients", [])
+        if hasattr(self, "mcp_client_filter"):
+            selected = str(self.mcp_client_filter.currentData() or "")
+            self.mcp_client_filter.blockSignals(True)
+            self.mcp_client_filter.clear()
+            self.mcp_client_filter.addItem("全部 Client", "")
+            for client in rows:
+                self.mcp_client_filter.addItem(
+                    str(client.get("display_name") or "Agent Client"),
+                    str(client.get("client_id") or ""),
+                )
+            match = self.mcp_client_filter.findData(selected)
+            self.mcp_client_filter.setCurrentIndex(max(0, match))
+            self.mcp_client_filter.blockSignals(False)
+        self.agent_client_table.setRowCount(0)
+        for index, client in enumerate(rows):
+            self.agent_client_table.insertRow(index)
+            state = str(client.get("state") or "active")
+            enabled = bool(client.get("enabled"))
+            state_text = (
+                "已撤销"
+                if state == "revoked"
+                else "已启用"
+                if enabled and state == "active"
+                else "已暂停"
+            )
+            install_text = {
+                "managed_supported": "已检测 · 可管理",
+                "not_installed": "未检测到 · 辅助配置",
+                "manual_only": "手动 Client",
+            }.get(
+                str(client.get("install_status") or ""),
+                str(client.get("config_status") or "未配置"),
+            )
+            capability_count = len(client.get("capabilities") or [])
+            account_count = len(client.get("account_ids") or [])
+            workspace_count = len(client.get("workspace_ids") or [])
+            values = [
+                f"{client.get('display_name') or 'Agent Client'}\n{self._agent_client_type_text(str(client.get('client_type') or 'custom'))}",
+                f"{install_text}\n{state_text}",
+                f"能力 {capability_count} · 邮箱 {account_count} · 工作区 {workspace_count}",
+                self._short_time(client.get("last_seen_at"), include_date=True),
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setToolTip(value)
+                item.setData(Qt.ItemDataRole.UserRole, client)
+                self.agent_client_table.setItem(index, column, item)
+            actions = QWidget()
+            grid = QGridLayout(actions)
+            grid.setContentsMargins(3, 3, 3, 3)
+            grid.setHorizontalSpacing(4)
+            grid.setVerticalSpacing(3)
+            buttons = [
+                (
+                    "权限",
+                    lambda checked=False, value=client: self._edit_agent_client_permissions(value),
+                ),
+                (
+                    "配置",
+                    lambda checked=False, value=client: self._configure_agent_client(value),
+                ),
+                (
+                    "测试",
+                    lambda checked=False, value=client: self._test_agent_client(value),
+                ),
+                (
+                    "恢复",
+                    lambda checked=False, value=client: self._restore_latest_agent_config(value),
+                ),
+                (
+                    "恢复启用" if state == "paused" else "暂停",
+                    lambda checked=False, value=client: self._toggle_agent_client(value),
+                ),
+                (
+                    "撤销",
+                    lambda checked=False, value=client: self._revoke_agent_client(value),
+                ),
+            ]
+            for position, (text, callback) in enumerate(buttons):
+                button = self._button(text, callback, text_only=True)
+                button.setObjectName("compactButton")
+                button.setEnabled(state != "revoked")
+                grid.addWidget(button, position // 3, position % 3)
+            self.agent_client_table.setCellWidget(index, 4, actions)
+            self.agent_client_table.setRowHeight(index, 72)
+
+    @staticmethod
+    def _agent_client_type_text(client_type: str) -> str:
+        return {
+            "codex": "Codex",
+            "claude_code": "Claude Code",
+            "claude_desktop": "Claude Desktop",
+            "custom": "自定义 MCP",
+        }.get(client_type, "自定义 MCP")
+
+    def _create_agent_client_dialog(self, client_type: str) -> None:
+        dialog = QDialog(self)
+        type_text = self._agent_client_type_text(client_type)
+        dialog.setWindowTitle(f"连接 {type_text}")
+        dialog.resize(620, 650)
+        layout = QVBoxLayout(dialog)
+        name_edit = QLineEdit(type_text)
+        form = QFormLayout()
+        form.addRow("显示名称", name_edit)
+        layout.addLayout(form)
+
+        capability_title = QLabel("允许的能力")
+        capability_title.setObjectName("sectionTitle")
+        layout.addWidget(capability_title)
+        capability_specs = [
+            ("搜索邮件", "mail.search", True),
+            ("读取邮件", "mail.get", True),
+            ("读取文本资源", "resource.read", True),
+            ("准备附件到工作区", "resource.prepare", True),
+            ("查看同步状态", "sync.status", True),
+            ("按需刷新邮件", "sync.ensure_fresh", True),
+            ("列出工作区", "workspace.list", True),
+            ("提交最终结果", "result.submit", False),
+        ]
+        capability_checks: list[tuple[QCheckBox, str]] = []
+        capability_grid = QGridLayout()
+        for index, (label, capability, checked) in enumerate(capability_specs):
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(checked)
+            capability_checks.append((checkbox, capability))
+            capability_grid.addWidget(checkbox, index // 2, index % 2)
+        layout.addLayout(capability_grid)
+
+        accounts = self.service.list_mail_accounts().details.get("accounts", [])
+        account_title = QLabel("允许的邮箱账号")
+        account_title.setObjectName("sectionTitle")
+        layout.addWidget(account_title)
+        account_checks: list[tuple[QCheckBox, str]] = []
+        for account in accounts:
+            checkbox = QCheckBox(
+                str(account.get("display_name") or account.get("provider") or "邮箱账号")
+            )
+            checkbox.setChecked(bool(account.get("enabled")))
+            account_checks.append((checkbox, str(account["account_id"])))
+            layout.addWidget(checkbox)
+
+        workspaces = self.service.list_agent_workspaces().details.get(
+            "workspace_details", []
+        )
+        workspace_title = QLabel("允许的工作区")
+        workspace_title.setObjectName("sectionTitle")
+        layout.addWidget(workspace_title)
+        workspace_checks: list[tuple[QCheckBox, str]] = []
+        for workspace in workspaces:
+            checkbox = QCheckBox(str(workspace.get("display_path") or "工作区"))
+            checkbox.setChecked(bool(workspace.get("available")))
+            workspace_checks.append((checkbox, str(workspace["workspace_id"])))
+            layout.addWidget(checkbox)
+        if not workspaces:
+            hint = QLabel("尚无工作区；可先创建 Client，之后在本页添加工作区并编辑权限。")
+            hint.setObjectName("hint")
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+
+        notice = QLabel(
+            "默认拒绝未勾选能力。result.submit 保持固定收件人与既有文件边界，不会开放任意发信。"
+        )
+        notice.setObjectName("hint")
+        notice.setWordWrap(True)
+        layout.addWidget(notice)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("创建并继续配置")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        created = self.service.create_agent_client(
+            client_type=client_type,
+            display_name=name_edit.text(),
+            config_mode="manual" if client_type == "custom" else "managed",
+            config_scope="custom" if client_type == "custom" else "user",
+            capabilities=[
+                capability
+                for checkbox, capability in capability_checks
+                if checkbox.isChecked()
+            ],
+            account_ids=[
+                account_id
+                for checkbox, account_id in account_checks
+                if checkbox.isChecked()
+            ],
+            workspace_ids=[
+                workspace_id
+                for checkbox, workspace_id in workspace_checks
+                if checkbox.isChecked()
+            ],
+        )
+        if not created.ok:
+            self._show_service_result(created)
+            return
+        client = created.details["client"]
+        listed = self.service.list_agent_clients().details.get("clients", [])
+        client = next(
+            (
+                row
+                for row in listed
+                if row.get("client_id") == client.get("client_id")
+            ),
+            client,
+        )
+        self.show_message("Client 已创建，完成配置前保持未启用", "success")
+        self._configure_agent_client(client)
+
+    def _edit_agent_client_permissions(self, client: dict) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"权限 - {client.get('display_name')}")
+        dialog.resize(560, 600)
+        layout = QVBoxLayout(dialog)
+        current_caps = set(client.get("capabilities") or [])
+        current_accounts = set(client.get("account_ids") or [])
+        current_workspaces = set(client.get("workspace_ids") or [])
+        cap_checks: list[tuple[QCheckBox, str]] = []
+        for label, capability in (
+            ("搜索邮件", "mail.search"),
+            ("读取邮件", "mail.get"),
+            ("读取文本资源", "resource.read"),
+            ("准备附件到工作区", "resource.prepare"),
+            ("查看同步状态", "sync.status"),
+            ("按需刷新邮件", "sync.ensure_fresh"),
+            ("列出工作区", "workspace.list"),
+            ("提交最终结果", "result.submit"),
+        ):
+            check = QCheckBox(label)
+            check.setChecked(capability in current_caps)
+            cap_checks.append((check, capability))
+            layout.addWidget(check)
+        layout.addWidget(horizontal_line())
+        account_checks: list[tuple[QCheckBox, str]] = []
+        for account in self.service.list_mail_accounts().details.get("accounts", []):
+            check = QCheckBox(
+                f"邮箱：{account.get('display_name') or account.get('provider')}"
+            )
+            account_id = str(account["account_id"])
+            check.setChecked(account_id in current_accounts)
+            account_checks.append((check, account_id))
+            layout.addWidget(check)
+        workspace_checks: list[tuple[QCheckBox, str]] = []
+        for workspace in self.service.list_agent_workspaces().details.get(
+            "workspace_details", []
+        ):
+            check = QCheckBox(f"工作区：{workspace.get('display_path')}")
+            workspace_id = str(workspace["workspace_id"])
+            check.setChecked(workspace_id in current_workspaces)
+            workspace_checks.append((check, workspace_id))
+            layout.addWidget(check)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存并立即生效")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        result = self.service.set_agent_client_permissions(
+            str(client["client_id"]),
+            capabilities=[
+                capability for check, capability in cap_checks if check.isChecked()
+            ],
+            account_ids=[
+                account_id
+                for check, account_id in account_checks
+                if check.isChecked()
+            ],
+            workspace_ids=[
+                workspace_id
+                for check, workspace_id in workspace_checks
+                if check.isChecked()
+            ],
+        )
+        self._show_service_result(result)
+        self.request_refresh()
+
+    def _configure_agent_client(self, client: dict) -> None:
+        if (
+            str(client.get("client_type")) == "custom"
+            or client.get("installed") is False
+        ):
+            self._copy_agent_client_assisted_config(client)
+            return
+        preview = self.service.preview_agent_client_config(str(client["client_id"]))
+        if not preview.ok:
+            self._show_service_result(preview)
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("确认 Client 配置修改")
+        dialog.resize(760, 620)
+        layout = QVBoxLayout(dialog)
+        target = QLabel(f"目标文件：{preview.details.get('target_path')}")
+        target.setWordWrap(True)
+        layout.addWidget(target)
+        editor = QTextEdit()
+        editor.setReadOnly(True)
+        editor.setPlainText(str(preview.details.get("preview") or ""))
+        layout.addWidget(editor, 1)
+        notice = QLabel(
+            "预览中的 scoped token 已隐藏。确认后会先备份，再以临时文件、fsync 和原子替换写入；外部并发修改会被拒绝。"
+        )
+        notice.setObjectName("hint")
+        notice.setWordWrap(True)
+        layout.addWidget(notice)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Apply
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Apply).setText("备份并应用")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        plan_id = str(preview.details["plan_id"])
+
+        def finished(result: ServiceResult) -> None:
+            if result.ok:
+                self.service.set_agent_client_state(
+                    str(client["client_id"]), "active", enabled=True
+                )
+            self._show_service_result(result)
+            self.request_refresh()
+
+        self._run_task(
+            "正在备份并应用 Client 配置",
+            lambda: self.service.apply_agent_client_config(plan_id),
+            finished,
+            refresh_on_finish=False,
+        )
+
+    def _copy_agent_client_assisted_config(self, client: dict) -> None:
+        result = self.service.export_agent_client_config(str(client["client_id"]))
+        if not result.ok:
+            self._show_service_result(result)
+            return
+        value = (
+            result.details.get("toml")
+            if str(client.get("client_type")) == "codex"
+            else result.details.get("json")
+        )
+        QApplication.clipboard().setText(str(value or ""))
+        self.service.set_agent_client_state(
+            str(client["client_id"]), "active", enabled=True
+        )
+        self.show_message(
+            "辅助配置已复制；其中仅含可撤销的 scoped token，不含邮箱凭据",
+            "success",
+        )
+        self.request_refresh()
+
+    def _test_agent_client(self, client: dict) -> None:
+        self._run_task(
+            "正在启动真实 stdio 连接测试",
+            lambda: self.service.test_agent_client_connection(
+                str(client["client_id"])
+            ),
+            lambda result: (self._show_service_result(result), self.request_refresh()),
+            refresh_on_finish=False,
+        )
+
+    def _toggle_agent_client(self, client: dict) -> None:
+        state = str(client.get("state") or "active")
+        target_state = "active" if state == "paused" else "paused"
+        result = self.service.set_agent_client_state(
+            str(client["client_id"]),
+            target_state,
+            enabled=target_state == "active",
+        )
+        self._show_service_result(result)
+        self.request_refresh()
+
+    def _revoke_agent_client(self, client: dict) -> None:
+        removal = None
+        if str(client.get("client_type")) != "custom":
+            removal = self.service.preview_agent_client_config(
+                str(client["client_id"]), remove=True
+            )
+        dialog = QDialog(self)
+        dialog.setWindowTitle("撤销 Agent Client")
+        dialog.resize(720, 540 if removal and removal.ok else 260)
+        layout = QVBoxLayout(dialog)
+        notice = QLabel(
+            "撤销后 scoped token 立即失效，其他 Client 不受影响。"
+            + (
+                "下方预览只移除 AgentMailBridge 自己管理的配置项，并会先创建备份。"
+                if removal and removal.ok
+                else "未发现可安全管理的外部配置，本次只撤销 Client 身份。"
+            )
+        )
+        notice.setWordWrap(True)
+        layout.addWidget(notice)
+        if removal and removal.ok:
+            target = QLabel(f"目标文件：{removal.details.get('target_path')}")
+            target.setWordWrap(True)
+            layout.addWidget(target)
+            editor = QTextEdit()
+            editor.setReadOnly(True)
+            editor.setPlainText(str(removal.details.get("preview") or ""))
+            layout.addWidget(editor, 1)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Yes
+            | QDialogButtonBox.StandardButton.No
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Yes).setText("确认撤销")
+        buttons.button(QDialogButtonBox.StandardButton.No).setText("取消")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        if removal and removal.ok:
+            plan_id = str(removal.details["plan_id"])
+
+            def revoke_with_config_cleanup() -> ServiceResult:
+                applied = self.service.apply_agent_client_config(plan_id)
+                revoked = self.service.set_agent_client_state(
+                    str(client["client_id"]), "revoked"
+                )
+                if not applied.ok:
+                    return ServiceResult(
+                        OperationStatus.PARTIAL,
+                        error_code=applied.error_code,
+                        message="Client 已撤销，但外部配置项移除失败：" + applied.message,
+                        details={"client_revoked": revoked.ok},
+                    )
+                return revoked
+
+            self._run_task(
+                "正在备份配置、移除受管项并撤销 Client",
+                revoke_with_config_cleanup,
+                lambda value: (
+                    self._show_service_result(value),
+                    self.request_refresh(),
+                ),
+                refresh_on_finish=False,
+            )
+            return
+        result = self.service.set_agent_client_state(
+            str(client["client_id"]), "revoked"
+        )
+        self._show_service_result(result)
+        self.request_refresh()
+
+    def _restore_latest_agent_config(self, client: dict) -> None:
+        result = self.service.list_agent_client_config_backups(
+            str(client["client_id"])
+        )
+        backups = result.details.get("backups", []) if result.ok else []
+        backup = next(
+            (row for row in backups if row.get("status") == "applied"),
+            None,
+        )
+        if backup is None:
+            self.show_message("没有可恢复的配置备份", "normal")
+            return
+        choice = QMessageBox.question(
+            self,
+            "恢复 Client 配置",
+            f"恢复最近备份 {backup.get('backup_path_display')}？当前配置若已被外部修改会安全拒绝。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if choice != QMessageBox.StandardButton.Yes:
+            return
+        self._run_task(
+            "正在恢复 Client 配置备份",
+            lambda: self.service.restore_agent_client_config(
+                str(backup["backup_id"])
+            ),
+            lambda value: (self._show_service_result(value), self.request_refresh()),
+            refresh_on_finish=False,
+        )
+
     def _toggle_mcp_read_access(self, enabled: bool) -> None:
         if self._loading_mcp_read_access:
             return
@@ -5405,8 +6016,9 @@ class BridgeWindow(QMainWindow):
             confirmation = QMessageBox.question(
                 self,
                 "启用本机 Agent 邮件读取",
-                "启用后，能启动当前 MCP 配置的本机进程可以按工具边界搜索和读取本地邮件归档。\n\n"
-                "该授权不是逐封分享；不会开放凭据、任意文件路径或邮件修改能力。是否继续？",
+                "启用后，只有已注册且通过 Client 身份、状态、能力、账号和工作区权限的本机 Agent，"
+                "才能搜索和读取本地邮件归档。\n\n"
+                "该总开关不是逐封分享；不会开放凭据、任意文件路径或邮件修改能力。是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )

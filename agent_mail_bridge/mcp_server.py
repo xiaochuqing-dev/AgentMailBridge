@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import time
@@ -13,6 +14,11 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from agent_mail_bridge.application_service import ApplicationService
+from agent_mail_bridge.agent_integration import (
+    AgentAccessError,
+    AgentIdentity,
+    TOOL_CAPABILITIES,
+)
 from agent_mail_bridge.config import load_config
 from agent_mail_bridge.database import close_connection
 from agent_mail_bridge.models import OperationStatus, SendResult
@@ -60,6 +66,8 @@ class McpServer:
         *,
         input_stream: TextIO | None = None,
         output_stream: TextIO | None = None,
+        client_id: str | None = None,
+        client_token: str | None = None,
     ) -> None:
         self.service = service
         self.input_stream = input_stream or sys.stdin
@@ -68,6 +76,20 @@ class McpServer:
         self.rate_limit = SubmissionRateLimit()
         self.client_name = "unknown"
         self.session_id = str(uuid.uuid4())
+        self.client_id = str(
+            client_id
+            if client_id is not None
+            else os.getenv("AGENT_MAIL_BRIDGE_CLIENT_ID", "")
+        ).strip()
+        self._client_token = str(
+            client_token
+            if client_token is not None
+            else os.getenv("AGENT_MAIL_BRIDGE_CLIENT_TOKEN", "")
+        )
+        self.identity: AgentIdentity | None = None
+        self._audit_account_id: str | None = None
+        self._audit_workspace_id: str | None = None
+        self._correlation_id: str | None = None
 
     def serve(self) -> int:
         """逐行处理 JSON-RPC，标准输出只写协议消息。"""
@@ -116,6 +138,14 @@ class McpServer:
         if not self.initialized:
             return _error_response(request_id, -32002, "MCP 尚未完成初始化")
         if method == "tools/list":
+            auth_error = self._authenticate()
+            if auth_error is not None:
+                return _error_response(
+                    request_id,
+                    -32001,
+                    str(auth_error),
+                    data={"error_code": auth_error.code},
+                )
             return _success_response(request_id, {"tools": _all_tools()})
         if method == "tools/call":
             return self._call_tool(request_id, message.get("params"))
@@ -128,6 +158,15 @@ class McpServer:
         client_info = params.get("clientInfo")
         if isinstance(client_info, dict):
             self.client_name = str(client_info.get("name") or "unknown")[:120]
+        auth_error = self._authenticate()
+        if auth_error is not None:
+            self._audit_connection_denial(auth_error)
+            return _error_response(
+                request_id,
+                -32001,
+                str(auth_error),
+                data={"error_code": auth_error.code},
+            )
         protocol = (
             requested
             if requested in SUPPORTED_PROTOCOL_VERSIONS
@@ -140,9 +179,9 @@ class McpServer:
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
                 "instructions": (
-                    "邮件读取需由用户在 GUI 中一次性启用；可搜索和分页读取本地归档，"
-                    "可把资源受控准备到授权工作区。submit_result 收件人固定。"
-                    "服务不能读取凭据、修改邮件或遍历任意文件系统路径。"
+                    "邮件读取需启用总开关，并通过当前 Client 的能力、账号和工作区权限；"
+                    "可搜索和分页读取本地归档，可把资源受控准备到授权工作区。"
+                    "submit_result 收件人固定。服务不能读取凭据、修改邮件或遍历任意文件系统路径。"
                 ),
             },
         )
@@ -156,9 +195,45 @@ class McpServer:
         arguments = params.get("arguments", {})
         if not isinstance(arguments, dict):
             return _error_response(request_id, -32602, "工具 arguments 必须是对象")
+        arguments = dict(arguments)
 
         called_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         started = time.perf_counter()
+        self._audit_account_id = None
+        self._audit_workspace_id = None
+        self._correlation_id = f"{self.session_id}:{request_id}"
+        auth_error = self._authenticate()
+        if auth_error is not None:
+            structured = self._agent_denial_payload(auth_error)
+            self._audit_tool(tool_name, arguments, structured, called_at, started)
+            return _success_response(
+                request_id, _tool_result(structured, is_error=True)
+            )
+        if (
+            tool_name
+            in {
+                "search_mails",
+                "get_mail",
+                "read_mail_resource",
+                "prepare_mail_resources",
+            }
+            and not self.service.cfg.mcp_mail_read_enabled
+        ):
+            structured = self._agent_denial_payload(
+                AgentAccessError("agent_access_disabled")
+            )
+            self._audit_tool(tool_name, arguments, structured, called_at, started)
+            return _success_response(
+                request_id, _tool_result(structured, is_error=True)
+            )
+        try:
+            arguments = self._authorize_tool(tool_name, arguments)
+        except AgentAccessError as exc:
+            structured = self._agent_denial_payload(exc)
+            self._audit_tool(tool_name, arguments, structured, called_at, started)
+            return _success_response(
+                request_id, _tool_result(structured, is_error=True)
+            )
         validation_error = _validate_tool_arguments(tool_name, arguments)
         if validation_error:
             if tool_name == "submit_result":
@@ -195,6 +270,10 @@ class McpServer:
             if tool_name == "submit_result"
             else _service_result_payload(result)
         )
+        if structured.get("error_code") == "read_access_disabled":
+            structured["error_code"] = "agent_access_disabled"
+            structured["status"] = "agent_access_disabled"
+            structured["message"] = "Agent 邮件访问总开关已关闭"
         structured = _redact_payload(structured, self.service)
         is_error = not bool(structured.get("ok"))
         if tool_name == "submit_result" and structured.get("status") in {
@@ -240,8 +319,13 @@ class McpServer:
             )
         if tool_name == "list_agent_workspaces":
             result = self.service.list_agent_workspaces()
+            allowed = self.identity.workspace_ids if self.identity else frozenset()
             result.details = {
-                "workspaces": result.details.get("workspace_details", []),
+                "workspaces": [
+                    row
+                    for row in result.details.get("workspace_details", [])
+                    if str(row.get("workspace_id")) in allowed
+                ],
                 "takes_effect": result.details.get("takes_effect"),
             }
             return result
@@ -288,9 +372,111 @@ class McpServer:
                 ensure_fresh=bool(arguments.get("ensure_fresh")),
                 sync_triggered=bool(structured.get("sync_triggered")),
                 details=_audit_details(tool_name, structured),
+                client_id=(self.identity.client_id if self.identity else self.client_id[:80] or None),
+                client_type=(self.identity.client_type if self.identity else None),
+                display_name_snapshot=(
+                    self.identity.display_name if self.identity else None
+                ),
+                capability=TOOL_CAPABILITIES.get(tool_name),
+                account_id=self._audit_account_id,
+                workspace_id=self._audit_workspace_id,
+                deny_reason_code=(
+                    str(structured.get("error_code") or "") or None
+                    if not structured.get("ok")
+                    else None
+                ),
+                correlation_id=self._correlation_id,
             )
         except Exception:  # noqa: BLE001
             # 审计失败不能污染 MCP stdout，也不能把邮件正文写入诊断。
+            return
+
+    def _authenticate(self) -> AgentAccessError | None:
+        try:
+            self.identity = self.service.resolve_agent_identity(
+                self.client_id, self._client_token
+            )
+        except AgentAccessError as exc:
+            self.identity = None
+            return exc
+        return None
+
+    def _authorize_tool(
+        self, tool_name: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        identity = self.identity
+        if identity is None:
+            raise AgentAccessError("unknown_client")
+        capability = TOOL_CAPABILITIES[tool_name]
+        self.service.require_agent_capability(identity, capability)
+        if tool_name == "search_mails":
+            if arguments.get("ensure_fresh"):
+                self.service.require_agent_capability(
+                    identity, "sync.ensure_fresh"
+                )
+            account_id = self.service.require_agent_account(
+                identity, arguments.get("account_id")
+            )
+            if account_id != "*":
+                arguments["account_id"] = account_id
+                self._audit_account_id = account_id
+        elif tool_name in {
+            "get_mail",
+            "read_mail_resource",
+            "prepare_mail_resources",
+        }:
+            account_id = self.service.agent_mail_account_id(
+                _mail_identifier(arguments)
+            )
+            if account_id:
+                self.service.require_agent_account(identity, account_id)
+                self._audit_account_id = account_id
+        elif tool_name == "get_mail_sync_status":
+            account_id = self.service.require_agent_account(
+                identity, arguments.get("account_id")
+            )
+            if account_id == "*":
+                account_id = sorted(identity.account_ids)[0]
+            arguments["account_id"] = account_id
+            self._audit_account_id = account_id
+        if tool_name == "prepare_mail_resources":
+            workspace_id, workspace_path = self.service.require_agent_workspace(
+                identity, arguments.get("target_workspace")
+            )
+            arguments["target_workspace"] = workspace_path
+            self._audit_workspace_id = workspace_id
+        return arguments
+
+    @staticmethod
+    def _agent_denial_payload(exc: AgentAccessError) -> dict[str, Any]:
+        return {
+            "status": "denied",
+            "operation_status": "failed",
+            "ok": False,
+            "error_code": exc.code,
+            "message": str(exc),
+        }
+
+    def _audit_connection_denial(self, exc: AgentAccessError) -> None:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            self.service.record_mcp_audit(
+                call_id=str(uuid.uuid4()),
+                called_at=now,
+                completed_at=now,
+                tool_name="initialize",
+                operation_type="connection",
+                client_name=self.client_name,
+                session_id=self.session_id,
+                status="denied",
+                error_code=exc.code,
+                duration_ms=0,
+                details={},
+                client_id=self.client_id[:80] or None,
+                deny_reason_code=exc.code,
+                correlation_id=f"{self.session_id}:initialize",
+            )
+        except Exception:  # noqa: BLE001
             return
 
     def _rejected_tool_result(
@@ -809,12 +995,19 @@ def _success_response(request_id: Any, result: dict[str, Any]) -> dict[str, Any]
 
 
 def _error_response(
-    request_id: Any, code: int, message: str
+    request_id: Any,
+    code: int,
+    message: str,
+    *,
+    data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    error: dict[str, Any] = {"code": code, "message": message}
+    if data:
+        error["data"] = data
     return {
         "jsonrpc": "2.0",
         "id": request_id,
-        "error": {"code": code, "message": message},
+        "error": error,
     }
 
 

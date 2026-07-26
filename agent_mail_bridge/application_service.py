@@ -9,6 +9,7 @@ import ssl
 import platform
 import os
 import re
+import subprocess
 import sys
 import threading
 import uuid
@@ -38,6 +39,7 @@ from agent_mail_bridge.credentials import (
 )
 from agent_mail_bridge.database import (
     account_owned_fact_counts,
+    agent_integration_migration_needed,
     app_event_overview,
     close_connection,
     clear_all_app_events,
@@ -48,9 +50,11 @@ from agent_mail_bridge.database import (
     get_auto_receive_state,
     get_mail_account as query_mail_account,
     get_mail_package as query_raw_mail_package,
+    get_agent_config_backup,
     init_db,
     insert_mcp_call,
     insert_mcp_audit_event,
+    insert_agent_config_backup,
     legacy_archive_backfill_needed,
     multi_account_migration_needed,
     outbound_mail_migration_needed,
@@ -59,6 +63,8 @@ from agent_mail_bridge.database import (
     get_outbound_message as query_outbound_message,
     query_recent_mcp_calls,
     query_recent_mcp_audit_events,
+    query_agent_config_backups,
+    query_agent_client_permissions,
     query_recent_outbound_messages,
     query_recent_events,
     query_app_events,
@@ -69,6 +75,8 @@ from agent_mail_bridge.database import (
     remove_mail_account as remove_mail_account_record,
     update_mcp_call,
     update_mcp_staging,
+    update_agent_client,
+    update_agent_config_backup,
     save_auto_receive_state,
     delete_trusted_domain,
     upsert_trusted_domain,
@@ -78,6 +86,11 @@ from agent_mail_bridge.database import (
     sync_mail_accounts,
     update_mail_account as update_mail_account_record,
     upsert_mailboxes,
+)
+from agent_mail_bridge.agent_integration import (
+    AgentAccessError,
+    AgentIdentity,
+    AgentIntegrationService,
 )
 from agent_mail_bridge.file_index import list_received_files_for_date, scan_file_status
 from agent_mail_bridge.gmail_api_auth import get_oauth_state
@@ -151,6 +164,19 @@ from agent_mail_bridge.security import (
 from agent_mail_bridge.storage import atomic_copy_file, ensure_data_dirs
 from agent_mail_bridge.trusted_downloads import normalize_trusted_domain
 from agent_mail_bridge.utils import fmt_date, sanitize_filename, sha256_of_bytes, sha256_of_file
+from agent_mail_bridge.mcp_client_config import (
+    CLIENT_ID_ENV,
+    CLIENT_TOKEN_ENV,
+    ClientConfigError,
+    ConfigPlan,
+    apply_client_config,
+    codex_mcp_toml,
+    detect_client,
+    generic_mcp_json,
+    mcp_launch,
+    preview_client_config,
+    restore_client_config,
+)
 
 
 logger = get_logger("application_service")
@@ -198,6 +224,8 @@ class ApplicationService:
         else:
             self._credentials = CredentialService()
         self._account_router = AccountRuntimeRouter(cfg, self._credentials)
+        self._agent_integration = AgentIntegrationService(cfg, self._credentials)
+        self._agent_config_plans: dict[str, ConfigPlan] = {}
 
     def initialize(self) -> ServiceResult:
         """初始化安全目录、数据库和日志。"""
@@ -221,6 +249,9 @@ class ApplicationService:
                 account_migration_needed = multi_account_migration_needed(
                     self.cfg.db_path
                 )
+                agent_migration_needed = agent_integration_migration_needed(
+                    self.cfg.db_path
+                )
                 outbound_migration_needed = outbound_mail_migration_needed(
                     self.cfg.db_path
                 )
@@ -230,11 +261,14 @@ class ApplicationService:
                     or outbound_migration_needed
                     or v13_migration_needed
                     or account_migration_needed
+                    or agent_migration_needed
                 ):
                     create_database_backup(
                         self.cfg,
                         label=(
-                            "before_v1_4_multi_account"
+                            "before_v1_5_agent_permissions"
+                            if agent_migration_needed
+                            else "before_v1_4_multi_account"
                             if account_migration_needed
                             else "before_v1_3_models"
                             if v13_migration_needed
@@ -2188,6 +2222,504 @@ class ApplicationService:
             if event.get(key):
                 event[key] = _redact_text(str(event[key]), self.cfg)
         return insert_mcp_audit_event(self.cfg.db_path, **event)
+
+    def create_agent_client(
+        self,
+        *,
+        client_type: str,
+        display_name: str,
+        config_mode: str | None = None,
+        config_scope: str = "user",
+        capabilities: list[str] | None = None,
+        account_ids: list[str] | None = None,
+        workspace_ids: list[str] | None = None,
+    ) -> ServiceResult:
+        """创建默认拒绝的 Client；scoped token 只在本次结果中返回。"""
+        self.initialize()
+        try:
+            client, token = self._agent_integration.create_client_profile(
+                client_type=client_type,
+                display_name=display_name,
+                config_mode=config_mode,
+                config_scope=config_scope,
+            )
+            permissions = self._agent_integration.set_permissions(
+                str(client["client_id"]),
+                capabilities=capabilities or [],
+                account_ids=account_ids or [],
+                workspace_ids=workspace_ids or [],
+            )
+        except (AgentAccessError, CredentialError, sqlite3.Error, ValueError) as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code=getattr(exc, "code", "agent_client_create_failed"),
+                message=str(exc),
+            )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            message="Agent Client 已创建，默认保持未启用",
+            details={
+                "client": client,
+                "permissions": permissions,
+                "scoped_token": token,
+                "token_notice": "仅代表 AgentMailBridge 内的有限权限，可独立撤销；不会获得邮箱凭据。",
+            },
+        )
+
+    def list_agent_clients(self, *, include_revoked: bool = True) -> ServiceResult:
+        self.initialize()
+        clients = self._agent_integration.list_clients(
+            include_revoked=include_revoked
+        )
+        for client in clients:
+            client_id = str(client["client_id"])
+            rows = query_agent_client_permissions(self.cfg.db_path, client_id)
+            client["capabilities"] = sorted(
+                {
+                    str(row["capability"])
+                    for row in rows
+                    if row.get("enabled")
+                    and row.get("effect") == "allow"
+                    and "." in str(row.get("capability") or "")
+                    and row.get("capability")
+                    not in {"account.access", "workspace.access"}
+                }
+            )
+            client["account_ids"] = sorted(
+                str(row["account_id"])
+                for row in rows
+                if row.get("enabled")
+                and row.get("effect") == "allow"
+                and row.get("capability") == "account.access"
+                and row.get("account_id")
+            )
+            client["workspace_ids"] = sorted(
+                str(row["workspace_id"])
+                for row in rows
+                if row.get("enabled")
+                and row.get("effect") == "allow"
+                and row.get("capability") == "workspace.access"
+                and row.get("workspace_id")
+            )
+            try:
+                detection = detect_client(
+                    str(client["client_type"]),
+                    config_scope=str(client.get("config_scope") or "user"),
+                )
+                client["install_status"] = detection.status
+                client["installed"] = detection.installed
+                client["client_version"] = detection.version
+            except ClientConfigError as exc:
+                client["install_status"] = exc.code
+                client["installed"] = False
+                client["client_version"] = None
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            details={"clients": clients},
+        )
+
+    def set_agent_client_permissions(
+        self,
+        client_id: str,
+        *,
+        capabilities: list[str],
+        account_ids: list[str],
+        workspace_ids: list[str],
+        denied_capabilities: list[str] | None = None,
+    ) -> ServiceResult:
+        self.initialize()
+        try:
+            rows = self._agent_integration.set_permissions(
+                client_id,
+                capabilities=capabilities,
+                account_ids=account_ids,
+                workspace_ids=workspace_ids,
+                denied_capabilities=denied_capabilities or [],
+            )
+        except (AgentAccessError, sqlite3.Error, ValueError) as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code=getattr(exc, "code", "permission_save_failed"),
+                message=str(exc),
+            )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            message="Client 权限已保存并立即生效",
+            details={"permissions": rows},
+        )
+
+    def set_agent_client_state(
+        self, client_id: str, state: str, *, enabled: bool | None = None
+    ) -> ServiceResult:
+        self.initialize()
+        try:
+            client = self._agent_integration.set_client_state(
+                client_id, state, enabled=enabled
+            )
+        except (AgentAccessError, sqlite3.Error, ValueError) as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code=getattr(exc, "code", "client_state_update_failed"),
+                message=str(exc),
+            )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            message=(
+                "Client 已撤销，后续调用立即拒绝"
+                if state == "revoked"
+                else "Client 状态已更新并立即生效"
+            ),
+            details={"client": client},
+        )
+
+    def rotate_agent_client_token(self, client_id: str) -> ServiceResult:
+        self.initialize()
+        try:
+            token = self._agent_integration.rotate_client_token(client_id)
+        except (AgentAccessError, CredentialError, sqlite3.Error) as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code=getattr(exc, "code", "client_auth_failed"),
+                message=str(exc),
+            )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            message="Client scoped token 已轮换，旧 token 立即失效",
+            details={"scoped_token": token},
+        )
+
+    def resolve_agent_identity(
+        self, client_id: str, client_token: str
+    ) -> AgentIdentity:
+        self.initialize()
+        return self._agent_integration.resolve_identity(client_id, client_token)
+
+    def require_agent_capability(
+        self, identity: AgentIdentity, capability: str
+    ) -> None:
+        self._agent_integration.require_capability(identity, capability)
+
+    def require_agent_account(
+        self, identity: AgentIdentity, account_id: str | None
+    ) -> str:
+        return self._agent_integration.require_account(identity, account_id)
+
+    def agent_mail_account_id(self, package_id: str) -> str:
+        return self._agent_integration.account_for_mail(package_id)
+
+    def require_agent_workspace(
+        self, identity: AgentIdentity, requested: str | None
+    ) -> tuple[str, str]:
+        return self._agent_integration.require_workspace(identity, requested)
+
+    def preview_agent_client_config(
+        self,
+        client_id: str,
+        *,
+        project_root: str | Path | None = None,
+        remove: bool = False,
+    ) -> ServiceResult:
+        self.initialize()
+        client = self._agent_integration.get_client(client_id)
+        if client is None:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="unknown_client",
+                message="Agent Client 不存在",
+            )
+        try:
+            token = self._agent_integration.get_scoped_token(client_id)
+            plan = preview_client_config(
+                client_id=client_id,
+                client_type=str(client["client_type"]),
+                client_token=token,
+                config_scope=str(client.get("config_scope") or "user"),
+                project_root=Path(project_root) if project_root else None,
+                action="remove" if remove else "apply",
+            )
+        except (AgentAccessError, ClientConfigError, CredentialError) as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code=getattr(exc, "code", "config_parse_failed"),
+                message=str(exc),
+            )
+        plan_id = "plan_" + uuid.uuid4().hex
+        self._agent_config_plans[plan_id] = plan
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            message="配置预览已生成，尚未修改外部文件",
+            details={
+                "plan_id": plan_id,
+                "client_id": client_id,
+                "client_type": client["client_type"],
+                "target_path": str(plan.target_path),
+                "original_hash": plan.original_hash,
+                "applied_hash": plan.applied_hash,
+                "changed": plan.original_hash != plan.applied_hash,
+                "preview": plan.preview,
+                "action": plan.action,
+            },
+        )
+
+    def apply_agent_client_config(self, plan_id: str) -> ServiceResult:
+        self.initialize()
+        plan = self._agent_config_plans.pop(str(plan_id), None)
+        if plan is None:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="config_changed_concurrently",
+                message="配置预览已失效，请重新预览",
+            )
+        backup_root = (
+            self.cfg.data_root_path / "backups" / "agent_client_configs"
+        )
+        try:
+            applied = apply_client_config(plan, backup_root=backup_root)
+            try:
+                backup = insert_agent_config_backup(
+                    self.cfg.db_path,
+                    backup_id=applied.backup_id,
+                    client_id=plan.client_id,
+                    target_type=plan.client_type,
+                    original_path=str(applied.target_path),
+                    backup_path=str(applied.backup_path),
+                    original_hash=applied.original_hash,
+                    applied_hash=applied.applied_hash,
+                    status="applied",
+                )
+                update_agent_client(
+                    self.cfg.db_path,
+                    plan.client_id,
+                    config_location=str(applied.target_path),
+                    config_status=(
+                        "removed" if plan.action == "remove" else "reload_required"
+                    ),
+                )
+            except sqlite3.Error:
+                restore_client_config(
+                    target_path=applied.target_path,
+                    backup_path=applied.backup_path,
+                    applied_hash=applied.applied_hash,
+                )
+                raise
+        except (ClientConfigError, sqlite3.Error, OSError) as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code=getattr(exc, "code", "config_write_failed"),
+                message=str(exc),
+            )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            message=(
+                "已移除 AgentMailBridge 配置项"
+                if plan.action == "remove"
+                else "配置已安全写入；请 reload 或重启 Client"
+            ),
+            details={
+                "backup": backup,
+                "changed": applied.changed,
+                "target_path": str(applied.target_path),
+                "reload_required": True,
+            },
+        )
+
+    def list_agent_client_config_backups(
+        self, client_id: str
+    ) -> ServiceResult:
+        self.initialize()
+        rows = query_agent_config_backups(self.cfg.db_path, client_id)
+        for row in rows:
+            row["original_path_display"] = Path(
+                str(row.get("original_path") or "")
+            ).name
+            row["backup_path_display"] = Path(
+                str(row.get("backup_path") or "")
+            ).name
+        return ServiceResult(OperationStatus.SUCCESS, details={"backups": rows})
+
+    def restore_agent_client_config(self, backup_id: str) -> ServiceResult:
+        self.initialize()
+        backup = get_agent_config_backup(self.cfg.db_path, backup_id)
+        if backup is None:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="config_restore_failed",
+                message="配置备份不存在",
+            )
+        try:
+            restored_hash = restore_client_config(
+                target_path=Path(str(backup["original_path"])),
+                backup_path=Path(str(backup["backup_path"])),
+                applied_hash=str(backup.get("applied_hash") or "") or None,
+            )
+            update_agent_config_backup(
+                self.cfg.db_path,
+                backup_id,
+                status="restored",
+                restored_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            )
+            update_agent_client(
+                self.cfg.db_path,
+                str(backup["client_id"]),
+                config_status="restored_reload_required",
+            )
+        except (ClientConfigError, sqlite3.Error, OSError) as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code=getattr(exc, "code", "config_restore_failed"),
+                message=str(exc),
+            )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            message="配置备份已恢复；请 reload 或重启 Client",
+            details={"restored_hash": restored_hash, "reload_required": True},
+        )
+
+    def export_agent_client_config(self, client_id: str) -> ServiceResult:
+        """显式导出辅助配置；结果含 scoped token，调用方不得记录。"""
+        self.initialize()
+        client = self._agent_integration.get_client(client_id)
+        if client is None:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="unknown_client",
+                message="Agent Client 不存在",
+            )
+        try:
+            token = self._agent_integration.get_scoped_token(client_id)
+        except (AgentAccessError, CredentialError) as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code=getattr(exc, "code", "client_auth_failed"),
+                message=str(exc),
+            )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            message="已生成最小 stdio 配置；其中 scoped token 可随时撤销",
+            details={
+                "json": generic_mcp_json(
+                    client_id=client_id, client_token=token
+                ),
+                "toml": codex_mcp_toml(
+                    client_id=client_id, client_token=token
+                ),
+                "contains_scoped_token": True,
+            },
+        )
+
+    def test_agent_client_connection(self, client_id: str) -> ServiceResult:
+        """启动真实 stdio 进程完成 initialize 与 tools/list。"""
+        self.initialize()
+        client = self._agent_integration.get_client(client_id)
+        if client is None:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="unknown_client",
+                message="Agent Client 不存在",
+            )
+        try:
+            token = self._agent_integration.get_scoped_token(client_id)
+        except (AgentAccessError, CredentialError) as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code=getattr(exc, "code", "client_auth_failed"),
+                message=str(exc),
+            )
+        command, args = mcp_launch()
+        messages = [
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": str(client["client_type"]),
+                        "version": "AgentMailBridge-GUI",
+                    },
+                },
+            },
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        ]
+        env = os.environ.copy()
+        env.update(
+            {
+                "AGENT_MAIL_BRIDGE_DISABLE_DOTENV": "1",
+                "DATA_ROOT": str(self.cfg.data_root_path),
+                "MCP_MAIL_READ_ENABLED": (
+                    "true" if self.cfg.mcp_mail_read_enabled else "false"
+                ),
+                "ALLOWED_SEND_ROOTS": os.pathsep.join(
+                    str(path) for path in self.cfg.effective_allowed_send_roots
+                ),
+                CLIENT_ID_ENV: client_id,
+                CLIENT_TOKEN_ENV: token,
+            }
+        )
+        try:
+            completed = subprocess.run(
+                [command, *args],
+                input="\n".join(
+                    json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+                    for item in messages
+                )
+                + "\n",
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+                env=env,
+                check=False,
+            )
+            responses = [
+                json.loads(line)
+                for line in completed.stdout.splitlines()
+                if line.strip()
+            ]
+            listed = next(
+                row
+                for row in responses
+                if row.get("id") == 2 and isinstance(row.get("result"), dict)
+            )
+            tools = listed["result"].get("tools") or []
+            names = {str(item.get("name")) for item in tools}
+            expected = {
+                "submit_result",
+                "search_mails",
+                "get_mail",
+                "read_mail_resource",
+                "prepare_mail_resources",
+                "list_agent_workspaces",
+                "get_mail_sync_status",
+            }
+            if completed.returncode != 0 or names != expected:
+                raise ValueError("tools/list 未返回预期七工具")
+        except (
+            OSError,
+            subprocess.SubprocessError,
+            ValueError,
+            json.JSONDecodeError,
+            StopIteration,
+        ) as exc:
+            update_agent_client(
+                self.cfg.db_path, client_id, config_status="test_failed"
+            )
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="connection_test_failed",
+                message=f"连接测试失败：{exc}",
+            )
+        update_agent_client(
+            self.cfg.db_path, client_id, config_status="connected"
+        )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            message="连接测试通过：身份有效且七工具可见",
+            details={"tool_count": 7, "tools": sorted(names)},
+        )
 
     def record_mcp_rejection(
         self,

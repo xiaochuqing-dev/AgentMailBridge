@@ -210,6 +210,53 @@ CREATE TABLE IF NOT EXISTS mcp_audit_events (
     details_json TEXT
 );
 
+CREATE TABLE IF NOT EXISTS agent_clients (
+    client_id TEXT PRIMARY KEY,
+    client_type TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL DEFAULT 'active',
+    config_mode TEXT NOT NULL DEFAULT 'manual',
+    config_scope TEXT NOT NULL DEFAULT 'user',
+    config_location TEXT,
+    config_status TEXT NOT NULL DEFAULT 'not_configured',
+    credential_ref TEXT NOT NULL,
+    token_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_seen_at TEXT,
+    revoked_at TEXT,
+    notes TEXT
+);
+
+CREATE TABLE IF NOT EXISTS agent_client_permissions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_id TEXT NOT NULL,
+    capability TEXT NOT NULL,
+    effect TEXT NOT NULL,
+    account_id TEXT NOT NULL DEFAULT '',
+    workspace_id TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(client_id) REFERENCES agent_clients(client_id) ON DELETE CASCADE,
+    UNIQUE(client_id, capability, effect, account_id, workspace_id)
+);
+
+CREATE TABLE IF NOT EXISTS agent_client_config_backups (
+    backup_id TEXT PRIMARY KEY,
+    client_id TEXT NOT NULL,
+    target_type TEXT NOT NULL,
+    original_path TEXT NOT NULL,
+    backup_path TEXT NOT NULL,
+    original_hash TEXT NOT NULL,
+    applied_hash TEXT,
+    created_at TEXT NOT NULL,
+    restored_at TEXT,
+    status TEXT NOT NULL,
+    FOREIGN KEY(client_id) REFERENCES agent_clients(client_id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS mail_packages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     package_id TEXT NOT NULL UNIQUE,
@@ -459,6 +506,12 @@ CREATE INDEX IF NOT EXISTS idx_mcp_audit_called
     ON mcp_audit_events(called_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_mcp_audit_tool
     ON mcp_audit_events(tool_name, called_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_clients_type
+    ON agent_clients(client_type, state, enabled);
+CREATE INDEX IF NOT EXISTS idx_agent_permissions_client
+    ON agent_client_permissions(client_id, capability, enabled);
+CREATE INDEX IF NOT EXISTS idx_agent_backups_client
+    ON agent_client_config_backups(client_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_receive_retries_next_retry
     ON receive_retries(next_retry_at);
 CREATE INDEX IF NOT EXISTS idx_receive_rule_evaluations_time
@@ -511,6 +564,17 @@ _MCP_CALLS_NEW_COLUMNS = {
     "staging_failure_reason": "TEXT",
 }
 
+_MCP_AUDIT_AGENT_COLUMNS = {
+    "client_id": "TEXT",
+    "client_type": "TEXT",
+    "display_name_snapshot": "TEXT",
+    "capability": "TEXT",
+    "account_id": "TEXT",
+    "workspace_id": "TEXT",
+    "deny_reason_code": "TEXT",
+    "correlation_id": "TEXT",
+}
+
 _MAIL_PACKAGES_V13_COLUMNS = {
     # 早期试验库可能已有 mail_packages 但尚无 provider id；正式 v1.2.1
     # 已包含该列。把它纳入幂等迁移，保证后续唯一索引始终安全创建。
@@ -545,6 +609,8 @@ _MAIL_ACCOUNTS_V141_COLUMNS = {
 
 MULTI_ACCOUNT_MIGRATION_KEY = "multi_account_core_v1"
 MULTI_ACCOUNT_SCHEMA_VERSION = 3
+AGENT_INTEGRATION_MIGRATION_KEY = "agent_integration_permission_v1"
+AGENT_INTEGRATION_SCHEMA_VERSION = 1
 LEGACY_UNKNOWN_ACCOUNT_ID = stable_account_id("generic", "legacy-unknown")
 
 RECEIVE_RETRY_DELAYS_SECONDS = (60, 300, 1800, 7200)
@@ -571,6 +637,7 @@ def init_db(
             _migrate_received_files(conn)
             _migrate_sent_files(conn)
             _migrate_mcp_calls(conn)
+            _migrate_agent_integration(conn)
             _migrate_mail_packages_v13(conn)
             _migrate_mail_packages_v14(conn)
             _migrate_outbound_messages_v14(conn)
@@ -644,6 +711,44 @@ def _migrate_mcp_calls(conn: sqlite3.Connection) -> None:
     for col, col_type in _MCP_CALLS_NEW_COLUMNS.items():
         if col not in existing:
             conn.execute(f"ALTER TABLE mcp_calls ADD COLUMN {col} {col_type}")
+
+
+def _migrate_agent_integration(conn: sqlite3.Connection) -> None:
+    """补充 Client 审计字段并登记一次幂等权限地基迁移。"""
+    _add_missing_columns(conn, "mcp_audit_events", _MCP_AUDIT_AGENT_COLUMNS)
+    now = _now()
+    details = json.dumps(
+        {
+            "client_tables": 3,
+            "mail_packages_moved": False,
+            "raw_or_hash_rewritten": False,
+            "legacy_anonymous_grant_created": False,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    conn.execute(
+        """
+        INSERT INTO migration_metadata
+            (migration_key, schema_version, status, details_json,
+             started_at, completed_at, updated_at)
+        VALUES (?, ?, 'completed', ?, ?, ?, ?)
+        ON CONFLICT(migration_key) DO UPDATE SET
+            schema_version=excluded.schema_version,
+            status='completed',
+            details_json=excluded.details_json,
+            completed_at=excluded.completed_at,
+            updated_at=excluded.updated_at
+        """,
+        (
+            AGENT_INTEGRATION_MIGRATION_KEY,
+            AGENT_INTEGRATION_SCHEMA_VERSION,
+            details,
+            now,
+            now,
+            now,
+        ),
+    )
 
 
 def _migrate_mail_packages_v13(conn: sqlite3.Connection) -> None:
@@ -1821,6 +1926,53 @@ def multi_account_migration_needed(db_path: Path | str) -> bool:
         connection.close()
 
 
+def agent_integration_migration_needed(db_path: Path | str) -> bool:
+    """判断旧库是否需要在初始化前创建一次可恢复备份。"""
+    path = Path(db_path)
+    if not path.is_file():
+        return False
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    try:
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "mail_packages" not in tables:
+            return False
+        required = {
+            "agent_clients",
+            "agent_client_permissions",
+            "agent_client_config_backups",
+        }
+        if not required.issubset(tables):
+            return True
+        audit_columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(mcp_audit_events)"
+            ).fetchall()
+        }
+        if not set(_MCP_AUDIT_AGENT_COLUMNS).issubset(audit_columns):
+            return True
+        if "migration_metadata" not in tables:
+            return True
+        row = connection.execute(
+            "SELECT status, schema_version FROM migration_metadata "
+            "WHERE migration_key = ?",
+            (AGENT_INTEGRATION_MIGRATION_KEY,),
+        ).fetchone()
+        return (
+            not row
+            or row["status"] != "completed"
+            or int(row["schema_version"]) < AGENT_INTEGRATION_SCHEMA_VERSION
+        )
+    finally:
+        connection.close()
+
+
 def sync_mail_accounts(
     db_path: Path | str, accounts: Iterable[MailAccount]
 ) -> list[dict[str, Any]]:
@@ -2916,6 +3068,262 @@ def query_recent_sent_files(
 
 
 # ============================================================
+# Agent Client identity / permission foundation
+
+
+def create_agent_client(
+    db_path: Path | str,
+    *,
+    client_id: str,
+    client_type: str,
+    display_name: str,
+    config_mode: str,
+    config_scope: str,
+    credential_ref: str,
+    token_hash: str,
+    enabled: bool = False,
+    notes: str | None = None,
+) -> dict[str, Any]:
+    now = _now()
+    with _get_conn(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO agent_clients
+                (client_id, client_type, display_name, enabled, state,
+                 config_mode, config_scope, config_status, credential_ref,
+                 token_hash, created_at, updated_at, notes)
+            VALUES (?, ?, ?, ?, 'active', ?, ?, 'not_configured', ?, ?, ?, ?, ?)
+            """,
+            (
+                client_id,
+                client_type,
+                display_name,
+                1 if enabled else 0,
+                config_mode,
+                config_scope,
+                credential_ref,
+                token_hash,
+                now,
+                now,
+                notes,
+            ),
+        )
+        conn.commit()
+    return get_agent_client(db_path, client_id) or {}
+
+
+def get_agent_client(
+    db_path: Path | str, client_id: str
+) -> dict[str, Any] | None:
+    with _get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM agent_clients WHERE client_id = ?", (client_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    result["enabled"] = bool(result.get("enabled"))
+    return result
+
+
+def query_agent_clients(
+    db_path: Path | str, *, include_revoked: bool = True
+) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM agent_clients"
+    params: tuple[Any, ...] = ()
+    if not include_revoked:
+        sql += " WHERE state != ?"
+        params = ("revoked",)
+    sql += " ORDER BY created_at, client_id"
+    with _get_conn(db_path) as conn:
+        rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
+    for row in rows:
+        row["enabled"] = bool(row.get("enabled"))
+    return rows
+
+
+def update_agent_client(
+    db_path: Path | str,
+    client_id: str,
+    **changes: Any,
+) -> dict[str, Any] | None:
+    allowed = {
+        "display_name",
+        "enabled",
+        "state",
+        "config_mode",
+        "config_scope",
+        "config_location",
+        "config_status",
+        "token_hash",
+        "last_seen_at",
+        "revoked_at",
+        "notes",
+    }
+    values = {key: value for key, value in changes.items() if key in allowed}
+    if not values:
+        return get_agent_client(db_path, client_id)
+    if "enabled" in values:
+        values["enabled"] = 1 if values["enabled"] else 0
+    values["updated_at"] = _now()
+    assignments = ", ".join(f"{key} = ?" for key in values)
+    with _get_conn(db_path) as conn:
+        conn.execute(
+            f"UPDATE agent_clients SET {assignments} WHERE client_id = ?",
+            (*values.values(), client_id),
+        )
+        conn.commit()
+    return get_agent_client(db_path, client_id)
+
+
+def replace_agent_client_permissions(
+    db_path: Path | str,
+    client_id: str,
+    rows: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    now = _now()
+    normalized = [
+        {
+            "capability": str(row.get("capability") or ""),
+            "effect": str(row.get("effect") or "allow"),
+            "account_id": str(row.get("account_id") or ""),
+            "workspace_id": str(row.get("workspace_id") or ""),
+            "enabled": 1 if row.get("enabled", True) else 0,
+        }
+        for row in rows
+    ]
+    with _get_conn(db_path) as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "DELETE FROM agent_client_permissions WHERE client_id = ?",
+                (client_id,),
+            )
+            for row in normalized:
+                conn.execute(
+                    """
+                    INSERT INTO agent_client_permissions
+                        (client_id, capability, effect, account_id,
+                         workspace_id, enabled, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        client_id,
+                        row["capability"],
+                        row["effect"],
+                        row["account_id"],
+                        row["workspace_id"],
+                        row["enabled"],
+                        now,
+                        now,
+                    ),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return query_agent_client_permissions(db_path, client_id)
+
+
+def query_agent_client_permissions(
+    db_path: Path | str, client_id: str
+) -> list[dict[str, Any]]:
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM agent_client_permissions
+            WHERE client_id = ?
+            ORDER BY capability, account_id, workspace_id, effect
+            """,
+            (client_id,),
+        ).fetchall()
+    result = [dict(row) for row in rows]
+    for row in result:
+        row["enabled"] = bool(row.get("enabled"))
+    return result
+
+
+def insert_agent_config_backup(
+    db_path: Path | str,
+    *,
+    backup_id: str,
+    client_id: str,
+    target_type: str,
+    original_path: str,
+    backup_path: str,
+    original_hash: str,
+    applied_hash: str | None,
+    status: str,
+) -> dict[str, Any]:
+    with _get_conn(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO agent_client_config_backups
+                (backup_id, client_id, target_type, original_path, backup_path,
+                 original_hash, applied_hash, created_at, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                backup_id,
+                client_id,
+                target_type,
+                original_path,
+                backup_path,
+                original_hash,
+                applied_hash,
+                _now(),
+                status,
+            ),
+        )
+        conn.commit()
+    return get_agent_config_backup(db_path, backup_id) or {}
+
+
+def get_agent_config_backup(
+    db_path: Path | str, backup_id: str
+) -> dict[str, Any] | None:
+    with _get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM agent_client_config_backups WHERE backup_id = ?",
+            (backup_id,),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def query_agent_config_backups(
+    db_path: Path | str, client_id: str
+) -> list[dict[str, Any]]:
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM agent_client_config_backups
+            WHERE client_id = ?
+            ORDER BY created_at DESC, backup_id DESC
+            """,
+            (client_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def update_agent_config_backup(
+    db_path: Path | str,
+    backup_id: str,
+    *,
+    status: str,
+    restored_at: str | None = None,
+) -> None:
+    with _get_conn(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE agent_client_config_backups
+            SET status = ?, restored_at = ?
+            WHERE backup_id = ?
+            """,
+            (status, restored_at, backup_id),
+        )
+        conn.commit()
+
+
 # mcp_calls
 # ============================================================
 
@@ -3040,6 +3448,14 @@ def insert_mcp_audit_event(
     ensure_fresh: bool = False,
     sync_triggered: bool = False,
     details: dict[str, Any] | None = None,
+    client_id: str | None = None,
+    client_type: str | None = None,
+    display_name_snapshot: str | None = None,
+    capability: str | None = None,
+    account_id: str | None = None,
+    workspace_id: str | None = None,
+    deny_reason_code: str | None = None,
+    correlation_id: str | None = None,
 ) -> int:
     """记录统一 MCP 审计；查询和详情均不保存正文或资源内容。"""
     safe_query = " ".join(str(query_summary or "").split())[:500] or None
@@ -3053,8 +3469,11 @@ def insert_mcp_audit_event(
                  client_name, session_id, request_id, query_summary, mail_id,
                  resource_id, result_count, target_summary, source_path,
                  prepared_path, status, error_code, duration_ms, bytes_returned,
-                 cached, ensure_fresh, sync_triggered, details_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 cached, ensure_fresh, sync_triggered, details_json, client_id,
+                 client_type, display_name_snapshot, capability, account_id,
+                 workspace_id, deny_reason_code, correlation_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 call_id, called_at, completed_at, tool_name, operation_type,
@@ -3064,6 +3483,8 @@ def insert_mcp_audit_event(
                 max(0, int(bytes_returned)), 1 if cached else 0,
                 1 if ensure_fresh else 0, 1 if sync_triggered else 0,
                 details_json,
+                client_id, client_type, display_name_snapshot, capability,
+                account_id, workspace_id, deny_reason_code, correlation_id,
             ),
         )
         conn.commit()
