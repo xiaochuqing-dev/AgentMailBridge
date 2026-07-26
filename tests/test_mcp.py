@@ -100,8 +100,8 @@ def test_mcp_history_hides_legacy_outside_path(tmp_cfg, tmp_path):
     assert row["file_path_status"] == "unsafe_path"
 
 
-def test_mcp_lifecycle_and_tool_schema(tmp_cfg):
-    server = McpServer(ApplicationService(tmp_cfg))
+def test_mcp_lifecycle_and_tool_schema(tmp_cfg, mcp_server_factory):
+    server, _client_id, _token = mcp_server_factory(tmp_cfg)
     before_init = server.handle_message(
         {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
     )
@@ -137,7 +137,9 @@ def test_mcp_lifecycle_and_tool_schema(tmp_cfg):
     assert tool["inputSchema"]["additionalProperties"] is False
 
 
-def test_mcp_tool_call_success_and_duplicate(tmp_cfg, monkeypatch):
+def test_mcp_tool_call_success_and_duplicate(
+    tmp_cfg, monkeypatch, mcp_server_factory
+):
     source = tmp_cfg.data_root_path / "mcp-tool-result.md"
     source.write_text("result", encoding="utf-8")
     smtp_calls = []
@@ -145,7 +147,7 @@ def test_mcp_tool_call_success_and_duplicate(tmp_cfg, monkeypatch):
         "agent_mail_bridge.mail_send._smtp_send_with_stage",
         lambda cfg, message: smtp_calls.append(message),
     )
-    server = McpServer(ApplicationService(tmp_cfg))
+    server, _client_id, _token = mcp_server_factory(tmp_cfg)
     server.initialized = True
     arguments = {
         "file_path": str(source),
@@ -177,8 +179,10 @@ def test_mcp_tool_call_success_and_duplicate(tmp_cfg, monkeypatch):
     assert len(smtp_calls) == 1
 
 
-def test_mcp_rejects_recipient_argument_and_audits(tmp_cfg):
-    server = McpServer(ApplicationService(tmp_cfg))
+def test_mcp_rejects_recipient_argument_and_audits(
+    tmp_cfg, mcp_server_factory
+):
+    server, _client_id, _token = mcp_server_factory(tmp_cfg)
     server.initialized = True
     response = server.handle_message(
         {
@@ -208,7 +212,7 @@ def test_mcp_rate_limit_has_sixty_second_window():
     assert limiter.allow(61.0) is True
 
 
-def test_mcp_stdio_subprocess_outputs_only_json(tmp_path):
+def test_mcp_stdio_subprocess_outputs_only_json(tmp_cfg, mcp_server_factory):
     messages = [
         {
             "jsonrpc": "2.0",
@@ -224,8 +228,11 @@ def test_mcp_stdio_subprocess_outputs_only_json(tmp_path):
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
     ]
     env = os.environ.copy()
+    _server, client_id, token = mcp_server_factory(tmp_cfg)
     env["AGENT_MAIL_BRIDGE_DISABLE_DOTENV"] = "1"
-    env["DATA_ROOT"] = str(tmp_path / "data")
+    env["DATA_ROOT"] = str(tmp_cfg.data_root_path)
+    env["AGENT_MAIL_BRIDGE_CLIENT_ID"] = client_id
+    env["AGENT_MAIL_BRIDGE_CLIENT_TOKEN"] = token
     completed = subprocess.run(
         [sys.executable, "-m", "agent_mail_bridge.mcp_server"],
         input="".join(json.dumps(item) + "\n" for item in messages),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -13,6 +14,9 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from agent_mail_bridge.application_service import ApplicationService
+from agent_mail_bridge.config import AppConfig
+from agent_mail_bridge.database import close_connection
 from agent_mail_bridge.version import __version__
 
 
@@ -36,8 +40,37 @@ def main() -> int:
                 "GMAIL_ADDRESS": "user@example.com",
                 "OWNER_GMAIL": "owner@example.com",
                 "QQ_EMAIL": "sender@example.com",
+                "MCP_MAIL_READ_ENABLED": "false",
             }
         )
+        os.environ["AGENT_MAIL_BRIDGE_DISABLE_CREDENTIAL_STORE"] = "1"
+        cfg = AppConfig(
+            gmail_address="user@example.com",
+            owner_gmail="owner@example.com",
+            qq_email="sender@example.com",
+            data_root=data_root,
+        )
+        service = ApplicationService(cfg)
+        service.synchronize_mail_accounts()
+        accounts = service.list_mail_accounts().details.get("accounts", [])
+        created = service.create_agent_client(
+            client_type="custom",
+            display_name="packaged smoke",
+            capabilities=["mail.search", "result.submit"],
+            account_ids=[str(row["account_id"]) for row in accounts],
+        )
+        if not created.ok:
+            raise SystemExit("无法创建 packaged smoke Client")
+        client_id = str(created.details["client"]["client_id"])
+        client_token = str(created.details["scoped_token"])
+        activated = service.set_agent_client_state(
+            client_id, "active", enabled=True
+        )
+        if not activated.ok:
+            raise SystemExit("无法启用 packaged smoke Client")
+        close_connection()
+        env["AGENT_MAIL_BRIDGE_CLIENT_ID"] = client_id
+        env["AGENT_MAIL_BRIDGE_CLIENT_TOKEN"] = client_token
         requests = [
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
             {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
@@ -104,7 +137,7 @@ def main() -> int:
         if result["status"] != "path_not_allowed":
             raise SystemExit(f"MCP 路径边界异常：{result['status']}")
         read_denied = by_id[6]["result"]["structuredContent"]
-        if read_denied.get("error_code") != "read_access_disabled":
+        if read_denied.get("error_code") != "agent_access_disabled":
             raise SystemExit("MCP 读取默认关闭边界异常")
         if by_id[None].get("error", {}).get("code") != -32700:
             raise SystemExit("MCP malformed JSON 未返回 parse error")
@@ -112,6 +145,8 @@ def main() -> int:
             raise SystemExit("MCP 未知 method 未返回 method not found")
         if "Traceback" in completed.stderr:
             raise SystemExit("MCP stderr 出现异常回溯")
+        close_connection()
+        logging.shutdown()
     print("packaged MCP smoke PASS")
     return 0
 

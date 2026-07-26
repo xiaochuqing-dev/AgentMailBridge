@@ -150,7 +150,7 @@ def test_mcp_staging_detects_copy_mismatch(tmp_cfg, monkeypatch):
     smtp.assert_not_called()
 
 
-def test_mcp_bom_malformed_method_flush_and_eof(tmp_cfg):
+def test_mcp_bom_malformed_method_flush_and_eof(tmp_cfg, mcp_server_factory):
     messages = [
         "\ufeff" + json.dumps({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -161,11 +161,9 @@ def test_mcp_bom_malformed_method_flush_and_eof(tmp_cfg):
         json.dumps({"jsonrpc": "2.0", "id": 2, "method": "unknown"}),
     ]
     output = _FlushStream()
-    server = McpServer(
-        ApplicationService(tmp_cfg),
-        input_stream=io.StringIO("\n".join(messages) + "\n"),
-        output_stream=output,
-    )
+    server, _client_id, _token = mcp_server_factory(tmp_cfg)
+    server.input_stream = io.StringIO("\n".join(messages) + "\n")
+    server.output_stream = output
 
     assert server.serve() == 0
     responses = [json.loads(line) for line in output.getvalue().splitlines()]

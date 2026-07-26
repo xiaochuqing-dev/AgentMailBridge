@@ -6,8 +6,8 @@ param(
     [string]$NewSourceDir,
     [Parameter(Mandatory = $true)]
     [string]$OutputDir,
-    [string]$OldVersion = "1.4.4",
-    [string]$NewVersion = "1.4.5"
+    [string]$OldVersion = "1.4.5",
+    [string]$NewVersion = "1.5.0"
 )
 
 $ErrorActionPreference = "Stop"

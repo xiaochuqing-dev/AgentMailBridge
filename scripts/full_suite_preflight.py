@@ -12,14 +12,18 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from agent_mail_bridge.database import MULTI_ACCOUNT_SCHEMA_VERSION
+from agent_mail_bridge.database import (
+    AGENT_INTEGRATION_SCHEMA_VERSION,
+    MULTI_ACCOUNT_SCHEMA_VERSION,
+)
 from agent_mail_bridge.provider_adapters import get_provider_adapter
 from agent_mail_bridge.provider_foundation import PROVIDER_PROFILES
 from agent_mail_bridge.version import __version__
 
 
-TARGET_VERSION = "1.4.5"
+TARGET_VERSION = "1.5.0"
 TARGETED_TESTS = (
+    "tests/test_v1_5_agent_integration.py",
     "tests/test_v1_4_5_release_lifecycle.py",
     "tests/test_v1_4_3_provider_hardening.py",
     "tests/test_v1_4_2_generic_mail.py",
@@ -47,7 +51,7 @@ def _run(command: list[str], label: str) -> None:
 
 
 def _check_version_consistency() -> None:
-    _require(__version__ == TARGET_VERSION, "version.py is not v1.4.5")
+    _require(__version__ == TARGET_VERSION, "version.py is not v1.5.0")
     version_tuple = tuple(int(part) for part in TARGET_VERSION.split(".")) + (0,)
     tuple_text = ", ".join(str(part) for part in version_tuple)
     for relative in (
@@ -129,10 +133,20 @@ def _check_schema_consistency() -> None:
         MULTI_ACCOUNT_SCHEMA_VERSION == 3,
         "unexpected Multi-Account schema version",
     )
+    _require(
+        AGENT_INTEGRATION_SCHEMA_VERSION == 1,
+        "unexpected Agent Integration schema version",
+    )
     runtime_tests = _text("tests/test_v1_4_1_multi_account_runtime.py")
     _require(
         "assert schema_version == 3" in runtime_tests,
         "schema migration assertion is stale",
+    )
+    agent_tests = _text("tests/test_v1_5_agent_integration.py")
+    _require(
+        "unknown_client" in agent_tests
+        and "config_changed_concurrently" in agent_tests,
+        "Agent identity/config safety assertions are missing",
     )
     print("PASS schema consistency")
 

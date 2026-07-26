@@ -307,7 +307,9 @@ def test_process_lock_is_released_when_owner_process_exits(tmp_path):
             owner.wait(timeout=10)
 
 
-def test_mcp_tools_structured_output_and_audit_omit_content(tmp_cfg):
+def test_mcp_tools_structured_output_and_audit_omit_content(
+    tmp_cfg, mcp_server_factory
+):
     today = datetime.now().strftime("%Y-%m-%d")
     tmp_cfg.mcp_mail_read_enabled = True
     package_id = _archive_mail(
@@ -317,7 +319,7 @@ def test_mcp_tools_structured_output_and_audit_omit_content(tmp_cfg):
         body="不得进入审计的私密正文标记-XYZ",
         received_at=f"{today} 12:00:00",
     )
-    server = McpServer(ApplicationService(tmp_cfg))
+    server, _client_id, _token = mcp_server_factory(tmp_cfg)
     server.initialized = True
     listed = server.handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
     names = [item["name"] for item in listed["result"]["tools"]]
@@ -340,8 +342,10 @@ def test_mcp_tools_structured_output_and_audit_omit_content(tmp_cfg):
     assert "私密正文标记-XYZ" not in json.dumps(audit, ensure_ascii=False)
 
 
-def test_mcp_read_disabled_returns_stable_error_but_sync_status_is_available(tmp_cfg):
-    server = McpServer(ApplicationService(tmp_cfg))
+def test_mcp_read_disabled_returns_stable_error_but_sync_status_is_available(
+    tmp_cfg, mcp_server_factory
+):
+    server, _client_id, _token = mcp_server_factory(tmp_cfg)
     server.initialized = True
     denied = server.handle_message(
         {
@@ -351,7 +355,7 @@ def test_mcp_read_disabled_returns_stable_error_but_sync_status_is_available(tmp
             "params": {"name": "search_mails", "arguments": {"time_scope": "today"}},
         }
     )
-    assert denied["result"]["structuredContent"]["error_code"] == "read_access_disabled"
+    assert denied["result"]["structuredContent"]["error_code"] == "agent_access_disabled"
     status = server.handle_message(
         {
             "jsonrpc": "2.0",
@@ -363,7 +367,9 @@ def test_mcp_read_disabled_returns_stable_error_but_sync_status_is_available(tmp
     assert status["result"]["isError"] is False
 
 
-def test_real_stdio_protocol_reads_and_prepares_archived_resource(tmp_cfg, tmp_path):
+def test_real_stdio_protocol_reads_and_prepares_archived_resource(
+    tmp_cfg, tmp_path, mcp_server_factory
+):
     today = datetime.now().strftime("%Y-%m-%d")
     package_id = _archive_mail(
         tmp_cfg,
@@ -381,6 +387,8 @@ def test_real_stdio_protocol_reads_and_prepares_archived_resource(tmp_cfg, tmp_p
     )
     workspace = tmp_path / "stdio-workspace"
     workspace.mkdir()
+    tmp_cfg.allowed_send_roots = [workspace]
+    _server, client_id, client_token = mcp_server_factory(tmp_cfg)
     messages = [
         {
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -421,6 +429,8 @@ def test_real_stdio_protocol_reads_and_prepares_archived_resource(tmp_cfg, tmp_p
             "DATA_ROOT": str(tmp_cfg.data_root_path),
             "MCP_MAIL_READ_ENABLED": "true",
             "ALLOWED_SEND_ROOTS": str(workspace),
+            "AGENT_MAIL_BRIDGE_CLIENT_ID": client_id,
+            "AGENT_MAIL_BRIDGE_CLIENT_TOKEN": client_token,
         }
     )
     completed = subprocess.run(

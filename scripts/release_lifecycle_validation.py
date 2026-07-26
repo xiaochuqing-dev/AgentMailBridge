@@ -102,12 +102,60 @@ def _uninstall(install_dir: Path, env: dict[str, str]) -> None:
 
 
 def _packaged_probe(
-    install_dir: Path, env: dict[str, str], expected_version: str
+    install_dir: Path,
+    env: dict[str, str],
+    expected_version: str,
+    *,
+    cfg: AppConfig | None = None,
 ) -> dict[str, bool]:
     gui = install_dir / "AgentMailBridge.exe"
     mcp = install_dir / "AgentMailBridgeMCP.exe"
     version = _run([str(gui), "--version"], env=env).stdout.strip()
     _run([str(gui), "--packaged-self-test"], env=env)
+    probe_env = dict(env)
+    migration_backup_created = True
+    if expected_version == "1.5.0":
+        if cfg is None:
+            raise RuntimeError("v1.5.0 packaged probe 缺少隔离配置")
+        anonymous_env = dict(env)
+        anonymous_env.pop("AGENT_MAIL_BRIDGE_CLIENT_ID", None)
+        anonymous_env.pop("AGENT_MAIL_BRIDGE_CLIENT_TOKEN", None)
+        bootstrap = subprocess.run(
+            [str(mcp)],
+            input=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {
+                            "name": "lifecycle-migration-bootstrap",
+                            "version": "1",
+                        },
+                    },
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            env=anonymous_env,
+            timeout=60,
+            check=False,
+        )
+        if bootstrap.returncode != 0:
+            raise RuntimeError("隔离 MCP migration bootstrap 失败")
+        migration_backup_created = bool(
+            list(
+                (cfg.data_root_path / "backups").glob(
+                    "*before_v1_5_agent_permissions*.db"
+                )
+            )
+        )
+        probe_env.update(_provision_lifecycle_client(cfg))
     requests = [
         {
             "jsonrpc": "2.0",
@@ -136,7 +184,7 @@ def _packaged_probe(
         text=True,
         encoding="utf-8",
         capture_output=True,
-        env=env,
+        env=probe_env,
         timeout=60,
         check=False,
     )
@@ -161,6 +209,7 @@ def _packaged_probe(
         "mcp_sync_status": not bool(by_id.get(3, {}).get("result", {}).get("isError")),
         "mcp_stdout_purity": "Traceback" not in completed.stderr,
         "mcp_eof_exit": completed.returncode == 0,
+        "agent_migration_backup": migration_backup_created,
     }
 
 
@@ -184,13 +233,28 @@ def _baseline_values(home: Path, suffix: str) -> dict[str, str]:
     }
 
 
+def _baseline_config(home: Path, suffix: str) -> AppConfig:
+    values = _baseline_values(home, suffix)
+    return AppConfig(
+        gmail_address=values["GMAIL_ADDRESS"],
+        gmail_receive_backend="gmail_api",
+        gmail_api_credentials_path=Path(values["GMAIL_API_CREDENTIALS_PATH"]),
+        gmail_api_token_path=Path(values["GMAIL_API_TOKEN_PATH"]),
+        gmail_api_scopes=[values["GMAIL_API_SCOPES"]],
+        qq_email=values["QQ_EMAIL"],
+        owner_gmail=values["OWNER_GMAIL"],
+        data_root=Path(values["DATA_ROOT"]),
+        loaded_env_path=home / "Config" / ".env",
+        mcp_mail_read_enabled=False,
+        receive_rule_mode="all_scanned",
+    )
+
+
 def _seed_baseline(
     home: Path, *, suffix: str | None = None
 ) -> tuple[AppConfig, str]:
     suffix = suffix or uuid.uuid4().hex[:10]
     config_path = home / "Config" / ".env"
-    data_root = home / "Data"
-    oauth_root = home / "OAuth"
     values = _baseline_values(home, suffix)
     gmail_address = values["GMAIL_ADDRESS"]
     qq_address = values["QQ_EMAIL"]
@@ -199,19 +263,7 @@ def _seed_baseline(
         values,
         config_path,
     )
-    cfg = AppConfig(
-        gmail_address=gmail_address,
-        gmail_receive_backend="gmail_api",
-        gmail_api_credentials_path=oauth_root / "credentials.json",
-        gmail_api_token_path=oauth_root / "token.json",
-        gmail_api_scopes=["https://www.googleapis.com/auth/gmail.readonly"],
-        qq_email=qq_address,
-        owner_gmail=owner_address,
-        data_root=data_root,
-        loaded_env_path=config_path,
-        mcp_mail_read_enabled=False,
-        receive_rule_mode="all_scanned",
-    )
+    cfg = _baseline_config(home, suffix)
     service = ApplicationService(cfg)
     initialized = service.initialize()
     if not initialized.ok:
@@ -347,6 +399,78 @@ def _seed_baseline(
     return cfg, gmail_id
 
 
+def _seed_baseline_from_source(
+    source_root: Path,
+    home: Path,
+    suffix: str,
+    env: dict[str, str],
+) -> AppConfig:
+    source_root = source_root.resolve()
+    if not (source_root / "agent_mail_bridge" / "version.py").is_file():
+        raise RuntimeError("v1.4.5 基线源码目录无效")
+    code = """
+import sys
+from pathlib import Path
+source_root, home, suffix = sys.argv[1:4]
+sys.path.insert(0, source_root)
+from scripts.release_lifecycle_validation import _close_runtime_handles, _seed_baseline
+try:
+    _seed_baseline(Path(home), suffix=suffix)
+finally:
+    _close_runtime_handles()
+print("BASELINE_SEEDED")
+"""
+    completed = _run(
+        [sys.executable, "-c", code, str(source_root), str(home), suffix],
+        env=env,
+        timeout=300,
+    )
+    if "BASELINE_SEEDED" not in completed.stdout:
+        raise RuntimeError("v1.4.5 基线数据创建未完成")
+    return _baseline_config(home, suffix)
+
+
+def _provision_lifecycle_client(cfg: AppConfig) -> dict[str, str]:
+    previous = os.environ.get("AGENT_MAIL_BRIDGE_DISABLE_CREDENTIAL_STORE")
+    os.environ["AGENT_MAIL_BRIDGE_DISABLE_CREDENTIAL_STORE"] = "1"
+    try:
+        service = ApplicationService(cfg)
+        initialized = service.initialize()
+        if not initialized.ok:
+            raise RuntimeError("隔离 Agent Client 初始化失败")
+        account_ids = [
+            str(item["account_id"])
+            for item in service.list_mail_accounts().details.get("accounts", [])
+            if item.get("removed_at") is None
+        ]
+        created = service.create_agent_client(
+            client_type="custom",
+            display_name="Lifecycle validation",
+            config_mode="manual",
+            capabilities=["sync.status"],
+            account_ids=account_ids[:1],
+        )
+        if not created.ok:
+            raise RuntimeError("隔离 Agent Client 创建失败")
+        client_id = str(created.details["client"]["client_id"])
+        token = str(created.details["scoped_token"])
+        activated = service.set_agent_client_state(
+            client_id, "active", enabled=True
+        )
+        if not activated.ok:
+            raise RuntimeError("隔离 Agent Client 启用失败")
+        return {
+            "AGENT_MAIL_BRIDGE_CLIENT_ID": client_id,
+            "AGENT_MAIL_BRIDGE_CLIENT_TOKEN": token,
+        }
+    finally:
+        _close_runtime_handles()
+        if previous is None:
+            os.environ.pop("AGENT_MAIL_BRIDGE_DISABLE_CREDENTIAL_STORE", None)
+        else:
+            os.environ["AGENT_MAIL_BRIDGE_DISABLE_CREDENTIAL_STORE"] = previous
+
+
 def _snapshot(home: Path, cfg: AppConfig, credential_exists: bool) -> dict[str, Any]:
     with closing(sqlite3.connect(cfg.db_path)) as connection:
         connection.row_factory = sqlite3.Row
@@ -410,6 +534,13 @@ def _snapshot(home: Path, cfg: AppConfig, credential_exists: bool) -> dict[str, 
         "config_exists": (home / "Config" / ".env").is_file(),
         "gui_settings_exists": (home / "Config" / "gui_settings.ini").is_file(),
         "credential_exists": credential_exists,
+        "agent_migration_backup_count": len(
+            list(
+                (cfg.data_root_path / "backups").glob(
+                    "*before_v1_5_agent_permissions*.db"
+                )
+            )
+        ),
     }
 
 
@@ -433,6 +564,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--old-installer", required=True, type=Path)
     parser.add_argument("--new-installer", required=True, type=Path)
+    parser.add_argument("--old-source-dir", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--confirm-isolated-install", action="store_true")
     args = parser.parse_args()
@@ -440,6 +572,7 @@ def main() -> int:
         raise SystemExit("未确认隔离安装生命周期验收")
     old_installer = args.old_installer.resolve()
     new_installer = args.new_installer.resolve()
+    old_source_dir = args.old_source_dir.resolve()
     if not old_installer.is_file() or not new_installer.is_file():
         raise SystemExit("生命周期安装器不存在")
 
@@ -450,8 +583,8 @@ def main() -> int:
         "schema_version": 1,
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "environment": "current Windows user, randomized AppId, isolated app/home paths",
-        "old_version": "1.4.4",
-        "new_version": "1.4.5",
+        "old_version": "1.4.5",
+        "new_version": "1.5.0",
         "production_install_untouched": True,
         "checks": {},
     }
@@ -484,10 +617,13 @@ def main() -> int:
 
             _install(old_installer, install_dir, env)
             final_uninstall_needed = True
-            old_probe = _packaged_probe(install_dir, env, "1.4.4")
+            old_probe = _packaged_probe(install_dir, env, "1.4.5")
             try:
-                cfg, _gmail_id = _seed_baseline(
-                    home, suffix=baseline_suffix
+                cfg = _seed_baseline_from_source(
+                    old_source_dir,
+                    home,
+                    baseline_suffix,
+                    env,
                 )
             finally:
                 _close_runtime_handles()
@@ -498,7 +634,9 @@ def main() -> int:
             )
 
             _install(new_installer, install_dir, env)
-            upgraded_probe = _packaged_probe(install_dir, env, "1.4.5")
+            upgraded_probe = _packaged_probe(
+                install_dir, env, "1.5.0", cfg=cfg
+            )
             after_upgrade = _snapshot(
                 home,
                 cfg,
@@ -516,7 +654,9 @@ def main() -> int:
 
             _install(new_installer, install_dir, env)
             final_uninstall_needed = True
-            reinstall_probe = _packaged_probe(install_dir, env, "1.4.5")
+            reinstall_probe = _packaged_probe(
+                install_dir, env, "1.5.0", cfg=cfg
+            )
             after_reinstall = _snapshot(
                 home,
                 cfg,
@@ -528,6 +668,9 @@ def main() -> int:
                 "old_install": all(old_probe.values()),
                 "upgrade_install": all(upgraded_probe.values()),
                 "db_integrity": after_upgrade["db_integrity"] == "ok",
+                "agent_migration_backup_created": (
+                    after_upgrade["agent_migration_backup_count"] > 0
+                ),
                 "upgrade_persistence": _same_persistent_facts(
                     before, after_upgrade
                 ),

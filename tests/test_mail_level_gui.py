@@ -241,9 +241,10 @@ def test_composer_sends_body_three_attachments_and_two_links_as_one_call(
 def test_agent_page_is_unified_without_legacy_delivery_template(mail_gui_window):
     page = mail_gui_window.pages["agent"]
     text = _page_text(page)
-    assert "复制 MCP 配置" in text
-    assert "查看接入说明" in text
-    assert "MCP 自检" in text
+    assert "连接 Codex" in text
+    assert "连接 Claude Code" in text
+    assert "连接 Claude Desktop" in text
+    assert "自定义 MCP Client" in text
     assert "复制收件示例指令" in text
     assert "复制发件示例指令" in text
     assert "复制交付指令" not in text
@@ -297,7 +298,7 @@ def test_recent_sent_table_uses_stretch_columns_and_no_small_fixed_height(mail_g
     assert header.sectionResizeMode(1).name == "Stretch"
     assert mail_gui_window.sent_table.maximumHeight() >= 16_777_215
     assert "Agent 发件 / MCP" not in _page_text(mail_gui_window.pages["send"])
-    assert mail_gui_window.nav_buttons["agent"].text() == "Agent / MCP"
+    assert mail_gui_window.nav_buttons["agent"].text() == "Agent 接入"
 
 
 def test_agent_navigation_is_joined_and_send_resource_rows_have_no_cell_selection(mail_gui_window):

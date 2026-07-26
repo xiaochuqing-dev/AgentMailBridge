@@ -69,3 +69,49 @@ def tmp_cfg(tmp_path: Path) -> AppConfig:
     setup_logging(cfg.logs_dir, "DEBUG", force=True)
     yield cfg
     close_connection()
+
+
+@pytest.fixture()
+def mcp_server_factory():
+    """为旧 MCP 回归用例创建显式授权的 v1.5 Client。"""
+
+    def create(cfg: AppConfig):
+        from agent_mail_bridge.application_service import ApplicationService
+        from agent_mail_bridge.mcp_server import McpServer
+
+        service = ApplicationService(cfg)
+        service.synchronize_mail_accounts()
+        accounts = service.list_mail_accounts().details.get("accounts", [])
+        workspaces = service.list_agent_workspaces().details.get(
+            "workspace_details", []
+        )
+        created = service.create_agent_client(
+            client_type="custom",
+            display_name="pytest MCP Client",
+            capabilities=[
+                "mail.search",
+                "mail.get",
+                "resource.read",
+                "resource.prepare",
+                "sync.status",
+                "sync.ensure_fresh",
+                "workspace.list",
+                "result.submit",
+            ],
+            account_ids=[str(row["account_id"]) for row in accounts],
+            workspace_ids=[str(row["workspace_id"]) for row in workspaces],
+        )
+        assert created.ok, created.message
+        client_id = str(created.details["client"]["client_id"])
+        token = str(created.details["scoped_token"])
+        activated = service.set_agent_client_state(
+            client_id, "active", enabled=True
+        )
+        assert activated.ok, activated.message
+        return (
+            McpServer(service, client_id=client_id, client_token=token),
+            client_id,
+            token,
+        )
+
+    return create
