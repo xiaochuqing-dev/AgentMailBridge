@@ -194,8 +194,10 @@ P2：2。Generic 独立第三方真实 E2E 未执行；本阶段未重复人工 
 
 `35d03f48b6c3aeba667c3dbfa739c71f5ba76a99`：`fix: close v1.4.5 release lifecycle baseline`，包含产品修复、版本、安装/MCP 验收脚本、测试与用户文档。
 
-专项报告提交与最终状态回写将在后续文档提交中记录。
+`2cda0d30507381699e1cde7e7ae7df06d0d5f046`：`docs: add v1.4.5 closure report`，包含本专项报告及发布检查清单状态。
+
+最终 push 状态回写由当前文档提交完成，以仓库最终 HEAD 为准。
 
 ## 48. push status
 
-`35d03f48b6c3aeba667c3dbfa739c71f5ba76a99` 已普通 push 到 `origin/master`。本报告尚待提交与推送；未 force push，未创建 Tag 或 GitHub Release。
+代码和专项报告已普通 push 到 `origin/master`，远端至少包含 `2cda0d30507381699e1cde7e7ae7df06d0d5f046`。未 force push，未创建 Tag 或 GitHub Release。
