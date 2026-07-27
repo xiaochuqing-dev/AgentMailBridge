@@ -46,7 +46,7 @@
 | Unified Inbox | 上层聚合账号 | UI 查询本地缓存 | 核心目标 | 一套 MCP 多账号 | 正式支持 | Mail Facts 和一个 MCP 继续默认跨账号查询；Runtime 底层绝不合并账号状态 |
 | MCP scope | 不适用 | 不适用 | 不适用 | 一个 MCP 管多账号 | 不适用 | 继续一个 MCP；读取允许 account_id 过滤，Agent 发件权限不随 GUI 多账号扩大 |
 
-v1.5.0 在这一结论之上增加 Client account allowlist。一个 Client 只允许一个账号时，省略 account_id 会自动收窄；allowlist 等于全部启用账号时才允许统一视图；其他多账号子集必须显式指定账号。权限只过滤既有 Mail Facts 和 Runtime Router，不复制 Provider Adapter、账号状态或归档逻辑。
+v1.6.0 在这一结论之上增加动态账号范围。`all` 每次解析所有当前启用账号，未来新增账号自动生效；`selected` 只允许保存的显式 ID，旧 Client 保持该语义。权限只过滤既有 Mail Facts 和 Runtime Router，不复制 Provider Adapter、账号状态、历史导入或归档逻辑。
 
 Microsoft 官方资料进一步确认：Exchange Online 的 IMAP、POP、SMTP 现代认证需要 Microsoft Entra OAuth 与各自权限，Graph Mail.Send 也是独立发件权限；桌面应用应使用系统浏览器的授权码流程并配合 PKCE，官方不建议自行拼装低层协议。由此，Outlook 不能被当成“填服务器和密码即可工作”的 Generic 特例。本阶段只保留 planned Adapter；后续必须单独设计 MSAL/PKCE、个人账号与组织租户、管理员同意、Graph 与协议路线及真实租户 E2E。
 

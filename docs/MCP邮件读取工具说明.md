@@ -1,10 +1,10 @@
 # MCP 邮件读取工具说明
 
-v1.5.0 的 QQ、163 与 Gmail 真实归档继续复用同一套 MCP 邮件读取工具和 account_id 过滤，没有新增 Provider 专用 MCP。读取前增加 Client identity、capability、账号和工作区权限；其后仍执行资源 Hash、ownership、路径白名单、UTF-8、stdout purity、EOF 和审计边界。全局读取总开关继续默认关闭。
+v1.6.0 的 QQ、163 与 Gmail 真实归档继续复用同一套七个 MCP 工具和 account_id 过滤，没有新增 Provider 专用 MCP。读取前检查 Client identity、capability、动态/显式账号和资料目录范围；其后仍执行资源 Hash、ownership、路径白名单、UTF-8、stdout purity、EOF 和审计边界。全局读取总开关继续默认关闭。
 
 ## search_mails
 
-输入支持 query、time_scope、recent_days、date_from/date_to、subject、sender、recipient、has_attachments、status、sort、limit、offset、ensure_fresh、allow_cached、`account_id`、兼容 `account_ref` 和 mailbox_ref。省略账号时查询全部归档账号，指定 `account_id` 时严格按账号过滤；同时请求 `ensure_fresh` 时只同步该账号，不替代 GUI 历史补扫。
+输入支持 query、time_scope、recent_days、date_from/date_to、subject、sender、recipient、has_attachments、status、sort、limit、offset、ensure_fresh、allow_cached、`account_id`、兼容 `account_ref` 和 mailbox_ref。省略账号时查询当前 Client 范围内的归档账号，指定 `account_id` 时严格按账号过滤；同时请求 `ensure_fresh` 时只同步该账号，不替代 GUI 历史邮件导入。
 
 ## get_mail
 
@@ -18,11 +18,11 @@ v1.5.0 的 QQ、163 与 Gmail 真实归档继续复用同一套 MCP 邮件读取
 
 ## prepare_mail_resources
 
-输入 mail_id/package_id、1 至 100 个 resource_ids，可选 target_workspace、target_subdir 和 overwrite_policy。target_workspace 接受 `list_agent_workspaces` 返回的 ID 或完整授权路径。输出目标目录、说明文件、每个资源的 prepared_path、size_bytes、sha256、失败项和 success/partial/failed 状态。
+输入 mail_id/package_id、可选 mode、target_workspace、target_subdir 和 overwrite_policy。默认 `mode=resources` 保持旧调用，要求 1 至 100 个 resource_ids。`mode=complete` 不要求 resource_ids，准备正文、raw.eml、邮件信息、附件、邮件内图片、已归档下载和来源 manifest。target_workspace 接受 `list_agent_workspaces` 返回的 ID 或完整授权路径；完整模式只在全部 ownership、路径、大小和 Hash 闭合后原子发布。
 
 ## list_agent_workspaces
 
-无输入。返回 workspace_id、完整 display_path、available 和 default。没有唯一可用工作区时，prepare 返回 workspace_required，不自行猜测目录。
+无输入。返回资料目录的稳定 workspace_id、完整 display_path、available 和 default。没有唯一可用目录时，prepare 返回 workspace_required，不自行猜测。
 
 ## get_mail_sync_status
 
@@ -32,7 +32,7 @@ Gmail、QQ、163 与 Generic 都使用同一个工具和 DTO。指定 `account_i
 
 ## submit_result
 
-输入与既有版本相同：file_path 必填，title 与稳定 request_id 可选，不接受任意 recipient。读取开关关闭不影响发送，实际目标始终由 `OWNER_GMAIL` 控制。成功、duplicate 和 SMTP 已接受但归档失败不会被客户端误判为协议错误；路径、类型、大小、配置、速率和 Hash 失败返回稳定业务状态。
+输入与既有版本相同：file_path 必填，title 与稳定 request_id 可选，不接受任意 recipient。读取开关关闭不影响发送，实际目标始终由 `OWNER_GMAIL` 控制。文件必须同时属于当前 Client 的资料目录范围和全局允许目录；成功、duplicate 和 SMTP 已接受但归档失败不会被客户端误判为协议错误。
 
 ## 通用协议约定
 

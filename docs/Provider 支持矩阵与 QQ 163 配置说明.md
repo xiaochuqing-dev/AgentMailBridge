@@ -10,16 +10,16 @@
 | Generic-Test | 账号级 IMAP/SMTP secret | NOT_TESTED | LIST/SPECIAL-USE 已实现 | implementation ready | 自动化通过，真实 NOT_TESTED | implementation ready | 自动化通过，真实 NOT_TESTED | 自动化通过，真实 NOT_TESTED | 自动化通过，真实 NOT_TESTED | `implementation_ready_e2e_required` |
 | Outlook/Microsoft | 未来 MSAL/PKCE/OAuth | 未实现 | 未实现 | planned | planned | planned | planned | planned | planned | planned |
 
-QQ、163 与 Generic 共用 Generic IMAP/SMTP Core、统一 Mail Package、Mail Facts、调度、重试、历史补扫和 outbound archive。v1.4.4 根据真实证据只在 163 Profile 开启 RFC 2971 IMAP ID，并保持 QQ/163 业务处理、解析、归档与调度共享。Provider profile 只保存服务器默认值和少量差异，不复制协议代码。
+QQ、163 与 Generic 共用 Generic IMAP/SMTP Core、统一 Mail Package、Mail Facts、调度、重试、历史邮件导入和 outbound archive。v1.4.4 根据真实证据只在 163 Profile 开启 RFC 2971 IMAP ID，并保持 QQ/163 业务处理、解析、归档与调度共享。Provider profile 只保存服务器默认值和少量差异，不复制协议代码。
 
-v1.5.0 的 Agent Client 接入不改变 Provider 支持状态。Client 只能在其 account allowlist 内调用同一组七工具；QQ/163 正式支持、Gmail 只读收件、Generic 需第三方真实 E2E、Outlook planned 的结论不变。
+v1.6.0 的 Codex、Claude Code、Hermes、动态范围、历史导入和完整邮件资料不改变 Provider 支持状态。QQ/163 正式支持；Gmail 只读收件且 scope 仍只有 `gmail.readonly`；Generic 需独立第三方真实 E2E；Outlook planned。
 
 ## QQ 配置
 
 1. 在 QQ 邮箱网页设置中启用 IMAP/SMTP 服务并生成授权码。第三方客户端密码填写授权码，不填写 QQ 登录密码。
 2. 在“添加邮箱账号”选择 QQ，填写完整 `@qq.com` 地址和授权码。
 3. 保存后先执行“测试连接”，再执行“发现目录”。连接测试只认证和读取目录，不收件、不发件。
-4. 连接通过后，可在收件页选择该账号立即收取或历史补扫，也可在发件页选择该账号发送一封 GUI 手工邮件。
+4. 连接通过后，可在收件页选择该账号立即收取或导入历史邮件，也可在发件页选择该账号发送一封 GUI 手工邮件。
 
 默认 profile：
 
@@ -48,7 +48,7 @@ v1.5.0 的 Agent Client 接入不改变 Provider 支持状态。Client 只能在
 
 Generic 至少配置 IMAP 或 SMTP 之一。端口必须为 1 至 65535，传输只允许 SSL/TLS 或 STARTTLS，plain 会被拒绝。IMAP 与 SMTP 可使用不同 secret，均按 account_id 存入 Windows Credential Manager。
 
-服务器连接通过并不代表所有邮件行为均兼容。启用自动收件前应验证中文主题、HTML、附件、重复同步、目录和历史补扫；正式发件前应验证收件人拒绝、附件大小和 Sent 行为。AgentMailBridge 只保留本地 outbound/sent archive，不会擅自在远端 Sent 目录追加副本。
+服务器连接通过并不代表所有邮件行为均兼容。启用自动收件前应验证中文主题、HTML、附件、重复同步、目录和历史导入；正式发件前应验证收件人拒绝、附件大小和 Sent 行为。AgentMailBridge 只保留本地 outbound/sent archive，不会擅自在远端 Sent 目录追加副本。
 
 ## 真实验收方法
 

@@ -1,18 +1,18 @@
 # Agent 邮件读取与资源交付设计
 
-v1.5.0 在不改变 DATA_ROOT、授权工作区、固定结果收件人和七工具边界的前提下，增加 Client 身份与确定性权限链。QQ、163 与 Gmail 继续共用统一 account_id、package、resource、raw.eml 和 Hash 事实；没有增加 Provider 专用工具，也没有扩大 Agent 的发送账号或收件人权限。
+v1.6.0 在不改变 DATA_ROOT、固定结果收件人和七工具边界的前提下，把历史邮件和整封邮件资料开放给受权 Agent。QQ、163 与 Gmail 继续共用统一 account_id、package、resource、raw.eml 和 Hash 事实；没有增加 Provider 专用或智能判断工具，也没有扩大 Agent 的发送账号或收件人权限。
 
 ## 产品边界
 
-AgentMailBridge 在同一个 MCP 中使用稳定 Client 身份和账号归属。`search_mails` 只能访问 Client allowlist：单账号时可自动收窄，完整账号集可使用统一视图，其他多账号组合必须显式指定账号。`ensure_fresh` 还需要独立 capability，并通过 Account Runtime Router 同步指定账号，不替代 GUI 历史补扫。
+AgentMailBridge 在同一个 MCP 中使用稳定 Client 身份和账号归属。动态 `all` 范围在每次会话解析当前及以后新增账号/资料目录；`selected` 只使用保存的显式 ID。`ensure_fresh` 还需要独立 capability，并通过 Account Runtime Router 同步指定账号，不替代 GUI“导入历史邮件”。
 
 ## 数据流
 
-Provider Adapter 复用现有 Gmail API/IMAP 收件实现，先完成带 `account_id/mailbox_id` 的 raw、正文、资源和 manifest 原子 package。Agent 调用 `search_mails` 获取稳定 mail_id，再用 `get_mail` 读取有界正文和资源清单。文本与 CSV 可用 `read_mail_resource` 分页读取；图片和文档先获得安全描述，需要 Agent 自身能力处理时由 `prepare_mail_resources` 复制到授权项目工作区。任务结果仍通过兼容的 `submit_result` 回邮。
+Provider Adapter 复用现有 Gmail API/IMAP 收件实现，先完成带 `account_id/mailbox_id` 的 raw、正文、资源和 manifest 原子 package。Agent 调用 `search_mails` 获取稳定 mail_id，再用 `get_mail` 读取有界正文和资源清单。文本与 CSV 可用 `read_mail_resource` 分页读取；指定资源继续使用兼容准备模式，整封邮件使用同一工具的 `mode=complete` 复制到授权资料目录。任务结果仍通过兼容的 `submit_result` 回邮。
 
 ## 授权模型
 
-`MCP_MAIL_READ_ENABLED` 保留为全局 Agent 邮件读取总开关，默认 false。其后依次校验 Client token、active 状态、capability、account allowlist、workspace allowlist，再执行 DATA_ROOT、ownership、路径、大小和 Hash 校验。旧匿名配置不获得隐式权限。Client token 只代表 AgentMailBridge 内的有限权限，不改变 Gmail `gmail.readonly` scope，也不能读取邮箱凭据。
+`MCP_MAIL_READ_ENABLED` 保留为全局 Agent 邮件读取总开关，默认 false。其后依次校验 Client token、active 状态、capability、account 范围、资料目录范围，再执行 DATA_ROOT、ownership、路径、大小和 Hash 校验。旧匿名配置不获得隐式权限。Client token 只代表 AgentMailBridge 内的有限权限，不改变 Gmail `gmail.readonly` scope，也不能读取邮箱凭据。
 
 邮件读取始终以 `DATA_ROOT` 为硬边界。数据库 package_root 和每个资源路径在访问时重新解析，必须位于规范 package 内；资源 ID 必须属于指定邮件，已有 SHA-256 必须匹配。路径事实被篡改、资源缺失或 Hash 不一致都会拒绝。
 
@@ -22,11 +22,11 @@ Provider Adapter 复用现有 Gmail API/IMAP 收件实现，先完成带 `accoun
 
 图片只读取文件头，返回 PNG、JPEG、WebP、GIF 或 BMP 的格式和尺寸。PDF、DOCX、XLSX、PPTX、ZIP、EXE 与未知二进制返回类型、MIME、大小、Hash 和能力描述；桥接器不执行、不解压、不渲染宏。普通链接只返回已归档 URL 事实，不自动访问网页。
 
-## 受控资源准备
+## 受控资源与完整邮件资料准备
 
-工作区来自 `ALLOWED_SEND_ROOTS`，每个路径有稳定 workspace_id。目标固定在 `<workspace>/.agentmailbridge/mail/<mail-id>/`，可增加安全相对子目录。目录逐级解析，现有符号链接、目录联接、绝对路径和 `..` 不能逃逸。复制采用同目录临时文件与原子替换；源事实 Hash、实时源 Hash、目标大小和目标 Hash 必须闭合。默认同名文件自动安全重命名，也可选择 error 或 overwrite。
+Agent 可用资料目录来自 `ALLOWED_SEND_ROOTS`，每个路径有稳定 workspace_id。目标固定在 `<允许目录>/.agentmailbridge/mail/<mail-id>/`，可增加安全相对子目录。目录逐级解析，现有符号链接、目录联接、绝对路径和 `..` 不能逃逸。复制采用同目录临时文件与原子替换；源事实 Hash、实时源 Hash、目标大小和目标 Hash 必须闭合。默认同名目录自动安全重命名，也可选择 error 或 overwrite。
 
-每次准备生成 UTF-8 `邮件说明.md`，包含必要邮件摘要和已准备资源 Hash。准备不会修改正式邮件 package，也不会让工作区反向成为邮件事实源。
+兼容资源模式继续生成 UTF-8 `邮件说明.md`。完整模式生成 `邮件正文.md`、`原始邮件.eml`、`邮件信息.json`、`原始归档manifest.json`、`完整资料manifest.json`、`附件`、`邮件内图片` 和 `下载文件`。邮件信息包含账号归属、发件人、收件人、时间、主题、package_id；manifest 逐项保存 resource_id、来源关系、相对路径、大小和 SHA-256。所有文件先写入短名 staging，完整复核后一次重命名发布；失败清理 staging，内部 package 在前后 Hash 快照中必须不变。
 
 ## 同步与并发
 
@@ -36,4 +36,4 @@ Provider Adapter 复用现有 Gmail API/IMAP 收件实现，先完成带 `accoun
 
 `mcp_audit_events` 统一审计 search、get、read、prepare、workspace、sync 和 send，并与旧 `mcp_calls` 合并查询。正文全文、附件内容、凭据和 OAuth 不进入审计。`submit_result` 的输入、幂等 request_id、`OWNER_GMAIL` 固定目标、白名单、原子 staging 和四段 Hash 链保持兼容；GUI 用户手动填写 To 不会扩大 MCP 权限。
 
-Route B 多邮箱、远程 MCP、任意收件人、邮箱修改、普通网页抓取和附件执行均不在 v1.2.0 范围内。
+远程 MCP、任意收件人、邮箱修改、普通网页抓取、附件执行和 Agent 自动挑选“相关邮件”均不在 v1.6.0 范围内。

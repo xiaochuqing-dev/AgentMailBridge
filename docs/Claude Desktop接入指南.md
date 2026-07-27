@@ -1,11 +1,7 @@
-# Claude Desktop 接入指南
+# Claude Desktop 兼容接入说明
 
-Windows Claude Desktop 配置位于 `%APPDATA%\Claude\claude_desktop_config.json`。在 GUI 的“Agent 接入”中创建 Claude Desktop Client，选择权限，查看脱敏预览并确认写入。
+普通 Claude Desktop 聊天客户端不是 AgentMailBridge v1.6.0 的重点支持对象，状态固定为 `SKIPPED_BY_SCOPE`。推荐使用 Claude Code；两者不得混为同一客户端或用 Claude Code PASS 代替 Desktop PASS。
 
-AgentMailBridge 只合并 `mcpServers.agent-mail-bridge`，保留其他 server 和未知字段，写前保存原文件及 Hash。保存后必须完全退出并重新启动 Claude Desktop，再回到 GUI 点击“测试”。
+为避免破坏存量用户，Windows `%APPDATA%\Claude\claude_desktop_config.json` 的已有兼容适配器继续保留在“其他 Agent”。如用户自行使用，AgentMailBridge 仍只合并 `mcpServers.agent-mail-bridge`，写前备份并检测并发变化。
 
-配置损坏、路径无法识别、并发修改或版本不确定时会拒绝覆盖并退化为辅助配置。未安装 Claude Desktop 时，状态只能记为 PACKAGED_CONFIG_PASS 或 NOT_TESTED，不能写成真实 Client PASS。
-
-暂停或撤销后后续调用立即拒绝；撤销只移除 AgentMailBridge 项，配置备份可手动恢复。
-
-官方依据：https://modelcontextprotocol.io/docs/develop/connect-local-servers
+本阶段不做专门开发、真实 E2E 或阻断验收，也不因该入口单独重复运行长测试。配置损坏、路径无法识别或版本不确定时安全退化为辅助配置；撤销仍只移除 AgentMailBridge 自身项。

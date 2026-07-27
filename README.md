@@ -1,12 +1,14 @@
 # AgentMailBridge
 
-AgentMailBridge v1.5.0 是面向个人用户的本地优先 Windows 邮箱桥接工具，也是 Claude Code、Codex、Claude Desktop 和其他 MCP Client 的确定性邮件事实后端。它不内置大模型，不理解自然语言，也不替 Agent 判断邮件相关性；用户在 GUI 中连接和授权 Agent，Agent 自己调用七个事实工具。
+AgentMailBridge v1.6.0 是面向个人用户的本地优先 Windows 邮箱桥接工具，也是 Codex、Claude Code 和 Hermes 共用的确定性邮件事实后端。邮箱只需接入一次；Agent 不获得邮箱密码或 OAuth Token，只通过七个事实工具搜索、读取和准备用户明确选择的邮件。普通 Claude Desktop 聊天客户端仅保留兼容接入，不是本阶段重点。
 
-每个 Agent Client 使用稳定 `client_id`、独立 scoped token、独立 capability、邮箱账号 allowlist 和工作区 allowlist。未知、暂停或撤销 Client 默认拒绝；邮箱密码、QQ/163 授权码和 Gmail OAuth Token 不会交给 Agent。项目不提供多租户、Agent 任意外发、通用 Gmail MCP、遥测或云同步。GUI 手动发件可明确填写一个合法收件人；MCP `submit_result` 仍固定受 `OWNER_GMAIL` 控制。
+每封邮件形成一个包含真实 `raw.eml`、可读正文、附件、邮件内图片、受控下载和来源 Hash 的本地事实包。用户可导入接入前的历史邮件，也可把整封邮件的完整资料原子复制到允许目录供 Agent 处理，内部归档保持不变。
+
+每个 Agent Client 使用稳定 `client_id`、独立 scoped token 和确定性权限。首次连接默认使用“推荐权限”：当前及以后新增的邮箱和资料目录自动可用，搜索、读取、按需刷新和完整资料准备开启，主动发送/结果提交关闭。完全信任和自定义模式仍受固定收件人、`DATA_ROOT`、ownership 与 Hash 边界约束。未知、暂停或撤销 Client 默认拒绝。
 
 ## Multi-Account Runtime
 
-`MailAccount` 使用 provider 与规范化邮箱地址生成稳定、不含明文地址的 `account_id`，并单独声明认证类型、收件/发件开关、能力和数据命名空间。账号可创建、编辑、启停和保守移除；移除默认保留历史邮件、附件、发件记录与审计，并让用户单独选择是否清理该账号凭据或 OAuth Token。GUI 可添加同 Provider 的多个账号，手工收件、历史补扫、连接测试和 GUI 发件均可明确选择账号。
+`MailAccount` 使用 provider 与规范化邮箱地址生成稳定、不含明文地址的 `account_id`，并单独声明认证类型、收件/发件开关、能力和数据命名空间。账号可创建、编辑、启停和保守移除；移除默认保留历史邮件、附件、发件记录与审计，并让用户单独选择是否清理该账号凭据或 OAuth Token。GUI 可添加同 Provider 的多个账号，手工收件、历史邮件导入、连接测试和 GUI 发件均可明确选择账号。
 
 Account Runtime Router 由 `account_id` 解析 Provider Adapter、运行配置、Credential Manager key 和 OAuth 文件。新账号秘密不扩张为 `GMAIL_1/QQ_2` 环境变量，也不进入 SQLite；Token 位于账号专属目录。调度器按账号保存状态、锁、重试和退避，一个账号失败不会阻断其他账号。v1.3/v1.4 兼容配置仍可幂等映射，迁移不移动归档、不改写 `raw.eml` 或历史 Hash。
 
@@ -36,7 +38,7 @@ Account Runtime Router 由 `account_id` 解析 Provider Adapter、运行配置�
 - 历史记录只回答“发生过什么业务行为”，以产品化摘要、中文状态和结构化详情展示收件、发件和 Agent / MCP；文件与数据管理真实收件文件、发送归档、Agent 结果、存储概览、备份、恢复和一致性扫描。
 - 收件页不重复显示 Gmail 管理卡；正常窗口完整展示今日文件与最近日志，不出现页面级滚动，较矮窗口才启用滚动兜底。数据较多时表格内部滚动，不使用分页。
 - 收件和发件共用顶部唯一“刷新本地页面数据”入口；新配置默认接收“当前扫描范围内全部邮件”。“仅 Gmail 自发自收邮件（高级）”和自定义规则仍可明确选择；自定义规则可按发件人/域名、主题关键词和是否含附件过滤。手动、自动、Gmail API、IMAP 和 MCP 新鲜度同步共用同一业务规则。
-- “立即收取”只检查当前增量范围；“历史补扫”可分页重扫最近 24 小时、7 天、30 天或自定义日期，支持取消、进度、当前规则重评、正式归档去重和有限重试。规则跳过只是一次评估，不会永久阻止以后补收。
+- “立即收取”只检查当前增量范围；“导入历史邮件”提供最近 30 天、最近 1 年、2024 全年、全部历史和自定义范围，自动按季度分段，持久化进度、计数、取消和继续状态，不推进普通增量 checkpoint。
 - 收件结果明确区分成功、无新邮件、部分完成和失败；无新邮件不计入失败或错误。
 - “今日收到邮件”每封邮件只显示一条紧凑记录；RFC 2047 联系人显示名会解码，正文摘要最多一至两行，附件、邮件图片、链接和下载数量始终可见。双击整行或点击“查看邮件”进入详情；正文和资源使用可拖动纵向分隔，图片、附件、链接与下载只在非空时分区显示。
 - 收件搜索使用邮件事实层，可按主题、发件人、收件人、抄送人、完整可读正文、附件名、邮件图片名、链接文字、域名、URL 和状态查找；同一邮件多个资源命中仍只显示一条。
@@ -47,7 +49,7 @@ Account Runtime Router 由 `account_id` 解析 Provider Adapter、运行配置�
 
 ## Windows 安装
 
-运行 `AgentMailBridge-1.5.0-Setup.exe`。默认安装到 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需 Python、Git 或管理员权限。桌面和开始菜单只指向 `AgentMailBridge.exe`；内部 `AgentMailBridgeMCP.exe` 不创建快捷方式、托盘或开机启动项。
+运行 `AgentMailBridge-1.6.0-Setup.exe`。默认安装到 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需 Python、Git 或管理员权限。桌面和开始菜单只指向 `AgentMailBridge.exe`；内部 `AgentMailBridgeMCP.exe` 不创建快捷方式、托盘或开机启动项。
 
 安装版数据位置：
 
@@ -72,13 +74,14 @@ Token 仅在 state 校验成功后交换，并通过同目录临时文件、落�
 
 ## Agent 接入与 MCP
 
-从左侧进入“Agent 接入”。页面可创建 Codex、Claude Code、Claude Desktop 或自定义 Client，选择允许的邮箱、能力和工作区，预览并应用配置，执行真实 stdio 连接测试，查看按 Client 审计，并立即暂停、恢复或撤销。读取总开关仍默认关闭；Client 权限不能绕过总开关、`DATA_ROOT`、资源 ownership 或 Hash 校验。
+从左侧进入“Agent 接入”。推荐入口是 Codex、Claude Code 和 Hermes；首次只需选择推荐、完全信任或自定义模式，技术能力仅在自定义高级区域显示。账号范围和 Agent 可用资料目录都支持“所有当前及以后新增项”或“仅选择”；旧 Client 保持原有显式选择，不自动扩大。页面还提供连接测试、审计、暂停、恢复、token 轮换和撤销。
 
 | Client | 配置能力 | 当前边界 |
 | --- | --- | --- |
-| Codex | managed / assisted | 用户级 `config.toml` 可备份和幂等合并；未检测到安装时只复制 TOML |
+| Codex | managed / assisted | 桌面版、CLI 与编辑器入口共用用户级 `config.toml`；未验证版本只辅助配置 |
 | Claude Code | managed / assisted | 用户级 `~/.claude.json` 可备份和幂等合并；项目级适配器可用 |
-| Claude Desktop | managed / assisted | Windows JSON 配置可受控合并；新版 Desktop Extension 流程仍按官方界面处理 |
+| Hermes | managed / assisted | Windows `%LOCALAPPDATA%\hermes\config.yaml` 保留注释和未知字段，支持 `hermes mcp test` 与 `/reload-mcp` |
+| Claude Desktop | compatibility only | 保留已有兼容配置，不作为推荐入口或 v1.6.0 验收阻断项 |
 | Custom MCP | manual | 复制最小 JSON/TOML stdio 示例并自行导入 |
 
 自动写入前必须显示已隐藏 scoped token 的预览。应用时保存原文件和 Hash，检测 hash/mtime 并发冲突，使用临时文件、fsync 和原子替换；损坏配置不会覆盖，失败会恢复，用户也可恢复备份。重复连接只更新 `agent-mail-bridge` 项，不删除其他 MCP Server 或未知字段。撤销只移除本产品管理项并让该 token 立即失效。
@@ -90,8 +93,8 @@ MCP 按需启动，stdin 关闭后退出，并提供七个工具：
 - `search_mails`：按最新、今天、昨天、最近若干天或日期范围搜索，支持账号、主题、发件人、收件人、附件和状态过滤；账号范围始终受当前 Client allowlist 限制。
 - `get_mail`：分页读取邮件元数据、完整可读正文和资源清单。
 - `read_mail_resource`：严格按邮件归属分页读取文本、CSV/TSV、图片元数据和真实 raw.eml，二进制只返回安全描述。
-- `prepare_mail_resources`：把指定资源原子复制到授权工作区，校验大小和 SHA-256，不执行、不解压。
-- `list_agent_workspaces`：列出明确授权的工作区。
+- `prepare_mail_resources`：默认兼容旧的指定资源准备；`mode=complete` 会原子准备正文、真实 raw、邮件信息、附件、邮件内图片、已归档下载和双 manifest，逐项校验 ownership、大小与 SHA-256。
+- `list_agent_workspaces`：列出明确授权的 Agent 可用资料目录。
 - `get_mail_sync_status`：读取指定或当前账号的后台同步、新鲜度、重试和跨进程互斥状态。
 - `submit_result`：保持向后兼容，把 Agent 最终结果发送到固定 Gmail。
 
@@ -105,7 +108,7 @@ MCP 按需启动，stdin 关闭后退出，并提供七个工具：
 }
 ```
 
-邮件读取只能访问 `DATA_ROOT` 内的规范归档，不能读取凭据或任意文件系统路径；资源准备只能写入用户明确授权的工作区。MCP/Agent 结果收件人固定为 `OWNER_GMAIL`，提交文件必须位于 `DATA_ROOT` 或授权工作区。GUI 手动收件人和全局文件选择都不会扩大 Agent 信任范围。
+邮件读取只能访问 `DATA_ROOT` 内的规范归档，不能读取凭据或任意文件系统路径；资料准备只能写入用户明确授权的目录。MCP/Agent 结果收件人固定为 `OWNER_GMAIL`；`submit_result` 还必须通过当前 Client 自己的资料目录范围、全局允许目录、Hash、大小和 staging 校验。
 
 Windows MCP stdin、stdout 和 stderr 明确使用 UTF-8，首条请求可兼容 UTF-8 BOM；stdout 只输出逐行 JSON-RPC 并在每条响应后 flush。中文目录、中文文件名、空格路径和中文标题可直接提交，不需要 Agent 修改 code page 或手工执行 Copy-Item。
 
@@ -115,7 +118,7 @@ Windows MCP stdin、stdout 和 stderr 明确使用 UTF-8，首条请求可兼容
 
 自动收件默认每 60 秒检查一次，最低可设为 30 秒；开启或应用启动后约 3 秒执行首次检查。Gmail API 使用约 30 分钟重叠回看并分页到安全扫描上限。共享 Generic IMAP Core 使用 mailbox 级 UIDVALIDITY/UIDNEXT/last_uid checkpoint、少量 UID 重叠扫描和有界批量 `BODY.PEEK[]`；Message-ID 与数据库唯一约束继续承担正式归档去重。
 
-检查间隔决定“多久检查一次”，Gmail lookback 或 IMAP UID overlap 决定“每次增量向前重查多少”，两者不是同一概念。改变检查间隔不会扩大历史范围；更早邮件应使用历史补扫。历史补扫直接查询指定日期范围，按账号、Message-ID 与 provider id 去重，不删除邮件、不执行附件；Gmail API 保持只读，IMAP 使用 `BODY.PEEK[]` 不误标已读。UIDVALIDITY 变化会安全重置该 mailbox 的 UID 游标并清理旧 UID 代际的技术重试，再依靠归档去重重扫，避免把旧 UID 的失败错误套到新邮件。
+检查间隔决定“多久检查一次”，Gmail lookback 或 IMAP UID overlap 决定“每次增量向前重查多少”，两者不是同一概念。改变检查间隔不会扩大历史范围；更早邮件应使用“导入历史邮件”。导入按账号、Message-ID 与 provider id 去重，不删除邮件、不执行附件；Gmail API 保持只读，IMAP 使用 `BODY.PEEK[]` 不误标已读。
 
 调度状态按账号持久化保存上次检查、上次成功、最近结果、下次检查、连续失败和 checkpoint，并保留 v1.3 全局状态兼容快照。GUI 自动收件轮询所有到期账号；每个账号使用独立线程锁和进程锁，认证、网络或后端整体失败按 30 秒、1 分钟、2 分钟、5 分钟、最长 15 分钟独立退避，`no_changes`、成功或部分完成恢复正常周期。窗口进入托盘时调度继续，只有真正退出才停止。
 
@@ -152,8 +155,8 @@ python scripts\provider_mime_receive_validation.py --from-account-id <account_id
 
 构建流程会先执行 Preflight，再运行完整 pytest、构建 GUI 与内部 MCP、执行 packaged smoke 和秘密排除扫描，并生成：
 
-- `release\AgentMailBridge-1.5.0-Setup.exe`
-- `release\AgentMailBridge-1.5.0-Windows-x64.zip`
+- `release\AgentMailBridge-1.6.0-Setup.exe`
+- `release\AgentMailBridge-1.6.0-Windows-x64.zip`
 - `release\checksums.sha256`
 
 详细说明见 `docs/GUI使用说明.md`、`docs/MCP使用说明.md`、`docs/Agent Client身份与权限设计.md`、`docs/Credential与Client Token说明.md`、四类 Client 接入指南、`docs/安全与诊断说明.md`、`docs/Windows安装与升级说明.md` 和最终专项报告。

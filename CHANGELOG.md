@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## 1.6.0 Agent Ecosystem, History Import & Complete Mail Package - 2026-07-27
+
+- 推荐 Agent 调整为 Codex、Claude Code 和 Hermes；新增 Hermes 0.19.0 Windows YAML 适配、安装/版本检测、保留注释与未知字段的合并、备份、恢复和安全 assisted 降级。普通 Claude Desktop 仅保留兼容入口。
+- 首次连接简化为推荐、完全信任和自定义三种模式。邮箱与 Agent 可用资料目录新增动态“所有当前及以后新增项”语义；旧 Client 的显式列表继续保持仅选择，不自动扩大权限。
+- “历史补扫”产品化为“导入历史邮件”，提供最近 30 天、最近 1 年、2024 全年、全部历史和自定义范围，自动分段并持久化扫描、保存、重复、跳过、失败、取消、截断和继续状态。
+- 七工具数量保持不变；`prepare_mail_resources` 新增向后兼容的 `mode=complete`，原子准备可读正文、真实 raw.eml、邮件信息、附件、邮件内图片、已归档下载和来源 manifest，并闭合 ownership、路径、大小、SHA-256、失败清理与重复执行策略。
+- 配置预览改为只显示 AgentMailBridge 项、命令、参数、隐藏的 env 名、脱敏目标和恢复策略，不展示其他 MCP Server 内容；备份最多保留 20 份和 90 天并保留最后一个有效副本。
+- Client token 轮换覆盖 Credential、数据库和受管配置的协调回滚；`submit_result` 新增当前 Client 资料目录范围校验。未知 Codex、Claude Code 或 Hermes 版本不再盲写配置。
+- Agent Integration schema 升级到 v2；迁移前创建 `before_v1_6_agent_ecosystem` 在线备份，事务内新增动态范围和历史导入状态，不移动 Mail Package、不改写 raw.eml、不重算 Hash、不扩大旧 Client 权限。
+- Gmail 继续严格只读且 scope 仅为 `gmail.readonly`；QQ/163 保持正式支持，Generic 保持 implementation ready / E2E required，Gmail send 与 Outlook/Microsoft 仍为 planned。
+
 ## 1.5.0 Agent Integration & Permission Foundation - 2026-07-26
 
 - “Agent / MCP”重构为“Agent 接入”：可创建 Codex、Claude Code、Claude Desktop 和自定义 MCP Client，并分别管理能力、邮箱账号、工作区、连接状态、最近调用、暂停、恢复与撤销。
