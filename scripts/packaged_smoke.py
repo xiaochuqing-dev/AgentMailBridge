@@ -134,8 +134,11 @@ def main() -> int:
         ]:
             raise SystemExit("MCP 工具列表异常")
         result = by_id[4]["result"]["structuredContent"]
-        if result["status"] != "path_not_allowed":
-            raise SystemExit(f"MCP 路径边界异常：{result['status']}")
+        if result.get("error_code") != "workspace_denied":
+            raise SystemExit(
+                "MCP Client 资料目录边界异常："
+                + str(result.get("error_code") or result.get("status"))
+            )
         read_denied = by_id[6]["result"]["structuredContent"]
         if read_denied.get("error_code") != "agent_access_disabled":
             raise SystemExit("MCP 读取默认关闭边界异常")

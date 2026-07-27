@@ -188,10 +188,15 @@ def test_history_rescan_dialog_has_all_ranges_rule_toggle_and_cancel(
     assert dialog is not None
     combo = dialog.findChild(QComboBox, "historyRescanRange")
     assert [combo.itemText(index) for index in range(combo.count())] == [
-        "最近 24 小时", "最近 7 天", "最近 30 天", "自定义日期范围",
+        "最近 30 天",
+        "最近 1 年",
+        "2024 全年",
+        "全部历史",
+        "自定义日期范围",
+        "暂不导入",
     ]
     assert dialog.findChild(QCheckBox, "historyRescanApplyRule").isChecked() is True
-    assert dialog.findChild(QPushButton, "historyRescanStart").text() == "开始补扫"
+    assert dialog.findChild(QPushButton, "historyRescanStart").text() == "开始导入"
     assert dialog.findChild(QPushButton, "historyRescanCancel").text() == "关闭"
 
 

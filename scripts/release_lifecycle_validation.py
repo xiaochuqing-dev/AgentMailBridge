@@ -25,6 +25,7 @@ from agent_mail_bridge.application_service import ApplicationService
 from agent_mail_bridge.config import AppConfig
 from agent_mail_bridge.credentials import WindowsCredentialBackend
 from agent_mail_bridge.database import (
+    AGENT_INTEGRATION_MIGRATION_KEY,
     close_connection,
     create_outbound_message,
     save_auto_receive_state,
@@ -107,16 +108,26 @@ def _packaged_probe(
     expected_version: str,
     *,
     cfg: AppConfig | None = None,
+    client_auth_env: dict[str, str] | None = None,
 ) -> dict[str, bool]:
     gui = install_dir / "AgentMailBridge.exe"
     mcp = install_dir / "AgentMailBridgeMCP.exe"
     version = _run([str(gui), "--version"], env=env).stdout.strip()
     _run([str(gui), "--packaged-self-test"], env=env)
     probe_env = dict(env)
+    if not client_auth_env or not all(
+        client_auth_env.get(key)
+        for key in (
+            "AGENT_MAIL_BRIDGE_CLIENT_ID",
+            "AGENT_MAIL_BRIDGE_CLIENT_TOKEN",
+        )
+    ):
+        raise RuntimeError("packaged probe 缺少隔离 Client 身份")
+    probe_env.update(client_auth_env)
     migration_backup_created = True
-    if expected_version == "1.5.0":
+    if expected_version == "1.6.0":
         if cfg is None:
-            raise RuntimeError("v1.5.0 packaged probe 缺少隔离配置")
+            raise RuntimeError(f"v{expected_version} packaged probe 缺少隔离配置")
         anonymous_env = dict(env)
         anonymous_env.pop("AGENT_MAIL_BRIDGE_CLIENT_ID", None)
         anonymous_env.pop("AGENT_MAIL_BRIDGE_CLIENT_TOKEN", None)
@@ -151,11 +162,10 @@ def _packaged_probe(
         migration_backup_created = bool(
             list(
                 (cfg.data_root_path / "backups").glob(
-                    "*before_v1_5_agent_permissions*.db"
+                    "*before_v1_6_agent_ecosystem*.db"
                 )
             )
         )
-        probe_env.update(_provision_lifecycle_client(cfg))
     requests = [
         {
             "jsonrpc": "2.0",
@@ -404,21 +414,28 @@ def _seed_baseline_from_source(
     home: Path,
     suffix: str,
     env: dict[str, str],
-) -> AppConfig:
+) -> tuple[AppConfig, dict[str, str]]:
     source_root = source_root.resolve()
     if not (source_root / "agent_mail_bridge" / "version.py").is_file():
-        raise RuntimeError("v1.4.5 基线源码目录无效")
+        raise RuntimeError("v1.5.0 基线源码目录无效")
     code = """
+import json
 import sys
 from pathlib import Path
 source_root, home, suffix = sys.argv[1:4]
 sys.path.insert(0, source_root)
-from scripts.release_lifecycle_validation import _close_runtime_handles, _seed_baseline
+from scripts.release_lifecycle_validation import (
+    _close_runtime_handles,
+    _provision_lifecycle_client,
+    _seed_baseline,
+)
 try:
-    _seed_baseline(Path(home), suffix=suffix)
+    cfg, _gmail_id = _seed_baseline(Path(home), suffix=suffix)
+    client_auth = _provision_lifecycle_client(cfg)
 finally:
     _close_runtime_handles()
 print("BASELINE_SEEDED")
+print("CLIENT_AUTH=" + json.dumps(client_auth, separators=(",", ":")))
 """
     completed = _run(
         [sys.executable, "-c", code, str(source_root), str(home), suffix],
@@ -426,8 +443,24 @@ print("BASELINE_SEEDED")
         timeout=300,
     )
     if "BASELINE_SEEDED" not in completed.stdout:
-        raise RuntimeError("v1.4.5 基线数据创建未完成")
-    return _baseline_config(home, suffix)
+        raise RuntimeError("v1.5.0 基线数据创建未完成")
+    auth_line = next(
+        (
+            line.removeprefix("CLIENT_AUTH=")
+            for line in completed.stdout.splitlines()
+            if line.startswith("CLIENT_AUTH=")
+        ),
+        "",
+    )
+    try:
+        client_auth = json.loads(auth_line)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("v1.5.0 隔离 Client 创建未完成") from exc
+    if not isinstance(client_auth, dict):
+        raise RuntimeError("v1.5.0 隔离 Client 身份格式无效")
+    return _baseline_config(home, suffix), {
+        str(key): str(value) for key, value in client_auth.items()
+    }
 
 
 def _provision_lifecycle_client(cfg: AppConfig) -> dict[str, str]:
@@ -479,6 +512,17 @@ def _snapshot(home: Path, cfg: AppConfig, credential_exists: bool) -> dict[str, 
             "SELECT schema_version FROM migration_metadata "
             "WHERE migration_key = 'multi_account_core_v1'"
         ).fetchone()
+        agent_schema_row = connection.execute(
+            "SELECT schema_version FROM migration_metadata "
+            "WHERE migration_key = ?",
+            (AGENT_INTEGRATION_MIGRATION_KEY,),
+        ).fetchone()
+        table_names = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
         counts = {
             "accounts": int(
                 connection.execute(
@@ -495,12 +539,66 @@ def _snapshot(home: Path, cfg: AppConfig, credential_exists: bool) -> dict[str, 
                 connection.execute("SELECT COUNT(*) FROM account_sync_states").fetchone()[0]
             ),
         }
+        agent_counts = {
+            "agent_clients": (
+                int(connection.execute("SELECT COUNT(*) FROM agent_clients").fetchone()[0])
+                if "agent_clients" in table_names
+                else 0
+            ),
+            "history_import_runs": (
+                int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM history_import_runs"
+                    ).fetchone()[0]
+                )
+                if "history_import_runs" in table_names
+                else 0
+            ),
+        }
         account_ids = sorted(
             str(row[0])
             for row in connection.execute(
                 "SELECT account_id FROM mail_accounts "
                 "WHERE removed_at IS NULL ORDER BY account_id"
             )
+        )
+        agent_client_ids = (
+            sorted(
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT client_id FROM agent_clients ORDER BY client_id"
+                )
+            )
+            if "agent_clients" in table_names
+            else []
+        )
+        agent_columns = (
+            {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(agent_clients)")
+            }
+            if "agent_clients" in table_names
+            else set()
+        )
+        agent_client_scope_modes = (
+            {
+                str(row["client_id"]): {
+                    "account": str(row["account_scope_mode"]),
+                    "workspace": str(row["workspace_scope_mode"]),
+                }
+                for row in connection.execute(
+                    """
+                    SELECT client_id, account_scope_mode, workspace_scope_mode
+                    FROM agent_clients
+                    ORDER BY client_id
+                    """
+                )
+            }
+            if {
+                "account_scope_mode",
+                "workspace_scope_mode",
+            }.issubset(agent_columns)
+            else {}
         )
     package_files: dict[str, str] = {}
     mail_root = cfg.received_dir / "mail"
@@ -521,8 +619,14 @@ def _snapshot(home: Path, cfg: AppConfig, credential_exists: bool) -> dict[str, 
     return {
         "db_integrity": integrity,
         "schema_version": int(schema_row[0] if schema_row else 0),
+        "agent_schema_version": int(
+            agent_schema_row[0] if agent_schema_row else 0
+        ),
         "counts": counts,
+        "agent_counts": agent_counts,
         "account_ids": account_ids,
+        "agent_client_ids": agent_client_ids,
+        "agent_client_scope_modes": agent_client_scope_modes,
         "raw_eml_count": sum(
             1 for path in package_files if path.endswith("/raw.eml")
         ),
@@ -537,7 +641,7 @@ def _snapshot(home: Path, cfg: AppConfig, credential_exists: bool) -> dict[str, 
         "agent_migration_backup_count": len(
             list(
                 (cfg.data_root_path / "backups").glob(
-                    "*before_v1_5_agent_permissions*.db"
+                    "*before_v1_6_agent_ecosystem*.db"
                 )
             )
         ),
@@ -547,7 +651,6 @@ def _snapshot(home: Path, cfg: AppConfig, credential_exists: bool) -> dict[str, 
 def _same_persistent_facts(before: dict[str, Any], after: dict[str, Any]) -> bool:
     keys = (
         "schema_version",
-        "counts",
         "account_ids",
         "raw_eml_count",
         "attachment_count",
@@ -557,7 +660,20 @@ def _same_persistent_facts(before: dict[str, Any], after: dict[str, Any]) -> boo
         "gui_settings_exists",
         "credential_exists",
     )
-    return all(before.get(key) == after.get(key) for key in keys)
+    core_count_keys = ("accounts", "packages", "outbound", "scheduler")
+    return (
+        all(before.get(key) == after.get(key) for key in keys)
+        and all(
+            before.get("counts", {}).get(key)
+            == after.get("counts", {}).get(key)
+            for key in core_count_keys
+        )
+        and set(before.get("agent_client_ids") or []).issubset(
+            set(after.get("agent_client_ids") or [])
+        )
+        and int(after.get("agent_counts", {}).get("history_import_runs") or 0)
+        >= int(before.get("agent_counts", {}).get("history_import_runs") or 0)
+    )
 
 
 def main() -> int:
@@ -583,8 +699,8 @@ def main() -> int:
         "schema_version": 1,
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "environment": "current Windows user, randomized AppId, isolated app/home paths",
-        "old_version": "1.4.5",
-        "new_version": "1.5.0",
+        "old_version": "1.5.0",
+        "new_version": "1.6.0",
         "production_install_untouched": True,
         "checks": {},
     }
@@ -617,9 +733,8 @@ def main() -> int:
 
             _install(old_installer, install_dir, env)
             final_uninstall_needed = True
-            old_probe = _packaged_probe(install_dir, env, "1.4.5")
             try:
-                cfg = _seed_baseline_from_source(
+                cfg, lifecycle_client_auth = _seed_baseline_from_source(
                     old_source_dir,
                     home,
                     baseline_suffix,
@@ -627,6 +742,13 @@ def main() -> int:
                 )
             finally:
                 _close_runtime_handles()
+            old_probe = _packaged_probe(
+                install_dir,
+                env,
+                "1.5.0",
+                cfg=cfg,
+                client_auth_env=lifecycle_client_auth,
+            )
             before = _snapshot(
                 home,
                 cfg,
@@ -635,7 +757,11 @@ def main() -> int:
 
             _install(new_installer, install_dir, env)
             upgraded_probe = _packaged_probe(
-                install_dir, env, "1.5.0", cfg=cfg
+                install_dir,
+                env,
+                "1.6.0",
+                cfg=cfg,
+                client_auth_env=lifecycle_client_auth,
             )
             after_upgrade = _snapshot(
                 home,
@@ -655,7 +781,11 @@ def main() -> int:
             _install(new_installer, install_dir, env)
             final_uninstall_needed = True
             reinstall_probe = _packaged_probe(
-                install_dir, env, "1.5.0", cfg=cfg
+                install_dir,
+                env,
+                "1.6.0",
+                cfg=cfg,
+                client_auth_env=lifecycle_client_auth,
             )
             after_reinstall = _snapshot(
                 home,
@@ -670,6 +800,16 @@ def main() -> int:
                 "db_integrity": after_upgrade["db_integrity"] == "ok",
                 "agent_migration_backup_created": (
                     after_upgrade["agent_migration_backup_count"] > 0
+                ),
+                "agent_schema_v2": (
+                    after_upgrade["agent_schema_version"] == 2
+                ),
+                "legacy_client_scope_not_expanded": all(
+                    after_upgrade["agent_client_scope_modes"].get(
+                        client_id
+                    )
+                    == {"account": "selected", "workspace": "selected"}
+                    for client_id in before["agent_client_ids"]
                 ),
                 "upgrade_persistence": _same_persistent_facts(
                     before, after_upgrade
@@ -705,6 +845,12 @@ def main() -> int:
                 "after_upgrade": after_upgrade["counts"],
                 "after_uninstall": after_uninstall["counts"],
                 "after_reinstall": after_reinstall["counts"],
+            }
+            evidence["agent_counts"] = {
+                "before": before["agent_counts"],
+                "after_upgrade": after_upgrade["agent_counts"],
+                "after_uninstall": after_uninstall["agent_counts"],
+                "after_reinstall": after_reinstall["agent_counts"],
             }
             evidence["file_counts"] = {
                 "raw_eml": before["raw_eml_count"],

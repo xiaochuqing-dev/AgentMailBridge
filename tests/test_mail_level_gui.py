@@ -243,7 +243,8 @@ def test_agent_page_is_unified_without_legacy_delivery_template(mail_gui_window)
     text = _page_text(page)
     assert "连接 Codex" in text
     assert "连接 Claude Code" in text
-    assert "连接 Claude Desktop" in text
+    assert "连接 Hermes" in text
+    assert "其他 Agent（Claude Desktop 兼容）" in text
     assert "自定义 MCP Client" in text
     assert "复制收件示例指令" in text
     assert "复制发件示例指令" in text
@@ -251,6 +252,7 @@ def test_agent_page_is_unified_without_legacy_delivery_template(mail_gui_window)
     assert not hasattr(mail_gui_window, "agent_delivery_title_edit")
     assert not hasattr(mail_gui_window, "agent_delivery_instruction")
     assert mail_gui_window.mcp_read_switch.isChecked() is False
+    assert "导入历史邮件" in _page_text(mail_gui_window.pages["inbox"])
 
     mail_gui_window._copy_mcp_example("receive")
     assert QApplication.clipboard().text() == (

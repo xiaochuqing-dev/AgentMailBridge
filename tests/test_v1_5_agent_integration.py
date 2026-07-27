@@ -494,7 +494,7 @@ def test_v1_4_style_database_migration_backup_and_v1_5_retention(
     migrated = ApplicationService(tmp_cfg)
     assert migrated.initialize().ok
     assert list(
-        backup_dir(tmp_cfg).glob("*before_v1_5_agent_permissions*.db")
+        backup_dir(tmp_cfg).glob("*before_v1_6_agent_ecosystem*.db")
     )
     with sqlite3.connect(tmp_cfg.db_path) as connection:
         migration = connection.execute(
@@ -505,7 +505,7 @@ def test_v1_4_style_database_migration_backup_and_v1_5_retention(
         clients = connection.execute(
             "SELECT COUNT(*) FROM agent_clients"
         ).fetchone()[0]
-    assert migration == ("completed", 1)
+    assert migration == ("completed", 2)
     assert clients == 0
 
     client_id, _token, _account, _workspace = _create_enabled_client(

@@ -21,8 +21,9 @@ from agent_mail_bridge.provider_foundation import PROVIDER_PROFILES
 from agent_mail_bridge.version import __version__
 
 
-TARGET_VERSION = "1.5.0"
+TARGET_VERSION = "1.6.0"
 TARGETED_TESTS = (
+    "tests/test_v1_6_agent_ecosystem.py",
     "tests/test_v1_5_agent_integration.py",
     "tests/test_v1_4_5_release_lifecycle.py",
     "tests/test_v1_4_3_provider_hardening.py",
@@ -51,7 +52,7 @@ def _run(command: list[str], label: str) -> None:
 
 
 def _check_version_consistency() -> None:
-    _require(__version__ == TARGET_VERSION, "version.py is not v1.5.0")
+    _require(__version__ == TARGET_VERSION, "version.py does not match target")
     version_tuple = tuple(int(part) for part in TARGET_VERSION.split(".")) + (0,)
     tuple_text = ", ".join(str(part) for part in version_tuple)
     for relative in (
@@ -134,7 +135,7 @@ def _check_schema_consistency() -> None:
         "unexpected Multi-Account schema version",
     )
     _require(
-        AGENT_INTEGRATION_SCHEMA_VERSION == 1,
+        AGENT_INTEGRATION_SCHEMA_VERSION == 2,
         "unexpected Agent Integration schema version",
     )
     runtime_tests = _text("tests/test_v1_4_1_multi_account_runtime.py")

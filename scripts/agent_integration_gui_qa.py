@@ -49,14 +49,9 @@ def _seed_clients(service: ApplicationService) -> None:
         client_type="codex",
         display_name="Codex 项目工作区",
         config_mode="managed",
-        capabilities=[
-            "mail.search",
-            "mail.get",
-            "resource.read",
-            "resource.prepare",
-        ],
-        account_ids=account_ids,
-        workspace_ids=workspace_ids,
+        permission_mode="recommended",
+        account_scope_mode="all",
+        workspace_scope_mode="all",
     )
     if codex.ok:
         service.set_agent_client_state(
@@ -70,13 +65,30 @@ def _seed_clients(service: ApplicationService) -> None:
         config_mode="managed",
         capabilities=["mail.search", "mail.get", "resource.read"],
         account_ids=account_ids,
+        workspace_ids=workspace_ids,
     )
+    hermes = service.create_agent_client(
+        client_type="hermes",
+        display_name="Hermes 完整邮件资料",
+        config_mode="managed",
+        permission_mode="recommended",
+        account_scope_mode="all",
+        workspace_scope_mode="all",
+    )
+    if hermes.ok:
+        service.set_agent_client_state(
+            str(hermes.details["client"]["client_id"]),
+            "active",
+            enabled=True,
+        )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--evidence", type=Path)
     parser.add_argument("--theme", choices=("light", "dark"), default="light")
+    parser.add_argument("--expected-dpr", type=float)
     args = parser.parse_args()
     output = args.output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -123,16 +135,30 @@ def main() -> int:
             "window_size": [window.width(), window.height()],
             "image_size": [image.width(), image.height()],
             "device_pixel_ratio": image.devicePixelRatio(),
+            "expected_device_pixel_ratio": args.expected_dpr,
             "horizontal_scrollbars": horizontal_scrollbars,
             "client_rows": window.agent_client_table.rowCount(),
             "screenshot": output.name,
             "status": (
                 "PASS"
                 if not horizontal_scrollbars
-                and window.agent_client_table.rowCount() == 2
+                and window.agent_client_table.rowCount() == 3
+                and (
+                    args.expected_dpr is None
+                    or abs(image.devicePixelRatio() - args.expected_dpr) <= 0.02
+                )
                 else "FAIL"
             ),
         }
+        if args.evidence:
+            evidence_path = args.evidence.resolve()
+            evidence_path.parent.mkdir(parents=True, exist_ok=True)
+            evidence_path.write_text(
+                json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
+                + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         window.quitting = True
         window.close()
