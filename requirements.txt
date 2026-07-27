@@ -15,6 +15,9 @@ google-auth-oauthlib>=1.0.0
 # Generic IMAP/SMTP Foundation：成熟 UID、LIST、SPECIAL-USE 与国际化目录解析
 IMAPClient>=3.0,<4
 
+# Hermes config.yaml 保留式解析与幂等合并，避免破坏无关 YAML 配置
+ruamel.yaml>=0.18.17,<0.19
+
 # 第二批次正式桌面界面；项目只使用 QtCore/QtGui/QtNetwork/QtWidgets。
 # 使用 Essentials 避免安装未使用的 WebEngine、Multimedia 等 Addons。
 PySide6-Essentials>=6.8,<7

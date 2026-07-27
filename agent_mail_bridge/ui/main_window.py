@@ -209,7 +209,9 @@ class _HistoryRescanRunner(QRunnable):
     """执行可取消的历史补扫，并把紧凑统计安全送回 GUI 线程。"""
 
     _PROGRESS_KEYS = (
-        "fetched", "matched", "saved", "duplicates", "rule_skipped", "failed",
+        "fetched", "matched", "saved", "duplicates", "skipped",
+        "rule_skipped", "failed",
+        "segment_index", "total_segments",
     )
 
     def __init__(
@@ -220,6 +222,8 @@ class _HistoryRescanRunner(QRunnable):
         date_from: datetime,
         date_to: datetime,
         apply_receive_rule: bool,
+        preset: str = "custom",
+        resume_run_id: str | None = None,
     ):
         super().__init__()
         self.service = service
@@ -227,6 +231,8 @@ class _HistoryRescanRunner(QRunnable):
         self.date_from = date_from
         self.date_to = date_to
         self.apply_receive_rule = apply_receive_rule
+        self.preset = preset
+        self.resume_run_id = resume_run_id
         self.cancel_event = threading.Event()
         self.signals = _HistoryRescanSignals()
 
@@ -240,18 +246,26 @@ class _HistoryRescanRunner(QRunnable):
             )
 
         try:
-            result = self.service.historical_rescan(
-                account_id=self.account_id,
-                date_from=self.date_from,
-                date_to=self.date_to,
-                apply_receive_rule=self.apply_receive_rule,
-                cancel_event=self.cancel_event,
-                progress_callback=publish,
-            )
+            if self.resume_run_id:
+                result = self.service.resume_history_import(
+                    self.resume_run_id,
+                    cancel_event=self.cancel_event,
+                    progress_callback=publish,
+                )
+            else:
+                result = self.service.import_historical_mails(
+                    account_id=self.account_id,
+                    preset=self.preset,
+                    date_from=self.date_from,
+                    date_to=self.date_to,
+                    apply_receive_rule=self.apply_receive_rule,
+                    cancel_event=self.cancel_event,
+                    progress_callback=publish,
+                )
         except Exception as exc:  # noqa: BLE001
             result = ReceiveResult(
                 OperationStatus.FAILED,
-                error_code="history_rescan_failed",
+                error_code="history_import_failed",
                 message=str(exc),
                 failed=1,
                 errors=[str(exc)],
@@ -962,17 +976,19 @@ class BridgeWindow(QMainWindow):
         self.receive_account_combo = QComboBox()
         self.receive_account_combo.setMinimumWidth(190)
         self.receive_account_combo.setToolTip(
-            "手动收取、连接测试和历史补扫使用这里选择的账号"
+            "手动收取、连接测试和历史邮件导入使用这里选择的账号"
         )
         tools.addWidget(self.receive_account_combo)
         tools.addStretch(1)
         self.inbox_test_button = self._button("测试当前连接", self.test_connection)
         receive = self._button("立即收取", self.receive, primary=True, icon_kind="mail")
-        receive.setToolTip("检查当前增量范围；如需找回较早邮件，请使用历史补扫")
+        receive.setToolTip("检查当前增量范围；如需找回较早邮件，请使用“导入历史邮件”")
         self.history_rescan_button = self._button(
-            "历史补扫", self.open_history_rescan_dialog, outline=True, icon_kind="clock"
+            "导入历史邮件", self.open_history_rescan_dialog, outline=True, icon_kind="clock"
         )
-        self.history_rescan_button.setToolTip("按 24 小时、7 天、30 天或自定义日期重新扫描")
+        self.history_rescan_button.setToolTip(
+            "按最近 30 天、最近 1 年、2024 全年、全部历史或自定义范围导入"
+        )
         self.receive_button = receive
         self.task_buttons.extend((self.inbox_test_button, self.history_rescan_button, receive))
         self.manual_receive_buttons.extend((self.history_rescan_button, receive))
@@ -1855,7 +1871,7 @@ class BridgeWindow(QMainWindow):
     def _build_agent_page(self) -> QWidget:
         page, layout = self._standard_page(
             "Agent 接入",
-            "连接 Codex、Claude Code、Claude Desktop 或自定义 MCP Client，并分别授权邮箱、能力和工作区。",
+            "连接 Codex Desktop、Claude Code、Hermes 或自定义 MCP Client，并分别授权邮箱、能力和资料目录。",
         )
 
         status_card = QFrame()
@@ -1876,7 +1892,7 @@ class BridgeWindow(QMainWindow):
         status_header.addWidget(self.mcp_status_label)
         status_layout.addLayout(status_header)
         capability = QLabel(
-            f"版本 {__version__}　支持搜索邮件、读取正文与附件、准备资源到工作区，以及发送最终结果。"
+            f"版本 {__version__}　支持搜索邮件、读取正文与附件、准备完整邮件资料，以及发送最终结果。"
         )
         capability.setObjectName("hint")
         capability.setWordWrap(True)
@@ -1888,7 +1904,7 @@ class BridgeWindow(QMainWindow):
         )
         self.mcp_roots_label.setWordWrap(True)
         self.mcp_roots_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        roots_caption = QLabel("允许目录")
+        roots_caption = QLabel("邮件资料输出目录 / 发件允许目录")
         roots_caption.setObjectName("fieldLabel")
         status_layout.addWidget(roots_caption)
         status_layout.addWidget(self.mcp_roots_label)
@@ -1914,7 +1930,7 @@ class BridgeWindow(QMainWindow):
         read_header.addWidget(self.mcp_read_switch)
         read_layout.addLayout(read_header)
         read_hint = QLabel(
-            "启用后，已注册且通过身份、能力、账号和工作区权限的 Client 才能读取本地邮件归档。"
+            "启用后，已注册且通过身份、能力、账号和资料目录权限的 Client 才能读取本地邮件归档。"
             "不读取凭据，不修改或删除邮件；可随时关闭总开关。"
         )
         read_hint.setObjectName("hint")
@@ -1942,33 +1958,50 @@ class BridgeWindow(QMainWindow):
         config_hint.setObjectName("hint")
         config_hint.setWordWrap(True)
         config_layout.addWidget(config_hint)
-        config_actions = QHBoxLayout()
+        config_actions = QGridLayout()
         config_actions.addWidget(
             self._button(
                 "连接 Codex",
                 lambda: self._create_agent_client_dialog("codex"),
                 primary=True,
-            )
+            ),
+            0,
+            0,
         )
         config_actions.addWidget(
             self._button(
                 "连接 Claude Code",
                 lambda: self._create_agent_client_dialog("claude_code"),
-            )
+            ),
+            0,
+            1,
         )
         config_actions.addWidget(
             self._button(
-                "连接 Claude Desktop",
-                lambda: self._create_agent_client_dialog("claude_desktop"),
-            )
+                "连接 Hermes",
+                lambda: self._create_agent_client_dialog("hermes"),
+            ),
+            0,
+            2,
         )
         config_actions.addWidget(
             self._button(
                 "自定义 MCP Client",
                 lambda: self._create_agent_client_dialog("custom"),
-            )
+            ),
+            1,
+            0,
         )
-        config_actions.addStretch(1)
+        config_actions.addWidget(
+            self._button(
+                "其他 Agent（Claude Desktop 兼容）",
+                lambda: self._create_agent_client_dialog("claude_desktop"),
+                text_only=True,
+            ),
+            1,
+            1,
+        )
+        config_actions.setColumnStretch(3, 1)
         config_layout.addLayout(config_actions)
         self.agent_client_table = DataTable(
             ["Client", "安装 / 配置", "权限摘要", "最近调用", "操作"]
@@ -2009,22 +2042,22 @@ class BridgeWindow(QMainWindow):
         workspace_layout = QVBoxLayout(workspace_card)
         workspace_layout.setContentsMargins(16, 12, 16, 12)
         workspace_header = QHBoxLayout()
-        workspace_title = QLabel("Agent 工作区授权")
+        workspace_title = QLabel("Agent 可用资料目录")
         workspace_title.setObjectName("sectionTitle")
         workspace_header.addWidget(workspace_title)
         workspace_header.addStretch(1)
         workspace_header.addWidget(
-            self._button("添加工作区", self.add_agent_workspace_from_dialog, outline=True)
+            self._button("添加资料目录", self.add_agent_workspace_from_dialog, outline=True)
         )
         workspace_layout.addLayout(workspace_header)
         workspace_hint = QLabel(
-            "工作区只影响发件源路径和邮件资源准备目标，不限制本地邮件事实查询。"
+            "资料目录用于完整邮件资料准备和受控发件源路径，不限制本地邮件事实查询。"
             "驱动器根目录、用户目录、AppData 和产品数据目录会被拒绝。"
         )
         workspace_hint.setObjectName("hint")
         workspace_hint.setWordWrap(True)
         workspace_layout.addWidget(workspace_hint)
-        self.agent_workspace_table = DataTable(["已授权工作区", "操作"])
+        self.agent_workspace_table = DataTable(["已授权资料目录", "操作"])
         self.agent_workspace_table.setMinimumHeight(116)
         workspace_table_header = self.agent_workspace_table.horizontalHeader()
         workspace_table_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
@@ -2114,8 +2147,15 @@ class BridgeWindow(QMainWindow):
         self.mail_detail_archive_button = self._button(
             "打开邮件归档", self.open_current_mail_archive, outline=True, icon_kind="file"
         )
+        self.mail_detail_complete_button = self._button(
+            "准备完整邮件资料",
+            self.prepare_current_complete_mail,
+            primary=True,
+            icon_kind="file",
+        )
         navigation.addWidget(self.mail_detail_thread_button)
         navigation.addWidget(self.mail_detail_archive_button)
+        navigation.addWidget(self.mail_detail_complete_button)
         layout.addLayout(navigation)
 
         header_card = QFrame()
@@ -2949,20 +2989,20 @@ class BridgeWindow(QMainWindow):
         )
 
     def open_history_rescan_dialog(self) -> None:
-        """选择明确历史范围并启动可取消的后台补扫。"""
+        """选择明确历史范围并启动可取消、可继续的后台导入。"""
         dialog = QDialog(self)
         dialog.setObjectName("historyRescanDialog")
-        dialog.setWindowTitle("历史补扫")
+        dialog.setWindowTitle("导入历史邮件")
         dialog.setModal(True)
         dialog.setMinimumWidth(620)
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(20, 18, 20, 18)
         layout.setSpacing(12)
 
-        title = QLabel("重新扫描历史邮件")
+        title = QLabel("导入历史邮件")
         title.setObjectName("sectionTitle")
         description = QLabel(
-            "历史补扫会直接查询指定范围，不受日常增量回看窗口限制；已归档邮件只计为重复，不会再次保存。"
+            "历史导入直接查询指定范围，不推进日常增量检查点；已归档邮件只计为重复，不会再次保存。"
         )
         description.setObjectName("hint")
         description.setWordWrap(True)
@@ -2972,11 +3012,13 @@ class BridgeWindow(QMainWindow):
         form = QFormLayout()
         range_combo = QComboBox()
         range_combo.setObjectName("historyRescanRange")
-        range_combo.addItem("最近 24 小时", "24h")
-        range_combo.addItem("最近 7 天", "7d")
         range_combo.addItem("最近 30 天", "30d")
+        range_combo.addItem("最近 1 年", "1y")
+        range_combo.addItem("2024 全年", "2024")
+        range_combo.addItem("全部历史", "all")
         range_combo.addItem("自定义日期范围", "custom")
-        form.addRow("扫描范围", range_combo)
+        range_combo.addItem("暂不导入", "none")
+        form.addRow("导入范围", range_combo)
         layout.addLayout(form)
 
         custom_panel = QFrame()
@@ -3010,14 +3052,43 @@ class BridgeWindow(QMainWindow):
         progress.setRange(0, 1)
         progress.setValue(0)
         progress.hide()
-        stats = QLabel("尚未开始")
+        account_id = str(self.receive_account_combo.currentData() or "") or None
+        recent_runs = self.service.list_history_imports(
+            account_id=account_id, limit=1
+        ).details.get("runs", [])
+        latest_run = recent_runs[0] if recent_runs else None
+        latest_status_text = {
+            "running": "导入中",
+            "completed": "已完成",
+            "no_changes": "没有新增",
+            "cancelled": "已取消",
+            "partial": "部分完成",
+            "failed": "失败",
+        }.get(str((latest_run or {}).get("status") or ""), "未知")
+        stats = QLabel(
+            (
+                f"上次导入：{latest_status_text}，"
+                f"范围 {str((latest_run or {}).get('date_from') or '')[:10]}"
+                f" 至 {str((latest_run or {}).get('date_to') or '')[:10]}；"
+                f"扫描 {int((latest_run or {}).get('scanned') or 0)} 封，"
+                f"新增 {int((latest_run or {}).get('saved') or 0)} 封，"
+                f"重复 {int((latest_run or {}).get('duplicates') or 0)} 封，"
+                f"跳过 {int((latest_run or {}).get('skipped') or 0)} 封，"
+                f"规则不匹配 {int((latest_run or {}).get('rule_skipped') or 0)} 封，"
+                f"失败 {int((latest_run or {}).get('failed') or 0)} 封；"
+                f"进度 {int((latest_run or {}).get('segment_index') or 0)}/"
+                f"{int((latest_run or {}).get('total_segments') or 0)} 段"
+            )
+            if latest_run
+            else "尚无历史导入记录"
+        )
         stats.setObjectName("historyRescanStats")
         stats.setWordWrap(True)
         layout.addWidget(progress)
         layout.addWidget(stats)
 
         safety = QLabel(
-            "补扫按页处理并可取消，不删除 Gmail 邮件；Gmail API 保持只读，IMAP 使用 BODY.PEEK 不标记已读。"
+            "导入按有限分段、分页处理并可取消，不删除服务器邮件；Gmail API 保持只读，IMAP 使用 BODY.PEEK 不标记已读。"
         )
         safety.setObjectName("hint")
         safety.setWordWrap(True)
@@ -3027,8 +3098,18 @@ class BridgeWindow(QMainWindow):
         actions.addStretch(1)
         cancel_button = self._button("关闭", dialog.reject, outline=True)
         cancel_button.setObjectName("historyRescanCancel")
-        start_button = self._button("开始补扫", primary=True)
+        continue_button = self._button("继续上次导入", outline=True)
+        continue_button.setObjectName("historyImportContinue")
+        continue_button.setVisible(
+            bool(
+                latest_run
+                and str(latest_run.get("status"))
+                in {"running", "cancelled", "partial", "failed"}
+            )
+        )
+        start_button = self._button("开始导入", primary=True)
         start_button.setObjectName("historyRescanStart")
+        actions.addWidget(continue_button)
         actions.addWidget(cancel_button)
         actions.addWidget(start_button)
         layout.addLayout(actions)
@@ -3041,18 +3122,30 @@ class BridgeWindow(QMainWindow):
 
         def selected_range() -> tuple[datetime, datetime]:
             now = datetime.now()
-            preset = str(range_combo.currentData() or "24h")
-            if preset == "24h":
-                return now - timedelta(hours=24), now
-            if preset == "7d":
-                return now - timedelta(days=7), now
+            preset = str(range_combo.currentData() or "30d")
             if preset == "30d":
                 return now - timedelta(days=30), now
+            if preset == "1y":
+                return now - timedelta(days=365), now
+            if preset == "2024":
+                return (
+                    datetime(2024, 1, 1),
+                    datetime(2024, 12, 31, 23, 59, 59),
+                )
+            if preset == "all":
+                return datetime(1970, 1, 1), now
+            if preset == "none":
+                return now, now
             start = datetime.strptime(start_date.date().toString("yyyy-MM-dd"), "%Y-%m-%d")
             end = datetime.strptime(end_date.date().toString("yyyy-MM-dd"), "%Y-%m-%d")
             return start, end.replace(hour=23, minute=59, second=59, microsecond=999999)
 
         def start_scan() -> None:
+            preset = str(range_combo.currentData() or "30d")
+            if preset == "none":
+                self.show_message("已选择暂不导入历史邮件", "normal")
+                dialog.accept()
+                return
             try:
                 range_start, range_end = selected_range()
             except ValueError as exc:
@@ -3065,9 +3158,22 @@ class BridgeWindow(QMainWindow):
                 range_start,
                 range_end,
                 apply_receive_rule=apply_rule.isChecked(),
+                preset=preset,
             )
 
         start_button.clicked.connect(start_scan)
+        if latest_run:
+            continue_button.clicked.connect(
+                lambda _checked=False: self._start_history_rescan(
+                    datetime.now(),
+                    datetime.now(),
+                    apply_receive_rule=bool(
+                        latest_run.get("apply_receive_rule")
+                    ),
+                    preset="custom",
+                    resume_run_id=str(latest_run.get("run_id") or ""),
+                )
+            )
         cancel_button.clicked.disconnect()
         cancel_button.clicked.connect(
             lambda _checked=False: self._cancel_history_rescan()
@@ -3081,22 +3187,24 @@ class BridgeWindow(QMainWindow):
         date_to: datetime,
         *,
         apply_receive_rule: bool,
+        preset: str = "custom",
+        resume_run_id: str | None = None,
     ) -> None:
         if not self.accepting_tasks:
             self.show_message("程序正在退出，不再启动新任务", "error")
             return
         if self.task_active:
-            self.show_message("已有任务正在运行，请等待完成后再补扫", "working")
+            self.show_message("已有任务正在运行，请等待完成后再导入历史邮件", "working")
             return
         self.task_active = True
         self._sync_manual_receive_actions()
         self._task_refresh_on_finish = True
-        self.status_var.set("正在分页重新扫描历史邮件")
+        self.status_var.set("正在分段导入历史邮件")
         self._active_task_button = self._history_rescan_start_button
         self._active_task_button_text = self._history_rescan_start_button.text()
         self._history_rescan_start_button.setEnabled(False)
-        self._history_rescan_start_button.setText("补扫中…")
-        self._history_rescan_cancel_button.setText("取消补扫")
+        self._history_rescan_start_button.setText("导入中…")
+        self._history_rescan_cancel_button.setText("取消导入")
         self._history_rescan_cancel_button.setEnabled(True)
         self._history_rescan_progress.setRange(0, 0)
         self._history_rescan_progress.show()
@@ -3110,6 +3218,8 @@ class BridgeWindow(QMainWindow):
             date_from=date_from,
             date_to=date_to,
             apply_receive_rule=apply_receive_rule,
+            preset=preset,
+            resume_run_id=resume_run_id,
         )
         runner.signals.progress.connect(self._update_history_rescan_progress)
         runner.signals.finished.connect(self._finish_task)
@@ -3123,8 +3233,9 @@ class BridgeWindow(QMainWindow):
         if self.closed or not hasattr(self, "_history_rescan_stats"):
             return
         self._history_rescan_stats.setText(
-            "扫描 {fetched} 封，匹配 {matched} 封，新增 {saved} 封，"
-            "已归档 {duplicates} 封，规则不匹配 {rule_skipped} 封，失败 {failed} 封".format(
+            "导入进度 {segment_index}/{total_segments} 段；扫描 {fetched} 封，"
+            "匹配 {matched} 封，新增 {saved} 封，已归档 {duplicates} 封，"
+            "跳过 {skipped} 封，规则不匹配 {rule_skipped} 封，失败 {failed} 封".format(
                 **{key: int(progress.get(key) or 0) for key in _HistoryRescanRunner._PROGRESS_KEYS}
             )
         )
@@ -3151,8 +3262,15 @@ class BridgeWindow(QMainWindow):
                     "matched": result.matched,
                     "saved": result.saved,
                     "duplicates": result.duplicates,
+                    "skipped": result.skipped,
                     "rule_skipped": result.rule_skipped,
                     "failed": result.failed,
+                    "segment_index": int(
+                        result.details.get("segment_index") or 0
+                    ),
+                    "total_segments": int(
+                        result.details.get("total_segments") or 0
+                    ),
                 }
             )
         if hasattr(self, "_history_rescan_progress"):
@@ -3162,7 +3280,7 @@ class BridgeWindow(QMainWindow):
             self._history_rescan_cancel_button.setText("关闭")
             self._history_rescan_cancel_button.setEnabled(True)
         if hasattr(self, "_history_rescan_start_button"):
-            self._history_rescan_start_button.setText("再次补扫")
+            self._history_rescan_start_button.setText("再次导入")
         if result.status == OperationStatus.CANCELLED:
             kind = "warning"
         elif result.status == OperationStatus.NO_CHANGES:
@@ -3171,7 +3289,7 @@ class BridgeWindow(QMainWindow):
             kind = "warning"
         else:
             kind = "success" if result.ok else "error"
-        self.show_message(result.message or "历史补扫已结束", kind)
+        self.show_message(result.message or "历史邮件导入已结束", kind)
 
     def choose_and_send(self) -> None:
         if not self.choose_send_file():
@@ -4729,7 +4847,7 @@ class BridgeWindow(QMainWindow):
             "get_mail": "读取邮件",
             "read_mail_resource": "读取附件",
             "prepare_mail_resources": "准备资源",
-            "list_agent_workspaces": "查询工作区",
+            "list_agent_workspaces": "查询资料目录",
             "get_mail_sync_status": "查询同步",
             "submit_result": "发送结果",
         }.get(tool_name, "MCP 调用")
@@ -4784,7 +4902,7 @@ class BridgeWindow(QMainWindow):
                 ("Client 类型", row.get("client_type") or "—"),
                 ("能力", row.get("capability") or "—"),
                 ("邮箱范围", row.get("account_id") or "—"),
-                ("工作区", row.get("workspace_id") or "—"),
+                ("资料目录", row.get("workspace_id") or "—"),
                 ("拒绝原因", row.get("deny_reason_code") or "—"),
                 ("状态", self._mcp_status_text(str(row.get("status") or ""))),
                 ("错误代码", row.get("error_code")),
@@ -5180,6 +5298,7 @@ class BridgeWindow(QMainWindow):
         self.mail_detail_body.setPlainText(self._mail_body_text(details))
         self.mail_detail_thread_button.setEnabled(bool(details.get("thread_ref")))
         self.mail_detail_archive_button.setEnabled(bool(details.get("package_root")))
+        self.mail_detail_complete_button.setEnabled(bool(details.get("package_id")))
         self._populate_mail_detail_resources(details.get("resources") or [])
         self.mail_detail_splitter.setSizes(self._mail_detail_splitter_sizes)
         self.mail_detail_resource_scroll.verticalScrollBar().setValue(0)
@@ -5371,6 +5490,102 @@ class BridgeWindow(QMainWindow):
         except (OSError, SecurityError) as exc:
             self.show_message(f"打开邮件归档失败：{exc}", "error")
 
+    def prepare_current_complete_mail(self) -> None:
+        details = getattr(self, "_current_mail_details", {})
+        package_id = str(details.get("package_id") or "")
+        if not package_id:
+            self.show_message("当前邮件标识不可用", "error")
+            return
+        workspaces = [
+            row
+            for row in self.service.list_agent_workspaces().details.get(
+                "workspace_details", []
+            )
+            if row.get("available")
+        ]
+        if not workspaces:
+            self.show_message(
+                "请先在 Agent 接入页添加一个邮件资料输出目录", "warning"
+            )
+            return
+        selected = workspaces[0]
+        if len(workspaces) > 1:
+            labels = [str(row.get("display_path") or "") for row in workspaces]
+            label, accepted = QInputDialog.getItem(
+                self,
+                "选择邮件资料输出目录",
+                "Agent 可用资料目录",
+                labels,
+                0,
+                False,
+            )
+            if not accepted:
+                return
+            selected = workspaces[labels.index(label)]
+        resources = [
+            item
+            for item in details.get("resources") or []
+            if str(item.get("internal_type") or "")
+            in {"attachment", "inline_image", "downloaded_file"}
+        ]
+        raw_info = (
+            details.get("raw_eml")
+            if isinstance(details.get("raw_eml"), dict)
+            else {}
+        )
+        estimated_files = 5 + len(resources)
+        estimated_bytes = int(raw_info.get("size_bytes") or 0) + sum(
+            int(item.get("size_bytes") or 0) for item in resources
+        )
+        confirmed = QMessageBox.question(
+            self,
+            "准备完整邮件资料",
+            "将复制可读正文、原始邮件、邮件信息、附件、邮件内图片、"
+            "已归档下载文件和来源说明。\n"
+            f"预计 {estimated_files} 个文件，源文件合计约 {format_size(estimated_bytes)}。\n"
+            "内部邮件归档不会被修改。是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if confirmed != QMessageBox.StandardButton.Yes:
+            return
+
+        def finished(result: ServiceResult) -> None:
+            self._show_service_result(result)
+            if result.ok:
+                target = str(result.details.get("target_directory") or "")
+                if target:
+                    QApplication.clipboard().setText(target)
+                    self.show_message(
+                        "完整邮件资料已准备，输出目录已复制", "success"
+                    )
+                    open_now = QMessageBox.question(
+                        self,
+                        "完整邮件资料已准备",
+                        "输出目录已复制到剪贴板。是否立即打开？",
+                        QMessageBox.StandardButton.Yes
+                        | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.Yes,
+                    )
+                    if open_now == QMessageBox.StandardButton.Yes:
+                        try:
+                            os.startfile(target)
+                        except OSError as exc:
+                            self.show_message(f"打开输出目录失败：{exc}", "error")
+
+        self._run_task(
+            "正在准备完整邮件资料",
+            lambda: self.service.prepare_mail_resources(
+                package_id,
+                [],
+                mode="complete",
+                target_workspace=str(selected.get("workspace_id") or ""),
+                overwrite_policy="rename",
+            ),
+            finished,
+            refresh_on_finish=False,
+        )
+
     def _return_from_mail_detail(self) -> None:
         if self._mail_detail_return_widget is self.mail_thread_page:
             self.page_stack.setCurrentWidget(self.mail_thread_page)
@@ -5553,19 +5768,31 @@ class BridgeWindow(QMainWindow):
             )
             install_text = {
                 "managed_supported": "已检测 · 可管理",
+                "version_unverified": "版本未验证 · 辅助配置",
                 "not_installed": "未检测到 · 辅助配置",
                 "manual_only": "手动 Client",
             }.get(
                 str(client.get("install_status") or ""),
                 str(client.get("config_status") or "未配置"),
             )
-            capability_count = len(client.get("capabilities") or [])
+            capabilities = set(client.get("capabilities") or [])
             account_count = len(client.get("account_ids") or [])
             workspace_count = len(client.get("workspace_ids") or [])
+            mode_text = {
+                "recommended": "推荐权限",
+                "full": "完全信任",
+                "custom": "自定义权限",
+            }.get(str(client.get("permission_mode") or ""), "自定义权限")
+            scope_summary = (
+                "邮箱动态全部 · 资料目录动态全部"
+                if client.get("account_scope_mode") == "all"
+                and client.get("workspace_scope_mode") == "all"
+                else f"邮箱 {account_count} · 资料目录 {workspace_count}"
+            )
             values = [
                 f"{client.get('display_name') or 'Agent Client'}\n{self._agent_client_type_text(str(client.get('client_type') or 'custom'))}",
                 f"{install_text}\n{state_text}",
-                f"能力 {capability_count} · 邮箱 {account_count} · 工作区 {workspace_count}",
+                f"{mode_text} · 完整邮件资料{'允许' if 'resource.prepare' in capabilities else '关闭'}\n{scope_summary}",
                 self._short_time(client.get("last_seen_at"), include_date=True),
             ]
             for column, value in enumerate(values):
@@ -5617,7 +5844,8 @@ class BridgeWindow(QMainWindow):
         return {
             "codex": "Codex",
             "claude_code": "Claude Code",
-            "claude_desktop": "Claude Desktop",
+            "hermes": "Hermes",
+            "claude_desktop": "Claude Desktop 兼容接入",
             "custom": "自定义 MCP",
         }.get(client_type, "自定义 MCP")
 
@@ -5632,17 +5860,42 @@ class BridgeWindow(QMainWindow):
         form.addRow("显示名称", name_edit)
         layout.addLayout(form)
 
+        mode_title = QLabel("权限模式")
+        mode_title.setObjectName("sectionTitle")
+        layout.addWidget(mode_title)
+        recommended_mode = QRadioButton("推荐权限（默认）")
+        recommended_mode.setToolTip(
+            "当前及未来新增邮箱、资料目录自动可用；允许读取、搜索、刷新和完整邮件资料准备，不允许提交结果"
+        )
+        full_mode = QRadioButton("完全信任")
+        full_mode.setToolTip(
+            "当前及未来新增邮箱、资料目录自动可用，并开放全部七项能力；固定收件人与文件边界仍保持"
+        )
+        custom_mode = QRadioButton("自定义")
+        recommended_mode.setChecked(True)
+        mode_group = QButtonGroup(dialog)
+        for radio in (recommended_mode, full_mode, custom_mode):
+            mode_group.addButton(radio)
+            layout.addWidget(radio)
+
+        advanced_panel = QFrame()
+        advanced_panel.setObjectName("accountPanel")
+        advanced_layout = QVBoxLayout(advanced_panel)
+        advanced_layout.setContentsMargins(14, 10, 14, 10)
+        advanced_panel.hide()
+        custom_mode.toggled.connect(advanced_panel.setVisible)
+
         capability_title = QLabel("允许的能力")
         capability_title.setObjectName("sectionTitle")
-        layout.addWidget(capability_title)
+        advanced_layout.addWidget(capability_title)
         capability_specs = [
             ("搜索邮件", "mail.search", True),
             ("读取邮件", "mail.get", True),
             ("读取文本资源", "resource.read", True),
-            ("准备附件到工作区", "resource.prepare", True),
+            ("准备资源与完整邮件资料", "resource.prepare", True),
             ("查看同步状态", "sync.status", True),
             ("按需刷新邮件", "sync.ensure_fresh", True),
-            ("列出工作区", "workspace.list", True),
+            ("列出资料目录", "workspace.list", True),
             ("提交最终结果", "result.submit", False),
         ]
         capability_checks: list[tuple[QCheckBox, str]] = []
@@ -5652,12 +5905,12 @@ class BridgeWindow(QMainWindow):
             checkbox.setChecked(checked)
             capability_checks.append((checkbox, capability))
             capability_grid.addWidget(checkbox, index // 2, index % 2)
-        layout.addLayout(capability_grid)
+        advanced_layout.addLayout(capability_grid)
 
         accounts = self.service.list_mail_accounts().details.get("accounts", [])
         account_title = QLabel("允许的邮箱账号")
         account_title.setObjectName("sectionTitle")
-        layout.addWidget(account_title)
+        advanced_layout.addWidget(account_title)
         account_checks: list[tuple[QCheckBox, str]] = []
         for account in accounts:
             checkbox = QCheckBox(
@@ -5665,28 +5918,30 @@ class BridgeWindow(QMainWindow):
             )
             checkbox.setChecked(bool(account.get("enabled")))
             account_checks.append((checkbox, str(account["account_id"])))
-            layout.addWidget(checkbox)
+            advanced_layout.addWidget(checkbox)
 
         workspaces = self.service.list_agent_workspaces().details.get(
             "workspace_details", []
         )
-        workspace_title = QLabel("允许的工作区")
+        workspace_title = QLabel("允许的 Agent 可用资料目录")
         workspace_title.setObjectName("sectionTitle")
-        layout.addWidget(workspace_title)
+        advanced_layout.addWidget(workspace_title)
         workspace_checks: list[tuple[QCheckBox, str]] = []
         for workspace in workspaces:
-            checkbox = QCheckBox(str(workspace.get("display_path") or "工作区"))
+            checkbox = QCheckBox(str(workspace.get("display_path") or "资料目录"))
             checkbox.setChecked(bool(workspace.get("available")))
             workspace_checks.append((checkbox, str(workspace["workspace_id"])))
-            layout.addWidget(checkbox)
+            advanced_layout.addWidget(checkbox)
         if not workspaces:
-            hint = QLabel("尚无工作区；可先创建 Client，之后在本页添加工作区并编辑权限。")
+            hint = QLabel("尚无资料目录；可先创建 Client，之后在本页添加目录并编辑权限。")
             hint.setObjectName("hint")
             hint.setWordWrap(True)
-            layout.addWidget(hint)
+            advanced_layout.addWidget(hint)
+        layout.addWidget(advanced_panel)
 
         notice = QLabel(
-            "默认拒绝未勾选能力。result.submit 保持固定收件人与既有文件边界，不会开放任意发信。"
+            "推荐权限会动态覆盖当前及未来新增邮箱和资料目录，但不会开放 result.submit。"
+            "完全信任仍保持固定收件人、全局允许目录、ownership 与 Hash 边界。"
         )
         notice.setObjectName("hint")
         notice.setWordWrap(True)
@@ -5702,6 +5957,14 @@ class BridgeWindow(QMainWindow):
         layout.addWidget(buttons)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
+        permission_mode = (
+            "recommended"
+            if recommended_mode.isChecked()
+            else "full"
+            if full_mode.isChecked()
+            else "custom"
+        )
+        dynamic_scope = permission_mode in {"recommended", "full"}
         created = self.service.create_agent_client(
             client_type=client_type,
             display_name=name_edit.text(),
@@ -5722,6 +5985,9 @@ class BridgeWindow(QMainWindow):
                 for checkbox, workspace_id in workspace_checks
                 if checkbox.isChecked()
             ],
+            permission_mode=permission_mode,
+            account_scope_mode="all" if dynamic_scope else "selected",
+            workspace_scope_mode="all" if dynamic_scope else "selected",
         )
         if not created.ok:
             self._show_service_result(created)
@@ -5744,6 +6010,20 @@ class BridgeWindow(QMainWindow):
         dialog.setWindowTitle(f"权限 - {client.get('display_name')}")
         dialog.resize(560, 600)
         layout = QVBoxLayout(dialog)
+        current_mode = str(client.get("permission_mode") or "custom")
+        recommended_mode = QRadioButton("推荐权限（动态全部邮箱与资料目录）")
+        full_mode = QRadioButton("完全信任（动态全部邮箱与资料目录）")
+        custom_mode = QRadioButton("自定义")
+        {
+            "recommended": recommended_mode,
+            "full": full_mode,
+            "custom": custom_mode,
+        }.get(current_mode, custom_mode).setChecked(True)
+        mode_group = QButtonGroup(dialog)
+        for radio in (recommended_mode, full_mode, custom_mode):
+            mode_group.addButton(radio)
+            layout.addWidget(radio)
+        layout.addWidget(horizontal_line())
         current_caps = set(client.get("capabilities") or [])
         current_accounts = set(client.get("account_ids") or [])
         current_workspaces = set(client.get("workspace_ids") or [])
@@ -5752,10 +6032,10 @@ class BridgeWindow(QMainWindow):
             ("搜索邮件", "mail.search"),
             ("读取邮件", "mail.get"),
             ("读取文本资源", "resource.read"),
-            ("准备附件到工作区", "resource.prepare"),
+            ("准备资源与完整邮件资料", "resource.prepare"),
             ("查看同步状态", "sync.status"),
             ("按需刷新邮件", "sync.ensure_fresh"),
-            ("列出工作区", "workspace.list"),
+            ("列出资料目录", "workspace.list"),
             ("提交最终结果", "result.submit"),
         ):
             check = QCheckBox(label)
@@ -5776,11 +6056,23 @@ class BridgeWindow(QMainWindow):
         for workspace in self.service.list_agent_workspaces().details.get(
             "workspace_details", []
         ):
-            check = QCheckBox(f"工作区：{workspace.get('display_path')}")
+            check = QCheckBox(f"资料目录：{workspace.get('display_path')}")
             workspace_id = str(workspace["workspace_id"])
             check.setChecked(workspace_id in current_workspaces)
             workspace_checks.append((check, workspace_id))
             layout.addWidget(check)
+        custom_controls = [
+            check for check, _value in cap_checks + account_checks + workspace_checks
+        ]
+
+        def sync_custom_controls() -> None:
+            enabled = custom_mode.isChecked()
+            for control in custom_controls:
+                control.setEnabled(enabled)
+
+        for radio in (recommended_mode, full_mode, custom_mode):
+            radio.toggled.connect(sync_custom_controls)
+        sync_custom_controls()
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save
             | QDialogButtonBox.StandardButton.Cancel
@@ -5791,6 +6083,14 @@ class BridgeWindow(QMainWindow):
         layout.addWidget(buttons)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
+        permission_mode = (
+            "recommended"
+            if recommended_mode.isChecked()
+            else "full"
+            if full_mode.isChecked()
+            else "custom"
+        )
+        dynamic_scope = permission_mode in {"recommended", "full"}
         result = self.service.set_agent_client_permissions(
             str(client["client_id"]),
             capabilities=[
@@ -5806,6 +6106,9 @@ class BridgeWindow(QMainWindow):
                 for check, workspace_id in workspace_checks
                 if check.isChecked()
             ],
+            permission_mode=permission_mode,
+            account_scope_mode="all" if dynamic_scope else "selected",
+            workspace_scope_mode="all" if dynamic_scope else "selected",
         )
         self._show_service_result(result)
         self.request_refresh()
@@ -5814,6 +6117,7 @@ class BridgeWindow(QMainWindow):
         if (
             str(client.get("client_type")) == "custom"
             or client.get("installed") is False
+            or str(client.get("install_status") or "") != "managed_supported"
         ):
             self._copy_agent_client_assisted_config(client)
             return
@@ -5873,6 +6177,8 @@ class BridgeWindow(QMainWindow):
         value = (
             result.details.get("toml")
             if str(client.get("client_type")) == "codex"
+            else result.details.get("yaml")
+            if str(client.get("client_type")) == "hermes"
             else result.details.get("json")
         )
         QApplication.clipboard().setText(str(value or ""))
@@ -6016,7 +6322,7 @@ class BridgeWindow(QMainWindow):
             confirmation = QMessageBox.question(
                 self,
                 "启用本机 Agent 邮件读取",
-                "启用后，只有已注册且通过 Client 身份、状态、能力、账号和工作区权限的本机 Agent，"
+                "启用后，只有已注册且通过 Client 身份、状态、能力、账号和资料目录权限的本机 Agent，"
                 "才能搜索和读取本地邮件归档。\n\n"
                 "该总开关不是逐封分享；不会开放凭据、任意文件路径或邮件修改能力。是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -6119,14 +6425,14 @@ class BridgeWindow(QMainWindow):
 
     def _copy_agent_workspace_path(self, raw_path: str) -> None:
         QApplication.clipboard().setText(raw_path)
-        self.show_message("工作区路径已复制", "success")
+        self.show_message("资料目录路径已复制", "success")
 
     def add_agent_workspace_from_dialog(self) -> None:
         path = QFileDialog.getExistingDirectory(
-            self, "选择要授权给 Agent 的项目工作区", str(Path.home())
+            self, "选择允许 Agent 使用的资料目录", str(Path.home())
         )
         if not path:
-            self.show_message("已取消添加工作区", "normal")
+            self.show_message("已取消添加资料目录", "normal")
             return
         result = self.service.add_agent_workspace(path)
         self._show_service_result(result)
@@ -6136,7 +6442,7 @@ class BridgeWindow(QMainWindow):
     def remove_agent_workspace(self, raw_path: str) -> None:
         confirmation = QMessageBox.question(
             self,
-            "移除 Agent 工作区授权",
+            "移除 Agent 资料目录授权",
             f"移除后，下一次 MCP 会话将不能交付该目录中的文件。\n\n{raw_path}",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,

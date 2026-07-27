@@ -47,7 +47,9 @@ from agent_mail_bridge.database import (
     configure_app_event_retention,
     count_receive_retries,
     create_mail_account as create_mail_account_record,
+    delete_agent_config_backup,
     get_auto_receive_state,
+    get_history_import_run,
     get_mail_account as query_mail_account,
     get_mail_package as query_raw_mail_package,
     get_agent_config_backup,
@@ -65,6 +67,7 @@ from agent_mail_bridge.database import (
     query_recent_mcp_audit_events,
     query_agent_config_backups,
     query_agent_client_permissions,
+    query_history_import_runs,
     query_recent_outbound_messages,
     query_recent_events,
     query_app_events,
@@ -77,6 +80,7 @@ from agent_mail_bridge.database import (
     update_mcp_staging,
     update_agent_client,
     update_agent_config_backup,
+    upsert_history_import_run,
     save_auto_receive_state,
     delete_trusted_domain,
     upsert_trusted_domain,
@@ -91,6 +95,7 @@ from agent_mail_bridge.agent_integration import (
     AgentAccessError,
     AgentIdentity,
     AgentIntegrationService,
+    new_client_token,
 )
 from agent_mail_bridge.file_index import list_received_files_for_date, scan_file_status
 from agent_mail_bridge.gmail_api_auth import get_oauth_state
@@ -173,6 +178,7 @@ from agent_mail_bridge.mcp_client_config import (
     codex_mcp_toml,
     detect_client,
     generic_mcp_json,
+    hermes_mcp_yaml,
     mcp_launch,
     preview_client_config,
     restore_client_config,
@@ -180,6 +186,8 @@ from agent_mail_bridge.mcp_client_config import (
 
 
 logger = get_logger("application_service")
+AGENT_CONFIG_BACKUP_MAX_COUNT = 20
+AGENT_CONFIG_BACKUP_MAX_AGE_DAYS = 90
 
 LOG_EVENT_CATEGORIES: dict[str, tuple[str, ...]] = {
     "收件": ("receive", "receive_auto", "auto_receive"),
@@ -266,7 +274,7 @@ class ApplicationService:
                     create_database_backup(
                         self.cfg,
                         label=(
-                            "before_v1_5_agent_permissions"
+                            "before_v1_6_agent_ecosystem"
                             if agent_migration_needed
                             else "before_v1_4_multi_account"
                             if account_migration_needed
@@ -279,6 +287,7 @@ class ApplicationService:
                     self.cfg.db_path,
                     legacy_accounts=legacy_accounts_from_config(self.cfg),
                 )
+                self._agent_integration.ensure_legacy_submit_scopes()
                 if archive_migration_needed:
                     migration = backfill_legacy_mail_packages(self.cfg)
                     if migration.get("failed"):
@@ -771,6 +780,400 @@ class ApplicationService:
             if legacy_process_lock is not None:
                 legacy_process_lock.release()
             receive_lock.release()
+
+    def import_historical_mails(
+        self,
+        *,
+        account_id: str | None = None,
+        preset: str = "30d",
+        date_from: datetime | str | None = None,
+        date_to: datetime | str | None = None,
+        apply_receive_rule: bool = True,
+        cancel_event: threading.Event | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        page_size: int = 100,
+        scan_cap: int = 5000,
+        run_id: str | None = None,
+        resume_from_segment: int = 1,
+        initial_facts: dict[str, int] | None = None,
+        persisted_preset: str | None = None,
+    ) -> ReceiveResult:
+        """产品化历史导入：持久化状态，并把长范围拆为独立有限段。"""
+        self.initialize()
+        normalized_preset = str(preset or "custom").strip().casefold()
+        allowed_presets = {"30d", "1y", "2024", "all", "custom"}
+        if normalized_preset not in allowed_presets:
+            return ReceiveResult(
+                OperationStatus.FAILED,
+                error_code="invalid_history_range",
+                message="历史导入范围预设无效",
+            )
+        storage_preset = str(persisted_preset or normalized_preset).strip().casefold()
+        if storage_preset not in allowed_presets:
+            return ReceiveResult(
+                OperationStatus.FAILED,
+                error_code="invalid_history_range",
+                message="历史导入范围预设无效",
+            )
+        now = datetime.now().replace(microsecond=0)
+        try:
+            if normalized_preset == "30d":
+                start, end = now - timedelta(days=30), now
+            elif normalized_preset == "1y":
+                start, end = now - timedelta(days=365), now
+            elif normalized_preset == "2024":
+                start, end = datetime(2024, 1, 1), datetime(
+                    2024, 12, 31, 23, 59, 59
+                )
+            elif normalized_preset == "all":
+                start, end = datetime(1970, 1, 1), now
+            else:
+                if date_from is None or date_to is None:
+                    raise ValueError("自定义历史导入需要开始和结束日期")
+                start = _coerce_rescan_datetime(date_from, end_of_day=False)
+                end = _coerce_rescan_datetime(date_to, end_of_day=True)
+            if start > end:
+                raise ValueError("历史导入开始时间不能晚于结束时间")
+        except (TypeError, ValueError) as exc:
+            return ReceiveResult(
+                OperationStatus.FAILED,
+                error_code="invalid_history_range",
+                message=str(exc),
+            )
+
+        target_account_id = account_id or current_receive_account_id(self.cfg)
+        if not target_account_id:
+            return ReceiveResult(
+                OperationStatus.FAILED,
+                error_code="account_not_found",
+                message="没有可用于历史导入的收件账号",
+            )
+        account = query_mail_account(self.cfg.db_path, target_account_id)
+        if (
+            account is None
+            or not account.get("enabled")
+            or not account.get("receive_enabled")
+        ):
+            return ReceiveResult(
+                OperationStatus.FAILED,
+                error_code="account_not_found",
+                message="历史导入账号不存在、已停用或未启用收件",
+            )
+        segments: list[tuple[datetime, datetime]] = []
+        cursor = start
+        while cursor <= end:
+            segment_end = min(
+                end,
+                cursor + timedelta(days=91, hours=23, minutes=59, seconds=59),
+            )
+            segments.append((cursor, segment_end))
+            cursor = segment_end + timedelta(seconds=1)
+        stable_run_id = run_id or ("history_" + uuid.uuid4().hex)
+        start_segment_index = max(
+            1, min(int(resume_from_segment or 1), len(segments) + 1)
+        )
+        prior = dict(initial_facts or {})
+        aggregate = {
+            key: int(prior.get(key) or 0)
+            for key in (
+                "scanned",
+                "matched",
+                "saved",
+                "duplicates",
+                "skipped",
+                "rule_skipped",
+                "failed",
+                "attachments",
+            )
+        }
+        saved_files: list[str] = []
+        errors: list[str] = []
+        backend = ""
+        cancelled = False
+        truncated = False
+        hard_failure: ReceiveResult | None = None
+        retry_from_segment: int | None = None
+        upsert_history_import_run(
+            self.cfg.db_path,
+            run_id=stable_run_id,
+            account_id=target_account_id,
+            preset=storage_preset,
+            date_from=start.isoformat(timespec="seconds"),
+            date_to=end.isoformat(timespec="seconds"),
+            apply_receive_rule=apply_receive_rule,
+            status="running",
+            **aggregate,
+            segment_index=max(0, start_segment_index - 1),
+            total_segments=len(segments),
+            next_segment_index=start_segment_index,
+            message="历史邮件导入中",
+        )
+
+        current_segment_index = max(0, start_segment_index - 1)
+        next_segment_index = start_segment_index
+        for index, (segment_start, segment_end) in enumerate(
+            segments[start_segment_index - 1 :],
+            start_segment_index,
+        ):
+            current_segment_index = index
+            if cancel_event and cancel_event.is_set():
+                cancelled = True
+                next_segment_index = index
+                break
+
+            def publish(payload: dict[str, Any], *, segment_index: int = index) -> None:
+                current = {
+                    "fetched": aggregate["scanned"] + int(payload.get("fetched") or 0),
+                    "matched": aggregate["matched"] + int(payload.get("matched") or 0),
+                    "saved": aggregate["saved"] + int(payload.get("saved") or 0),
+                    "duplicates": aggregate["duplicates"] + int(payload.get("duplicates") or 0),
+                    "skipped": aggregate["skipped"] + int(payload.get("skipped") or 0),
+                    "rule_skipped": aggregate["rule_skipped"] + int(payload.get("rule_skipped") or 0),
+                    "failed": aggregate["failed"] + int(payload.get("failed") or 0),
+                    "segment_index": segment_index,
+                    "total_segments": len(segments),
+                }
+                upsert_history_import_run(
+                    self.cfg.db_path,
+                    run_id=stable_run_id,
+                    account_id=target_account_id,
+                    preset=storage_preset,
+                    date_from=start.isoformat(timespec="seconds"),
+                    date_to=end.isoformat(timespec="seconds"),
+                    apply_receive_rule=apply_receive_rule,
+                    status="running",
+                    scanned=current["fetched"],
+                    matched=current["matched"],
+                    saved=current["saved"],
+                    duplicates=current["duplicates"],
+                    rule_skipped=current["rule_skipped"],
+                    failed=current["failed"],
+                    segment_index=segment_index,
+                    total_segments=len(segments),
+                    next_segment_index=segment_index,
+                    message=f"正在导入第 {segment_index}/{len(segments)} 段",
+                )
+                if progress_callback:
+                    progress_callback(current)
+
+            result = self.historical_rescan(
+                account_id=target_account_id,
+                date_from=segment_start,
+                date_to=segment_end,
+                apply_receive_rule=apply_receive_rule,
+                cancel_event=cancel_event,
+                progress_callback=publish,
+                page_size=page_size,
+                scan_cap=scan_cap,
+            )
+            backend = backend or result.backend
+            for key, attribute in (
+                ("scanned", "scanned"),
+                ("matched", "matched"),
+                ("saved", "saved"),
+                ("duplicates", "duplicates"),
+                ("skipped", "skipped"),
+                ("rule_skipped", "rule_skipped"),
+                ("failed", "failed"),
+                ("attachments", "attachments"),
+            ):
+                aggregate[key] += int(getattr(result, attribute) or 0)
+            saved_files.extend(result.saved_files)
+            errors.extend(result.errors)
+            cancelled = cancelled or result.cancelled
+            truncated = truncated or result.truncated
+            if (
+                result.cancelled
+                or result.truncated
+                or result.failed
+                or result.status
+                in {
+                    OperationStatus.FAILED,
+                    OperationStatus.AUTH_REQUIRED,
+                    OperationStatus.PARTIAL,
+                }
+            ):
+                retry_from_segment = (
+                    index
+                    if retry_from_segment is None
+                    else min(retry_from_segment, index)
+                )
+            next_segment_index = retry_from_segment or (index + 1)
+            if result.status in {
+                OperationStatus.FAILED,
+                OperationStatus.AUTH_REQUIRED,
+            }:
+                hard_failure = result
+                break
+            if cancelled or truncated:
+                break
+
+        if cancelled:
+            status = OperationStatus.CANCELLED
+            error_code = "history_import_cancelled"
+            message = "历史邮件导入已取消，已完成的结果已保留，可继续导入"
+            db_status = "cancelled"
+        elif hard_failure is not None and not (
+            aggregate["saved"] or aggregate["duplicates"]
+        ):
+            status = hard_failure.status
+            error_code = hard_failure.error_code or "history_import_failed"
+            message = hard_failure.message or "历史邮件导入失败"
+            db_status = "failed"
+        elif (
+            hard_failure is not None
+            or truncated
+            or aggregate["failed"]
+            or retry_from_segment is not None
+        ):
+            status = OperationStatus.PARTIAL
+            error_code = (
+                "history_import_truncated"
+                if truncated
+                else "history_import_partial"
+            )
+            message = "历史邮件导入部分完成，成功结果已保留，可继续导入"
+            db_status = "partial"
+        elif aggregate["saved"] == 0:
+            status = OperationStatus.NO_CHANGES
+            error_code = None
+            message = f"历史邮件导入完成：没有新增邮件，重复 {aggregate['duplicates']} 封"
+            db_status = "no_changes"
+        else:
+            status = OperationStatus.SUCCESS
+            error_code = None
+            message = (
+                f"历史邮件导入完成：新增 {aggregate['saved']} 封，"
+                f"重复 {aggregate['duplicates']} 封"
+            )
+            db_status = "completed"
+        completed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        upsert_history_import_run(
+            self.cfg.db_path,
+            run_id=stable_run_id,
+            account_id=target_account_id,
+            preset=storage_preset,
+            date_from=start.isoformat(timespec="seconds"),
+            date_to=end.isoformat(timespec="seconds"),
+            apply_receive_rule=apply_receive_rule,
+            status=db_status,
+            **aggregate,
+            segment_index=min(len(segments), current_segment_index),
+            total_segments=len(segments),
+            next_segment_index=min(len(segments) + 1, next_segment_index),
+            cancel_requested=cancelled,
+            truncated=truncated,
+            error_code=error_code,
+            message=message,
+            completed_at=completed_at,
+        )
+        return ReceiveResult(
+            status,
+            backend=backend,
+            scanned=aggregate["scanned"],
+            matched=aggregate["matched"],
+            accepted=aggregate["saved"],
+            saved=aggregate["saved"],
+            skipped=aggregate["skipped"],
+            rule_skipped=aggregate["rule_skipped"],
+            duplicates=aggregate["duplicates"],
+            failed=aggregate["failed"],
+            attachments=aggregate["attachments"],
+            saved_files=saved_files,
+            errors=errors,
+            cancelled=cancelled,
+            truncated=truncated,
+            scan_id=stable_run_id,
+            error_code=error_code,
+            message=message,
+            details={
+                "segment_index": min(
+                    len(segments), current_segment_index
+                ),
+                "total_segments": len(segments),
+                "next_segment_index": min(
+                    len(segments) + 1, next_segment_index
+                ),
+                "history_run_id": stable_run_id,
+            },
+        )
+
+    def resume_history_import(
+        self,
+        run_id: str,
+        *,
+        cancel_event: threading.Event | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> ReceiveResult:
+        self.initialize()
+        row = get_history_import_run(self.cfg.db_path, str(run_id))
+        if row is None:
+            return ReceiveResult(
+                OperationStatus.FAILED,
+                error_code="history_import_not_found",
+                message="历史导入记录不存在",
+            )
+        next_segment_index = max(1, int(row.get("next_segment_index") or 1))
+        total_segments = max(1, int(row.get("total_segments") or 1))
+        if (
+            next_segment_index > total_segments
+            and str(row.get("status") or "") in {"completed", "no_changes"}
+        ):
+            return ReceiveResult(
+                OperationStatus.NO_CHANGES,
+                scan_id=str(row["run_id"]),
+                message="历史邮件导入已经完成，无需继续",
+                details={
+                    "segment_index": total_segments,
+                    "total_segments": total_segments,
+                    "next_segment_index": next_segment_index,
+                    "history_run_id": str(row["run_id"]),
+                },
+            )
+        return self.import_historical_mails(
+            account_id=str(row["account_id"]),
+            preset="custom",
+            date_from=str(row["date_from"]),
+            date_to=str(row["date_to"]),
+            apply_receive_rule=bool(row["apply_receive_rule"]),
+            cancel_event=cancel_event,
+            progress_callback=progress_callback,
+            run_id=str(row["run_id"]),
+            resume_from_segment=next_segment_index,
+            persisted_preset=str(row.get("preset") or "custom"),
+            initial_facts={
+                key: (
+                    0
+                    if key == "failed"
+                    else int(row.get(key) or 0)
+                )
+                for key in (
+                    "scanned",
+                    "matched",
+                    "saved",
+                    "duplicates",
+                    "skipped",
+                    "rule_skipped",
+                    "failed",
+                    "attachments",
+                )
+            },
+        )
+
+    def list_history_imports(
+        self, *, account_id: str | None = None, limit: int = 20
+    ) -> ServiceResult:
+        self.initialize()
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            details={
+                "runs": query_history_import_runs(
+                    self.cfg.db_path,
+                    account_id=account_id,
+                    limit=limit,
+                )
+            },
+        )
 
     def get_auto_receive_state(
         self, account_id: str | None = None
@@ -2233,6 +2636,9 @@ class ApplicationService:
         capabilities: list[str] | None = None,
         account_ids: list[str] | None = None,
         workspace_ids: list[str] | None = None,
+        permission_mode: str = "custom",
+        account_scope_mode: str = "selected",
+        workspace_scope_mode: str = "selected",
     ) -> ServiceResult:
         """创建默认拒绝的 Client；scoped token 只在本次结果中返回。"""
         self.initialize()
@@ -2242,12 +2648,18 @@ class ApplicationService:
                 display_name=display_name,
                 config_mode=config_mode,
                 config_scope=config_scope,
+                permission_mode=permission_mode,
+                account_scope_mode=account_scope_mode,
+                workspace_scope_mode=workspace_scope_mode,
             )
             permissions = self._agent_integration.set_permissions(
                 str(client["client_id"]),
                 capabilities=capabilities or [],
                 account_ids=account_ids or [],
                 workspace_ids=workspace_ids or [],
+                permission_mode=permission_mode,
+                account_scope_mode=account_scope_mode,
+                workspace_scope_mode=workspace_scope_mode,
             )
         except (AgentAccessError, CredentialError, sqlite3.Error, ValueError) as exc:
             return ServiceResult(
@@ -2293,6 +2705,13 @@ class ApplicationService:
                 and row.get("capability") == "account.access"
                 and row.get("account_id")
             )
+            if str(client.get("account_scope_mode") or "selected") == "all":
+                client["account_ids"] = sorted(
+                    str(row["account_id"])
+                    for row in query_mail_accounts(
+                        self.cfg.db_path, enabled_only=True
+                    )
+                )
             client["workspace_ids"] = sorted(
                 str(row["workspace_id"])
                 for row in rows
@@ -2301,6 +2720,10 @@ class ApplicationService:
                 and row.get("capability") == "workspace.access"
                 and row.get("workspace_id")
             )
+            if str(client.get("workspace_scope_mode") or "selected") == "all":
+                client["workspace_ids"] = sorted(
+                    str(row["workspace_id"]) for row in workspace_dtos(self.cfg)
+                )
             try:
                 detection = detect_client(
                     str(client["client_type"]),
@@ -2326,15 +2749,37 @@ class ApplicationService:
         account_ids: list[str],
         workspace_ids: list[str],
         denied_capabilities: list[str] | None = None,
+        denied_account_ids: list[str] | None = None,
+        denied_workspace_ids: list[str] | None = None,
+        permission_mode: str | None = None,
+        account_scope_mode: str | None = None,
+        workspace_scope_mode: str | None = None,
     ) -> ServiceResult:
         self.initialize()
         try:
+            client = self._agent_integration.get_client(client_id)
+            if client is None:
+                raise AgentAccessError("unknown_client")
             rows = self._agent_integration.set_permissions(
                 client_id,
                 capabilities=capabilities,
                 account_ids=account_ids,
                 workspace_ids=workspace_ids,
                 denied_capabilities=denied_capabilities or [],
+                denied_account_ids=denied_account_ids or [],
+                denied_workspace_ids=denied_workspace_ids or [],
+                permission_mode=(
+                    permission_mode
+                    or str(client.get("permission_mode") or "custom")
+                ),
+                account_scope_mode=(
+                    account_scope_mode
+                    or str(client.get("account_scope_mode") or "selected")
+                ),
+                workspace_scope_mode=(
+                    workspace_scope_mode
+                    or str(client.get("workspace_scope_mode") or "selected")
+                ),
             )
         except (AgentAccessError, sqlite3.Error, ValueError) as exc:
             return ServiceResult(
@@ -2374,18 +2819,124 @@ class ApplicationService:
 
     def rotate_agent_client_token(self, client_id: str) -> ServiceResult:
         self.initialize()
-        try:
-            token = self._agent_integration.rotate_client_token(client_id)
-        except (AgentAccessError, CredentialError, sqlite3.Error) as exc:
+        client = self._agent_integration.get_client(client_id)
+        if client is None:
             return ServiceResult(
                 OperationStatus.FAILED,
-                error_code=getattr(exc, "code", "client_auth_failed"),
-                message=str(exc),
+                error_code="unknown_client",
+                message="Agent Client 不存在",
+            )
+        previous_token = ""
+        candidate_token = new_client_token()
+        plan: ConfigPlan | None = None
+        try:
+            previous_token = self._agent_integration.get_scoped_token(client_id)
+            configured_path = str(client.get("config_location") or "")
+            should_update_config = bool(
+                configured_path
+                and str(client.get("config_status") or "")
+                not in {"not_configured", "removed"}
+                and str(client.get("config_mode") or "") == "managed"
+            )
+            if should_update_config:
+                detection = detect_client(
+                    str(client["client_type"]),
+                    config_scope=str(client.get("config_scope") or "user"),
+                )
+                if detection.status != "managed_supported":
+                    raise ClientConfigError(
+                        "unsupported_client_version",
+                        "当前 Client 版本未验证，已保留旧 token 和现有配置",
+                    )
+                plan = preview_client_config(
+                    client_id=client_id,
+                    client_type=str(client["client_type"]),
+                    client_token=candidate_token,
+                    config_scope=str(client.get("config_scope") or "user"),
+                    target_path=Path(configured_path),
+                )
+            token = self._agent_integration.rotate_client_token(
+                client_id, replacement_token=candidate_token
+            )
+            if plan is not None:
+                backup_root = (
+                    self.cfg.data_root_path
+                    / "backups"
+                    / "agent_client_configs"
+                )
+                applied = apply_client_config(plan, backup_root=backup_root)
+                try:
+                    insert_agent_config_backup(
+                        self.cfg.db_path,
+                        backup_id=applied.backup_id,
+                        client_id=plan.client_id,
+                        target_type=plan.client_type,
+                        original_path=str(applied.target_path),
+                        backup_path=str(applied.backup_path),
+                        original_hash=applied.original_hash,
+                        applied_hash=applied.applied_hash,
+                        status="applied",
+                    )
+                    update_agent_client(
+                        self.cfg.db_path,
+                        client_id,
+                        config_status="reload_required",
+                    )
+                except sqlite3.Error:
+                    restore_client_config(
+                        target_path=applied.target_path,
+                        backup_path=applied.backup_path,
+                        applied_hash=applied.applied_hash,
+                    )
+                    raise
+                self._prune_agent_config_backups(client_id)
+        except (
+            AgentAccessError,
+            ClientConfigError,
+            CredentialError,
+            sqlite3.Error,
+            OSError,
+        ) as exc:
+            rollback_error: AgentAccessError | None = None
+            if previous_token:
+                try:
+                    current = self._agent_integration.get_scoped_token(client_id)
+                except (AgentAccessError, CredentialError):
+                    current = ""
+                if current == candidate_token:
+                    try:
+                        self._agent_integration.restore_client_token(
+                            client_id,
+                            expected_current=candidate_token,
+                            restored_token=previous_token,
+                        )
+                    except AgentAccessError as restore_exc:
+                        rollback_error = restore_exc
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code=(
+                    rollback_error.code
+                    if rollback_error
+                    else getattr(exc, "code", "token_rotation_failed")
+                ),
+                message=(
+                    str(rollback_error)
+                    if rollback_error
+                    else f"{exc}；旧 token 保持有效"
+                ),
             )
         return ServiceResult(
             OperationStatus.SUCCESS,
-            message="Client scoped token 已轮换，旧 token 立即失效",
-            details={"scoped_token": token},
+            message=(
+                "Client scoped token 与受管配置已一起轮换；请 reload 或重启 Client"
+                if plan is not None
+                else "Client scoped token 已轮换，旧 token 立即失效"
+            ),
+            details={
+                "scoped_token": token,
+                "config_updated": plan is not None,
+                "reload_required": plan is not None,
+            },
         )
 
     def resolve_agent_identity(
@@ -2412,6 +2963,13 @@ class ApplicationService:
     ) -> tuple[str, str]:
         return self._agent_integration.require_workspace(identity, requested)
 
+    def require_agent_submit_path(
+        self, identity: AgentIdentity, file_path: str
+    ) -> tuple[str, str]:
+        return self._agent_integration.require_path_workspace(
+            identity, file_path
+        )
+
     def preview_agent_client_config(
         self,
         client_id: str,
@@ -2428,6 +2986,23 @@ class ApplicationService:
                 message="Agent Client 不存在",
             )
         try:
+            detection = detect_client(
+                str(client["client_type"]),
+                config_scope=str(client.get("config_scope") or "user"),
+            )
+            if detection.status != "managed_supported":
+                raise ClientConfigError(
+                    (
+                        "client_not_installed"
+                        if detection.status == "not_installed"
+                        else "unsupported_client_version"
+                    ),
+                    (
+                        "未检测到该 Client，请使用辅助配置"
+                        if detection.status == "not_installed"
+                        else "当前 Client 版本未验证，请使用辅助配置，未修改外部文件"
+                    ),
+                )
             token = self._agent_integration.get_scoped_token(client_id)
             plan = preview_client_config(
                 client_id=client_id,
@@ -2452,7 +3027,9 @@ class ApplicationService:
                 "plan_id": plan_id,
                 "client_id": client_id,
                 "client_type": client["client_type"],
-                "target_path": str(plan.target_path),
+                "target_path": str(
+                    Path(plan.target_path.parent.name) / plan.target_path.name
+                ),
                 "original_hash": plan.original_hash,
                 "applied_hash": plan.applied_hash,
                 "changed": plan.original_hash != plan.applied_hash,
@@ -2502,6 +3079,7 @@ class ApplicationService:
                     applied_hash=applied.applied_hash,
                 )
                 raise
+            pruned_count = self._prune_agent_config_backups(plan.client_id)
         except (ClientConfigError, sqlite3.Error, OSError) as exc:
             return ServiceResult(
                 OperationStatus.FAILED,
@@ -2520,8 +3098,50 @@ class ApplicationService:
                 "changed": applied.changed,
                 "target_path": str(applied.target_path),
                 "reload_required": True,
+                "pruned_backup_count": pruned_count,
+                "backup_security_notice": (
+                    "配置备份可能含第三方 Client 的原有敏感值，仅保留在当前用户 DATA_ROOT；"
+                    "默认最多 20 份、90 天，并至少保留最近一份可恢复备份。"
+                ),
             },
         )
+
+    def _prune_agent_config_backups(self, client_id: str) -> int:
+        rows = query_agent_config_backups(self.cfg.db_path, client_id)
+        if not rows:
+            return 0
+        backup_root = (
+            self.cfg.data_root_path / "backups" / "agent_client_configs"
+        ).resolve()
+        valid_rows = [
+            row
+            for row in rows
+            if Path(str(row.get("backup_path") or "")).is_file()
+        ]
+        preserve_id = str(valid_rows[0]["backup_id"]) if valid_rows else ""
+        cutoff = datetime.now() - timedelta(
+            days=AGENT_CONFIG_BACKUP_MAX_AGE_DAYS
+        )
+        removed = 0
+        for index, row in enumerate(rows):
+            backup_id = str(row.get("backup_id") or "")
+            if backup_id == preserve_id:
+                continue
+            created = _parse_datetime(row.get("created_at"))
+            expired = bool(created and created < cutoff)
+            over_count = index >= AGENT_CONFIG_BACKUP_MAX_COUNT
+            if not expired and not over_count:
+                continue
+            path = Path(str(row.get("backup_path") or ""))
+            try:
+                assert_within_root(path, backup_root)
+                if path.is_file():
+                    path.unlink()
+                delete_agent_config_backup(self.cfg.db_path, backup_id)
+                removed += 1
+            except (OSError, SecurityError, sqlite3.Error):
+                continue
+        return removed
 
     def list_agent_client_config_backups(
         self, client_id: str
@@ -2601,6 +3221,9 @@ class ApplicationService:
                     client_id=client_id, client_token=token
                 ),
                 "toml": codex_mcp_toml(
+                    client_id=client_id, client_token=token
+                ),
+                "yaml": hermes_mcp_yaml(
                     client_id=client_id, client_token=token
                 ),
                 "contains_scoped_token": True,
@@ -3079,7 +3702,7 @@ class ApplicationService:
                 return ServiceResult(
                     OperationStatus.NO_CHANGES,
                     error_code="workspace_duplicate",
-                    message="该工作区已授权",
+                    message="该资料目录已授权",
                     details={"workspace": str(resolved)},
                 )
             try:
@@ -3087,7 +3710,7 @@ class ApplicationService:
                 return ServiceResult(
                     OperationStatus.NO_CHANGES,
                     error_code="workspace_nested",
-                    message="该目录已包含在现有授权工作区中",
+                    message="该目录已包含在现有授权资料目录中",
                     details={"workspace": str(resolved)},
                 )
             except ValueError:
@@ -3097,7 +3720,7 @@ class ApplicationService:
                 return ServiceResult(
                     OperationStatus.FAILED,
                     error_code="workspace_broader_than_existing",
-                    message="新目录会扩大现有授权范围，请先移除较小工作区后再明确授权",
+                    message="新目录会扩大现有授权范围，请先移除较小资料目录后再明确授权",
                 )
             except ValueError:
                 pass
@@ -3111,12 +3734,12 @@ class ApplicationService:
             return ServiceResult(
                 OperationStatus.FAILED,
                 error_code="workspace_save_failed",
-                message=f"保存工作区授权失败：{exc}",
+                message=f"保存资料目录授权失败：{exc}",
             )
         self.cfg.allowed_send_roots = updated
         return ServiceResult(
             OperationStatus.SUCCESS,
-            message="工作区已授权；新授权将在下一次 MCP 会话生效",
+            message="资料目录已授权；新授权将在下一次 MCP 会话生效",
             details={"workspace": str(resolved), "takes_effect": "next_mcp_session"},
         )
 
@@ -3138,7 +3761,7 @@ class ApplicationService:
             return ServiceResult(
                 OperationStatus.NO_CHANGES,
                 error_code="workspace_not_found",
-                message="该工作区未授权",
+                message="该资料目录未授权",
             )
         try:
             save_env_values(
@@ -3149,12 +3772,12 @@ class ApplicationService:
             return ServiceResult(
                 OperationStatus.FAILED,
                 error_code="workspace_save_failed",
-                message=f"保存工作区授权失败：{exc}",
+                message=f"保存资料目录授权失败：{exc}",
             )
         self.cfg.allowed_send_roots = updated
         return ServiceResult(
             OperationStatus.SUCCESS,
-            message="工作区授权已移除；下一次 MCP 会话将使用新范围",
+            message="资料目录授权已移除；下一次 MCP 会话将使用新范围",
             details={"workspace": str(resolved), "takes_effect": "next_mcp_session"},
         )
 
@@ -3497,7 +4120,10 @@ class ApplicationService:
         return ServiceResult(OperationStatus.SUCCESS, details={"resource": details, **details})
 
     def prepare_mail_resources(
-        self, package_id: str, resource_ids: list[str], **options: Any
+        self,
+        package_id: str,
+        resource_ids: list[str] | None = None,
+        **options: Any,
     ) -> ServiceResult:
         disabled = self._mail_read_disabled()
         if disabled:
@@ -3524,9 +4150,13 @@ class ApplicationService:
         )
         return ServiceResult(
             status,
-            error_code="preparation_failed" if details["failed_count"] else None,
+            error_code=(
+                "preparation_failed" if details["failed_count"] else None
+            ),
             message=(
-                f"已准备 {details['prepared_count']} 个资源"
+                "完整邮件资料已原子准备到 Agent 可用资料目录"
+                if details.get("mode") == "complete"
+                else f"已准备 {details['prepared_count']} 个资源"
                 if not details["failed_count"]
                 else f"已准备 {details['prepared_count']} 个，失败 {details['failed_count']} 个"
             ),

@@ -19,6 +19,7 @@ common_datas = [
 ]
 common_datas += collect_data_files("certifi")
 common_datas += copy_metadata("IMAPClient")
+common_datas += copy_metadata("ruamel.yaml")
 common_hiddenimports = (
     collect_submodules("googleapiclient")
     + collect_submodules("google_auth_oauthlib")

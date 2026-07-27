@@ -216,6 +216,9 @@ CREATE TABLE IF NOT EXISTS agent_clients (
     display_name TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 0,
     state TEXT NOT NULL DEFAULT 'active',
+    permission_mode TEXT NOT NULL DEFAULT 'custom',
+    account_scope_mode TEXT NOT NULL DEFAULT 'selected',
+    workspace_scope_mode TEXT NOT NULL DEFAULT 'selected',
     config_mode TEXT NOT NULL DEFAULT 'manual',
     config_scope TEXT NOT NULL DEFAULT 'user',
     config_location TEXT,
@@ -255,6 +258,35 @@ CREATE TABLE IF NOT EXISTS agent_client_config_backups (
     restored_at TEXT,
     status TEXT NOT NULL,
     FOREIGN KEY(client_id) REFERENCES agent_clients(client_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS history_import_runs (
+    run_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    preset TEXT NOT NULL DEFAULT 'custom',
+    date_from TEXT NOT NULL,
+    date_to TEXT NOT NULL,
+    apply_receive_rule INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'running',
+    scanned INTEGER NOT NULL DEFAULT 0,
+    matched INTEGER NOT NULL DEFAULT 0,
+    saved INTEGER NOT NULL DEFAULT 0,
+    duplicates INTEGER NOT NULL DEFAULT 0,
+    skipped INTEGER NOT NULL DEFAULT 0,
+    rule_skipped INTEGER NOT NULL DEFAULT 0,
+    failed INTEGER NOT NULL DEFAULT 0,
+    attachments INTEGER NOT NULL DEFAULT 0,
+    segment_index INTEGER NOT NULL DEFAULT 0,
+    total_segments INTEGER NOT NULL DEFAULT 1,
+    next_segment_index INTEGER NOT NULL DEFAULT 1,
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
+    truncated INTEGER NOT NULL DEFAULT 0,
+    error_code TEXT,
+    message TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    FOREIGN KEY(account_id) REFERENCES mail_accounts(account_id)
 );
 
 CREATE TABLE IF NOT EXISTS mail_packages (
@@ -610,8 +642,18 @@ _MAIL_ACCOUNTS_V141_COLUMNS = {
 MULTI_ACCOUNT_MIGRATION_KEY = "multi_account_core_v1"
 MULTI_ACCOUNT_SCHEMA_VERSION = 3
 AGENT_INTEGRATION_MIGRATION_KEY = "agent_integration_permission_v1"
-AGENT_INTEGRATION_SCHEMA_VERSION = 1
+AGENT_INTEGRATION_SCHEMA_VERSION = 2
 LEGACY_UNKNOWN_ACCOUNT_ID = stable_account_id("generic", "legacy-unknown")
+
+_AGENT_CLIENT_V16_COLUMNS = {
+    "permission_mode": "TEXT NOT NULL DEFAULT 'custom'",
+    "account_scope_mode": "TEXT NOT NULL DEFAULT 'selected'",
+    "workspace_scope_mode": "TEXT NOT NULL DEFAULT 'selected'",
+}
+
+_HISTORY_IMPORT_V16_COLUMNS = {
+    "next_segment_index": "INTEGER NOT NULL DEFAULT 1",
+}
 
 RECEIVE_RETRY_DELAYS_SECONDS = (60, 300, 1800, 7200)
 RECEIVE_RETRY_TERMINAL_COUNT = 5
@@ -716,10 +758,17 @@ def _migrate_mcp_calls(conn: sqlite3.Connection) -> None:
 def _migrate_agent_integration(conn: sqlite3.Connection) -> None:
     """补充 Client 审计字段并登记一次幂等权限地基迁移。"""
     _add_missing_columns(conn, "mcp_audit_events", _MCP_AUDIT_AGENT_COLUMNS)
+    _add_missing_columns(conn, "agent_clients", _AGENT_CLIENT_V16_COLUMNS)
+    _add_missing_columns(
+        conn, "history_import_runs", _HISTORY_IMPORT_V16_COLUMNS
+    )
     now = _now()
     details = json.dumps(
         {
-            "client_tables": 3,
+            "client_tables": 4,
+            "legacy_clients_kept_selected_scope": True,
+            "dynamic_scope_added": True,
+            "history_import_state_added": True,
             "mail_packages_moved": False,
             "raw_or_hash_rewritten": False,
             "legacy_anonymous_grant_created": False,
@@ -1946,8 +1995,25 @@ def agent_integration_migration_needed(db_path: Path | str) -> bool:
             "agent_clients",
             "agent_client_permissions",
             "agent_client_config_backups",
+            "history_import_runs",
         }
         if not required.issubset(tables):
+            return True
+        client_columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(agent_clients)"
+            ).fetchall()
+        }
+        if not set(_AGENT_CLIENT_V16_COLUMNS).issubset(client_columns):
+            return True
+        history_columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(history_import_runs)"
+            ).fetchall()
+        }
+        if not set(_HISTORY_IMPORT_V16_COLUMNS).issubset(history_columns):
             return True
         audit_columns = {
             str(row[1])
@@ -3082,6 +3148,9 @@ def create_agent_client(
     credential_ref: str,
     token_hash: str,
     enabled: bool = False,
+    permission_mode: str = "custom",
+    account_scope_mode: str = "selected",
+    workspace_scope_mode: str = "selected",
     notes: str | None = None,
 ) -> dict[str, Any]:
     now = _now()
@@ -3090,15 +3159,20 @@ def create_agent_client(
             """
             INSERT INTO agent_clients
                 (client_id, client_type, display_name, enabled, state,
+                 permission_mode, account_scope_mode, workspace_scope_mode,
                  config_mode, config_scope, config_status, credential_ref,
                  token_hash, created_at, updated_at, notes)
-            VALUES (?, ?, ?, ?, 'active', ?, ?, 'not_configured', ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, 'not_configured',
+                    ?, ?, ?, ?, ?)
             """,
             (
                 client_id,
                 client_type,
                 display_name,
                 1 if enabled else 0,
+                permission_mode,
+                account_scope_mode,
+                workspace_scope_mode,
                 config_mode,
                 config_scope,
                 credential_ref,
@@ -3151,6 +3225,9 @@ def update_agent_client(
         "display_name",
         "enabled",
         "state",
+        "permission_mode",
+        "account_scope_mode",
+        "workspace_scope_mode",
         "config_mode",
         "config_scope",
         "config_location",
@@ -3322,6 +3399,171 @@ def update_agent_config_backup(
             (status, restored_at, backup_id),
         )
         conn.commit()
+
+
+def delete_agent_config_backup(
+    db_path: Path | str, backup_id: str
+) -> None:
+    with _get_conn(db_path) as conn:
+        conn.execute(
+            "DELETE FROM agent_client_config_backups WHERE backup_id = ?",
+            (backup_id,),
+        )
+        conn.commit()
+
+
+def upsert_history_import_run(
+    db_path: Path | str,
+    *,
+    run_id: str,
+    account_id: str,
+    preset: str,
+    date_from: str,
+    date_to: str,
+    apply_receive_rule: bool,
+    status: str = "running",
+    **facts: Any,
+) -> dict[str, Any]:
+    now = _now()
+    allowed_facts = {
+        "scanned",
+        "matched",
+        "saved",
+        "duplicates",
+        "skipped",
+        "rule_skipped",
+        "failed",
+        "attachments",
+        "segment_index",
+        "total_segments",
+        "next_segment_index",
+        "cancel_requested",
+        "truncated",
+        "error_code",
+        "message",
+        "completed_at",
+    }
+    values = {key: facts.get(key) for key in allowed_facts}
+    integer_fields = {
+        "scanned",
+        "matched",
+        "saved",
+        "duplicates",
+        "skipped",
+        "rule_skipped",
+        "failed",
+        "attachments",
+        "segment_index",
+        "total_segments",
+        "next_segment_index",
+    }
+    for key in integer_fields:
+        values[key] = int(
+            values.get(key)
+            or (1 if key in {"total_segments", "next_segment_index"} else 0)
+        )
+    for key in ("cancel_requested", "truncated"):
+        values[key] = 1 if values.get(key) else 0
+    with _get_conn(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO history_import_runs
+                (run_id, account_id, preset, date_from, date_to,
+                 apply_receive_rule, status, scanned, matched, saved,
+                 duplicates, skipped, rule_skipped, failed, attachments,
+                 segment_index, total_segments, next_segment_index,
+                 cancel_requested, truncated,
+                 error_code, message, created_at, updated_at, completed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id) DO UPDATE SET
+                status=excluded.status,
+                scanned=excluded.scanned,
+                matched=excluded.matched,
+                saved=excluded.saved,
+                duplicates=excluded.duplicates,
+                skipped=excluded.skipped,
+                rule_skipped=excluded.rule_skipped,
+                failed=excluded.failed,
+                attachments=excluded.attachments,
+                segment_index=excluded.segment_index,
+                total_segments=excluded.total_segments,
+                next_segment_index=excluded.next_segment_index,
+                cancel_requested=excluded.cancel_requested,
+                truncated=excluded.truncated,
+                error_code=excluded.error_code,
+                message=excluded.message,
+                updated_at=excluded.updated_at,
+                completed_at=excluded.completed_at
+            """,
+            (
+                run_id,
+                account_id,
+                preset,
+                date_from,
+                date_to,
+                1 if apply_receive_rule else 0,
+                status,
+                values["scanned"],
+                values["matched"],
+                values["saved"],
+                values["duplicates"],
+                values["skipped"],
+                values["rule_skipped"],
+                values["failed"],
+                values["attachments"],
+                values["segment_index"],
+                values["total_segments"],
+                values["next_segment_index"],
+                values["cancel_requested"],
+                values["truncated"],
+                values.get("error_code"),
+                values.get("message"),
+                now,
+                now,
+                values.get("completed_at"),
+            ),
+        )
+        conn.commit()
+    return get_history_import_run(db_path, run_id) or {}
+
+
+def get_history_import_run(
+    db_path: Path | str, run_id: str
+) -> dict[str, Any] | None:
+    with _get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM history_import_runs WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    for key in ("apply_receive_rule", "cancel_requested", "truncated"):
+        result[key] = bool(result.get(key))
+    return result
+
+
+def query_history_import_runs(
+    db_path: Path | str,
+    *,
+    account_id: str | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    safe_limit = max(1, min(int(limit), 100))
+    sql = "SELECT * FROM history_import_runs"
+    params: list[Any] = []
+    if account_id:
+        sql += " WHERE account_id = ?"
+        params.append(account_id)
+    sql += " ORDER BY created_at DESC, run_id DESC LIMIT ?"
+    params.append(safe_limit)
+    with _get_conn(db_path) as conn:
+        rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
+    for row in rows:
+        for key in ("apply_receive_rule", "cancel_requested", "truncated"):
+            row[key] = bool(row.get(key))
+    return rows
 
 
 # mcp_calls

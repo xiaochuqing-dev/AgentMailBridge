@@ -9,7 +9,10 @@ import io
 import json
 import mimetypes
 import os
+import shutil
 import struct
+import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +65,10 @@ def workspace_dtos(cfg: AppConfig) -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def workspace_id_for_path(path: Path | str) -> str:
+    return _workspace_id(Path(path).resolve())
 
 
 def resource_capabilities(resource: dict[str, Any]) -> list[str]:
@@ -150,7 +157,7 @@ def read_mail_resource(
         raise MailAccessError("unsupported_resource_type", "raw 模式只用于当前邮件的 raw.eml")
     if normalized_mode != "raw" and "directly_readable" not in descriptor["capabilities"]:
         if "binary_file" in descriptor["capabilities"] or "visual_file" in descriptor["capabilities"]:
-            raise MailAccessError("binary_resource", "该资源是二进制文件，请使用 preview 或准备到工作区")
+            raise MailAccessError("binary_resource", "该资源是二进制文件，请使用 preview 或准备到资料目录")
         raise MailAccessError("unsupported_resource_type", "该资源不支持文本读取")
     encoding = detect_text_encoding(path, allow_rfc822=normalized_mode == "raw")
     page = _read_text_page(path, encoding, safe_offset, safe_chars)
@@ -197,12 +204,26 @@ def csv_preview(path: Path, *, row_offset: int, max_rows: int) -> dict[str, Any]
 def prepare_mail_resources(
     cfg: AppConfig,
     message: dict[str, Any],
-    resource_ids: list[str],
+    resource_ids: list[str] | None,
     *,
+    mode: str = "resources",
     target_workspace: str | None = None,
     target_subdir: str | None = None,
     overwrite_policy: str = "rename",
 ) -> dict[str, Any]:
+    normalized_mode = str(mode or "resources").strip().lower()
+    if normalized_mode not in {"resources", "complete"}:
+        raise MailAccessError(
+            "invalid_range", "mode 仅支持 resources 或 complete"
+        )
+    if normalized_mode == "complete":
+        return _prepare_complete_mail_package(
+            cfg,
+            message,
+            target_workspace=target_workspace,
+            target_subdir=target_subdir,
+            overwrite_policy=overwrite_policy,
+        )
     if not resource_ids or not all(isinstance(item, str) and item.strip() for item in resource_ids):
         raise MailAccessError("invalid_range", "resource_ids 必须包含至少一个资源标识")
     policy = str(overwrite_policy or "rename").strip().lower()
@@ -257,6 +278,7 @@ def prepare_mail_resources(
     note_text = _mail_note(message, prepared)
     _atomic_write_text(note, note_text)
     return {
+        "mode": "resources",
         "mail_id": package_id,
         "package_id": package_id,
         "workspace_id": _workspace_id(workspace),
@@ -269,6 +291,464 @@ def prepare_mail_resources(
         "failed_count": len(failures),
         "status": "partial" if failures and prepared else "failed" if failures else "success",
     }
+
+
+def _prepare_complete_mail_package(
+    cfg: AppConfig,
+    message: dict[str, Any],
+    *,
+    target_workspace: str | None,
+    target_subdir: str | None,
+    overwrite_policy: str,
+) -> dict[str, Any]:
+    policy = str(overwrite_policy or "rename").strip().lower()
+    if policy not in {"rename", "error", "overwrite"}:
+        raise MailAccessError(
+            "invalid_range",
+            "overwrite_policy 仅支持 rename、error 或 overwrite",
+        )
+    workspace = _select_workspace(cfg, target_workspace)
+    package_id = str(message.get("package_id") or "")
+    package_segment = _safe_package_segment(package_id)
+    try:
+        package_root = Path(
+            str(message.get("package_root") or "")
+        ).resolve(strict=True)
+    except OSError as exc:
+        raise MailAccessError(
+            "complete_mail_prepare_denied",
+            "邮件归档目录不可用",
+        ) from exc
+    source_snapshot = _archive_snapshot(package_root)
+    requested_subdir = _safe_subdir(target_subdir)
+    relative_destination = requested_subdir or Path("完整邮件资料")
+    parent_parts = [
+        ".agentmailbridge",
+        "mail",
+        package_segment,
+        *relative_destination.parent.parts,
+    ]
+    parent = _ensure_workspace_directory(workspace, parent_parts)
+    destination = parent / relative_destination.name
+    destination = _complete_collision_target(destination, policy)
+    # 临时名与中文目标名解耦，避免 Windows 未启用长路径时重复准备越过 MAX_PATH。
+    stage = parent / f".ambc-{uuid.uuid4().hex[:12]}.tmp"
+    rollback: Path | None = None
+    prepared: list[dict[str, Any]] = []
+    stage_step = "create_stage"
+    try:
+        stage.mkdir()
+        for name in ("附件", "邮件内图片", "下载文件"):
+            (stage / name).mkdir()
+
+        stage_step = "copy_body"
+        readable = _readable_body_resource(message)
+        body_source = _resource_path(message, readable, raw=False)
+        _copy_complete_file(
+            body_source,
+            stage / "邮件正文.md",
+            expected_sha=str(readable.get("sha256") or ""),
+            resource_id=str(readable.get("resource_id") or "body.readable"),
+            source_relative=str(readable.get("path") or ""),
+            prepared=prepared,
+        )
+
+        stage_step = "copy_raw"
+        raw = _find_resource(message, "raw.eml")
+        raw_source = _resource_path(message, raw, raw=True)
+        _copy_complete_file(
+            raw_source,
+            stage / "原始邮件.eml",
+            expected_sha=str(raw.get("sha256") or ""),
+            resource_id="raw.eml",
+            source_relative=str(raw.get("path") or ""),
+            prepared=prepared,
+        )
+
+        stage_step = "copy_resources"
+        for resource in message.get("resources") or []:
+            internal_type = str(resource.get("internal_type") or "")
+            folder = {
+                "attachment": "附件",
+                "inline_image": "邮件内图片",
+                "downloaded_file": "下载文件",
+            }.get(internal_type)
+            if not folder or not resource.get("absolute_path"):
+                continue
+            stage_step = f"copy_resource_{internal_type}"
+            source = _resource_path(message, dict(resource), raw=False)
+            display_name = str(resource.get("display_name") or source.name)
+            stem = sanitize_filename(Path(display_name).stem) or "文件"
+            safe_name = stem + Path(display_name).suffix.lower()
+            target = _collision_target(stage / folder / safe_name, "rename")
+            _copy_complete_file(
+                source,
+                target,
+                expected_sha=str(resource.get("sha256") or ""),
+                resource_id=str(resource.get("resource_id") or ""),
+                source_relative=str(resource.get("path") or ""),
+                prepared=prepared,
+            )
+
+        stage_step = "copy_source_manifest"
+        original_manifest = package_root / "manifest.json"
+        try:
+            assert_within_root(
+                original_manifest.resolve(strict=True), package_root
+            )
+        except (OSError, SecurityError) as exc:
+            raise MailAccessError(
+                "resource_not_local", "原始归档 manifest 不可用"
+            ) from exc
+        _copy_complete_file(
+            original_manifest,
+            stage / "原始归档manifest.json",
+            expected_sha="",
+            resource_id="archive.manifest",
+            source_relative="manifest.json",
+            prepared=prepared,
+        )
+
+        stage_step = "write_info"
+        info_path = stage / "邮件信息.json"
+        _atomic_write_json(info_path, _complete_mail_info(message))
+        prepared.append(_prepared_fact(info_path, "mail.info", ""))
+
+        stage_step = "write_manifest"
+        manifest_path = stage / "完整资料manifest.json"
+        manifest = _complete_package_manifest(message, prepared)
+        _atomic_write_json(manifest_path, manifest)
+        manifest_fact = _prepared_fact(manifest_path, "complete.manifest", "")
+        prepared.append(manifest_fact)
+
+        stage_step = "verify_staging"
+        for fact in prepared:
+            path = stage / str(fact["relative_path"])
+            if (
+                not path.is_file()
+                or path.stat().st_size != int(fact["size_bytes"])
+                or sha256_of_file(path) != str(fact["sha256"])
+            ):
+                raise MailAccessError(
+                    "complete_mail_hash_mismatch",
+                    "完整邮件资料发布前 Hash 复核失败",
+                )
+        if _archive_snapshot(package_root) != source_snapshot:
+            raise MailAccessError(
+                "complete_mail_hash_mismatch",
+                "完整邮件资料准备期间源归档发生变化",
+            )
+
+        stage_step = "publish"
+        if policy == "overwrite" and destination.exists():
+            if (
+                destination.is_symlink()
+                or (
+                    hasattr(destination, "is_junction")
+                    and destination.is_junction()
+                )
+                or not destination.is_dir()
+            ):
+                raise MailAccessError(
+                    "complete_mail_prepare_denied",
+                    "完整邮件资料目标被不安全对象占用",
+                )
+            rollback = parent / f".ambc-{uuid.uuid4().hex[:12]}.rollback"
+            os.replace(destination, rollback)
+        os.replace(stage, destination)
+        if rollback is not None:
+            shutil.rmtree(rollback, ignore_errors=True)
+            rollback = None
+    except MailAccessError as exc:
+        if rollback is not None and rollback.exists() and not destination.exists():
+            os.replace(rollback, destination)
+            rollback = None
+        if exc.code in {"hash_mismatch", "complete_mail_hash_mismatch"}:
+            raise MailAccessError(
+                "complete_mail_hash_mismatch",
+                "完整邮件资料源文件或复制结果 Hash 不一致",
+            ) from exc
+        if exc.code in {
+            "path_not_allowed",
+            "workspace_not_found",
+            "workspace_required",
+            "complete_mail_prepare_denied",
+        }:
+            raise MailAccessError(
+                "complete_mail_prepare_denied",
+                "完整邮件资料准备被目录或 ownership 边界拒绝",
+            ) from exc
+        raise
+    except OSError as exc:
+        if rollback is not None and rollback.exists() and not destination.exists():
+            try:
+                os.replace(rollback, destination)
+                rollback = None
+            except OSError:
+                pass
+        raise MailAccessError(
+            "complete_mail_prepare_failed",
+            "完整邮件资料准备失败",
+            os_error_type=type(exc).__name__,
+            stage_step=stage_step,
+            errno=getattr(exc, "errno", None),
+            winerror=getattr(exc, "winerror", None),
+        ) from exc
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage, ignore_errors=True)
+
+    final_prepared = [
+        {
+            **fact,
+            "prepared_path": str(destination / str(fact["relative_path"])),
+        }
+        for fact in prepared
+    ]
+    return {
+        "mode": "complete",
+        "mail_id": package_id,
+        "package_id": package_id,
+        "account_id": str(message.get("account_id") or ""),
+        "workspace_id": _workspace_id(workspace),
+        "workspace_path": str(workspace),
+        "target_directory": str(destination),
+        "manifest_path": str(destination / "完整资料manifest.json"),
+        "prepared": final_prepared,
+        "failures": [],
+        "prepared_count": len(final_prepared),
+        "failed_count": 0,
+        "status": "success",
+        "atomic_publish": True,
+        "source_archive_unchanged": True,
+        "source_archive_file_count": len(source_snapshot),
+    }
+
+
+def _readable_body_resource(message: dict[str, Any]) -> dict[str, Any]:
+    for resource in message.get("resources") or []:
+        if str(resource.get("internal_type") or "") == "body_readable":
+            return dict(resource)
+    body = dict(message.get("body") or {})
+    path = str(body.get("readable_path") or "")
+    absolute_path = str(body.get("readable_absolute_path") or "")
+    if not path and not absolute_path:
+        raise MailAccessError(
+            "resource_not_local", "当前邮件没有可用的可读正文"
+        )
+    return {
+        "resource_id": "body.readable",
+        "package_id": str(message.get("package_id") or ""),
+        "internal_type": "body_readable",
+        "display_name": "邮件正文.txt",
+        "path": path,
+        "absolute_path": absolute_path,
+        "sha256": body.get("text_sha256"),
+        "status": "saved",
+    }
+
+
+def _copy_complete_file(
+    source: Path,
+    target: Path,
+    *,
+    expected_sha: str,
+    resource_id: str,
+    source_relative: str,
+    prepared: list[dict[str, Any]],
+) -> None:
+    source_sha = sha256_of_file(source)
+    if expected_sha and source_sha.casefold() != expected_sha.casefold():
+        raise MailAccessError(
+            "complete_mail_hash_mismatch",
+            "完整邮件资料源文件 Hash 与归档事实不一致",
+        )
+    source_size = source.stat().st_size
+    atomic_copy_file(source, target)
+    copied_sha = sha256_of_file(target)
+    if (
+        copied_sha != source_sha
+        or target.stat().st_size != source_size
+        or sha256_of_file(source) != source_sha
+        or source.stat().st_size != source_size
+    ):
+        raise MailAccessError(
+            "complete_mail_hash_mismatch",
+            "完整邮件资料复制前后大小或 Hash 不一致",
+        )
+    prepared.append(
+        {
+            "resource_id": resource_id,
+            "relative_path": target.relative_to(
+                next(
+                    parent
+                    for parent in target.parents
+                    if parent.name.endswith(".tmp")
+                )
+            ).as_posix(),
+            "source_relative_path": source_relative,
+            "size_bytes": source_size,
+            "sha256": copied_sha,
+        }
+    )
+
+
+def _prepared_fact(
+    path: Path, resource_id: str, source_relative: str
+) -> dict[str, Any]:
+    stage = next(
+        parent for parent in path.parents if parent.name.endswith(".tmp")
+    )
+    return {
+        "resource_id": resource_id,
+        "relative_path": path.relative_to(stage).as_posix(),
+        "source_relative_path": source_relative,
+        "size_bytes": path.stat().st_size,
+        "sha256": sha256_of_file(path),
+    }
+
+
+def _archive_snapshot(root: Path) -> dict[str, tuple[int, int, str]]:
+    try:
+        package_root = Path(root).resolve(strict=True)
+        if (
+            not package_root.is_dir()
+            or package_root.is_symlink()
+            or (
+                hasattr(package_root, "is_junction")
+                and package_root.is_junction()
+            )
+        ):
+            raise OSError("归档根目录不是普通目录")
+        snapshot: dict[str, tuple[int, int, str]] = {}
+        for candidate in sorted(
+            package_root.rglob("*"), key=lambda item: item.as_posix()
+        ):
+            if candidate.is_symlink() or (
+                hasattr(candidate, "is_junction")
+                and candidate.is_junction()
+            ):
+                raise OSError("归档内包含符号链接或目录联接")
+            if not candidate.is_file():
+                continue
+            resolved = candidate.resolve(strict=True)
+            assert_within_root(resolved, package_root)
+            before = resolved.stat()
+            digest = sha256_of_file(resolved)
+            after = resolved.stat()
+            if (
+                before.st_size != after.st_size
+                or before.st_mtime_ns != after.st_mtime_ns
+            ):
+                raise OSError("归档文件读取期间发生变化")
+            snapshot[resolved.relative_to(package_root).as_posix()] = (
+                after.st_size,
+                after.st_mtime_ns,
+                digest,
+            )
+        return snapshot
+    except (OSError, SecurityError) as exc:
+        raise MailAccessError(
+            "complete_mail_prepare_denied",
+            "邮件归档包含不安全路径或读取期间发生变化",
+        ) from exc
+
+
+def _complete_mail_info(message: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "package_id": str(message.get("package_id") or ""),
+        "account_id": str(message.get("account_id") or ""),
+        "account_ref": str(message.get("account_ref") or ""),
+        "mailbox_ref": str(message.get("mailbox_ref") or ""),
+        "message_id": str(message.get("message_id") or ""),
+        "provider_message_id": str(message.get("provider_message_id") or ""),
+        "thread_ref": str(message.get("thread_ref") or ""),
+        "subject": str(message.get("subject") or ""),
+        "from": message.get("from_addresses") or message.get("from") or [],
+        "to": message.get("to_addresses") or message.get("to") or [],
+        "cc": message.get("cc_addresses") or message.get("cc") or [],
+        "bcc": message.get("bcc_addresses") or message.get("bcc") or [],
+        "sent_at": message.get("sent_at"),
+        "received_at": message.get("received_at"),
+        "saved_at": message.get("saved_at"),
+        "counts": dict(message.get("counts") or {}),
+        "archive_status": str(message.get("archive_status") or ""),
+        "parse_status": str(message.get("parse_status") or ""),
+    }
+
+
+def _complete_package_manifest(
+    message: dict[str, Any], prepared: list[dict[str, Any]]
+) -> dict[str, Any]:
+    resources = []
+    for resource in message.get("resources") or []:
+        resources.append(
+            {
+                key: resource.get(key)
+                for key in (
+                    "resource_id",
+                    "category",
+                    "internal_type",
+                    "source",
+                    "display_name",
+                    "original_name",
+                    "mime_type",
+                    "path",
+                    "url",
+                    "content_id",
+                    "size_bytes",
+                    "sha256",
+                    "status",
+                )
+            }
+        )
+    return {
+        "schema_version": 1,
+        "package_id": str(message.get("package_id") or ""),
+        "account_id": str(message.get("account_id") or ""),
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "source_archive_immutable": True,
+        "files": [dict(item) for item in prepared],
+        "resources": resources,
+    }
+
+
+def _complete_collision_target(path: Path, policy: str) -> Path:
+    if not path.exists() or policy == "overwrite":
+        return path
+    if path.is_symlink() or (
+        hasattr(path, "is_junction") and path.is_junction()
+    ):
+        raise MailAccessError(
+            "complete_mail_prepare_denied",
+            "完整邮件资料目标不能是符号链接或目录联接",
+        )
+    if policy == "error":
+        raise MailAccessError(
+            "complete_mail_prepare_failed",
+            f"完整邮件资料目标已存在：{path.name}",
+        )
+    for index in range(2, 10_000):
+        candidate = path.with_name(f"{path.name} ({index})")
+        if not candidate.exists():
+            return candidate
+    raise MailAccessError(
+        "complete_mail_prepare_failed", "无法生成安全的完整邮件资料目录名"
+    )
+
+
+def _atomic_write_json(path: Path, value: dict[str, Any]) -> None:
+    _atomic_write_text(
+        path,
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+    )
 
 
 def image_metadata(path: Path) -> dict[str, Any]:
@@ -415,14 +895,14 @@ def _select_workspace(cfg: AppConfig, requested: str | None) -> Path:
         for row in rows:
             if requested in {row["workspace_id"], row["display_path"]}:
                 if not row["available"]:
-                    raise MailAccessError("workspace_not_found", "授权工作区当前不可用")
+                    raise MailAccessError("workspace_not_found", "授权资料目录当前不可用")
                 return Path(row["display_path"]).resolve()
-        raise MailAccessError("workspace_not_found", "未找到指定的授权工作区")
+        raise MailAccessError("workspace_not_found", "未找到指定的授权资料目录")
     if len(available) == 1:
         return Path(available[0]["display_path"]).resolve()
     if not available:
-        raise MailAccessError("workspace_required", "请先在 Agent/MCP 页面授权一个项目工作区", workspaces=rows)
-    raise MailAccessError("workspace_required", "存在多个授权工作区，请明确指定 target_workspace", workspaces=available)
+        raise MailAccessError("workspace_required", "请先在 Agent 接入页面授权一个资料目录", workspaces=rows)
+    raise MailAccessError("workspace_required", "存在多个授权资料目录，请明确指定 target_workspace", workspaces=available)
 
 
 def _safe_subdir(value: str | None) -> Path | None:
@@ -430,7 +910,7 @@ def _safe_subdir(value: str | None) -> Path | None:
         return None
     path = Path(str(value).strip())
     if path.is_absolute() or path.anchor or any(part in {"", ".", ".."} for part in path.parts):
-        raise MailAccessError("path_not_allowed", "target_subdir 必须是工作区内的安全相对目录")
+        raise MailAccessError("path_not_allowed", "target_subdir 必须是资料目录内的安全相对目录")
     return path
 
 
@@ -455,12 +935,20 @@ def _ensure_workspace_directory(workspace: Path, parts: list[str]) -> Path:
     try:
         root = workspace.resolve(strict=True)
     except OSError as exc:
-        raise MailAccessError("workspace_not_found", "授权工作区当前不可用") from exc
+        raise MailAccessError("workspace_not_found", "授权资料目录当前不可用") from exc
     current = root
     for part in parts:
         candidate = current / part
         try:
             if candidate.exists() or candidate.is_symlink():
+                if candidate.is_symlink() or (
+                    hasattr(candidate, "is_junction")
+                    and candidate.is_junction()
+                ):
+                    raise MailAccessError(
+                        "path_not_allowed",
+                        "准备目录不能经过符号链接或目录联接",
+                    )
                 resolved = candidate.resolve(strict=True)
                 if not resolved.is_dir():
                     raise MailAccessError("preparation_failed", "准备目录被同名文件占用")
@@ -469,7 +957,7 @@ def _ensure_workspace_directory(workspace: Path, parts: list[str]) -> Path:
                 resolved = candidate.resolve(strict=True)
             assert_within_root(resolved, root)
         except SecurityError as exc:
-            raise MailAccessError("path_not_allowed", "准备目录超出授权工作区") from exc
+            raise MailAccessError("path_not_allowed", "准备目录超出授权资料目录") from exc
         except MailAccessError:
             raise
         except OSError as exc:

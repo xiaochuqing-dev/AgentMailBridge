@@ -179,9 +179,10 @@ class McpServer:
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
                 "instructions": (
-                    "邮件读取需启用总开关，并通过当前 Client 的能力、账号和工作区权限；"
-                    "可搜索和分页读取本地归档，可把资源受控准备到授权工作区。"
-                    "submit_result 收件人固定。服务不能读取凭据、修改邮件或遍历任意文件系统路径。"
+                    "邮件读取需启用总开关，并通过当前 Client 的能力、账号和资料目录权限；"
+                    "可搜索和分页读取本地归档，可把单个资源或整封完整邮件资料受控准备到授权目录。"
+                    "submit_result 还会验证当前 Client 的目录范围，收件人固定。"
+                    "服务不能读取凭据、修改邮件或遍历任意文件系统路径。"
                 ),
             },
         )
@@ -311,11 +312,18 @@ class McpServer:
         if tool_name == "prepare_mail_resources":
             options = {
                 key: arguments[key]
-                for key in ("target_workspace", "target_subdir", "overwrite_policy")
+                for key in (
+                    "mode",
+                    "target_workspace",
+                    "target_subdir",
+                    "overwrite_policy",
+                )
                 if key in arguments
             }
             return self.service.prepare_mail_resources(
-                _mail_identifier(arguments), arguments["resource_ids"], **options
+                _mail_identifier(arguments),
+                arguments.get("resource_ids") or [],
+                **options,
             )
         if tool_name == "list_agent_workspaces":
             result = self.service.list_agent_workspaces()
@@ -439,6 +447,13 @@ class McpServer:
                 account_id = sorted(identity.account_ids)[0]
             arguments["account_id"] = account_id
             self._audit_account_id = account_id
+        elif tool_name == "submit_result":
+            workspace_id, _workspace_path = (
+                self.service.require_agent_submit_path(
+                    identity, str(arguments.get("file_path") or "")
+                )
+            )
+            self._audit_workspace_id = workspace_id
         if tool_name == "prepare_mail_resources":
             workspace_id, workspace_path = self.service.require_agent_workspace(
                 identity, arguments.get("target_workspace")
@@ -554,7 +569,7 @@ def _validate_tool_arguments(tool_name: str, arguments: dict[str, Any]) -> str |
         },
         "prepare_mail_resources": {
             "mail_id", "package_id", "resource_ids", "target_workspace",
-            "target_subdir", "overwrite_policy",
+            "target_subdir", "overwrite_policy", "mode",
         },
         "list_agent_workspaces": set(),
         "get_mail_sync_status": {"account_id"},
@@ -575,11 +590,34 @@ def _validate_tool_arguments(tool_name: str, arguments: dict[str, Any]) -> str |
         if not isinstance(arguments.get("resource_id"), str) or not arguments["resource_id"].strip():
             return "resource_id 必须是非空字符串"
     if tool_name == "prepare_mail_resources":
+        mode = str(arguments.get("mode") or "resources").strip().lower()
+        if mode not in {"resources", "complete"}:
+            return "mode 仅支持 resources 或 complete"
         values = arguments.get("resource_ids")
-        if not isinstance(values, list) or not values or not all(
-            isinstance(value, str) and value.strip() for value in values
+        if mode != "complete" and (
+            not isinstance(values, list)
+            or not values
+            or not all(
+                isinstance(value, str) and value.strip() for value in values
+            )
         ):
             return "resource_ids 必须是非空字符串数组"
+        if values is not None and (
+            not isinstance(values, list)
+            or len(values) > 100
+            or not all(
+                isinstance(value, str) and value.strip() for value in values
+            )
+        ):
+            return "resource_ids 必须是最多 100 项的字符串数组"
+        for field in (
+            "mode",
+            "target_workspace",
+            "target_subdir",
+            "overwrite_policy",
+        ):
+            if field in arguments and not isinstance(arguments[field], str):
+                return f"{field} 必须是字符串"
     boolean_fields = {"ensure_fresh", "allow_cached", "has_attachments"}
     for field in boolean_fields & set(arguments):
         if not isinstance(arguments[field], bool):
@@ -748,8 +786,12 @@ def _read_mail_resource_tool() -> dict[str, Any]:
 def _prepare_mail_resources_tool() -> dict[str, Any]:
     return {
         "name": "prepare_mail_resources",
-        "title": "准备邮件资源到工作区",
-        "description": "由 AgentMailBridge 把指定邮件资源原子复制到授权工作区的 .agentmailbridge/mail/<mail-id>/，保留文件名并校验复制前后大小和 SHA-256；不执行、不解压。",
+        "title": "准备邮件资料到授权目录",
+        "description": (
+            "resources 模式把指定资源复制到授权目录；complete 模式原子生成整封邮件资料，"
+            "包含可读正文、真实 raw.eml、邮件信息、来源/完整资料 manifest、附件、邮件内图片和已下载文件。"
+            "两种模式都校验 ownership、路径、大小和 SHA-256，不执行、不解压，也不修改源归档。"
+        ),
         "annotations": _tool_annotations(
             read_only=False, idempotent=False, open_world=False
         ),
@@ -757,12 +799,16 @@ def _prepare_mail_resources_tool() -> dict[str, Any]:
             "type": "object",
             "properties": {
                 **_mail_identifier_properties(),
-                "resource_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 100, "uniqueItems": True},
-                "target_workspace": {"type": "string", "description": "list_agent_workspaces 返回的 workspace_id 或完整路径"},
+                "mode": {
+                    "type": "string",
+                    "enum": ["resources", "complete"],
+                    "default": "resources",
+                },
+                "resource_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 100, "uniqueItems": True},
+                "target_workspace": {"type": "string", "description": "list_agent_workspaces 返回的目录 ID 或完整路径"},
                 "target_subdir": {"type": "string", "description": "邮件目录内的可选安全相对子目录"},
                 "overwrite_policy": {"type": "string", "enum": ["rename", "error", "overwrite"], "default": "rename"},
             },
-            "required": ["resource_ids"],
             "anyOf": [{"required": ["mail_id"]}, {"required": ["package_id"]}],
             "additionalProperties": False,
         },
@@ -773,8 +819,8 @@ def _prepare_mail_resources_tool() -> dict[str, Any]:
 def _list_agent_workspaces_tool() -> dict[str, Any]:
     return {
         "name": "list_agent_workspaces",
-        "title": "列出 Agent 工作区",
-        "description": "列出用户在 GUI 中明确授权的工作区标识、完整显示路径、可用状态和默认状态，不返回秘密或无关目录。",
+        "title": "列出 Agent 可用资料目录",
+        "description": "列出当前 Client 可用的邮件资料输出目录标识、完整显示路径、可用状态和默认状态，不返回秘密或无关目录。",
         "annotations": _tool_annotations(
             read_only=True, idempotent=True, open_world=False
         ),
@@ -919,13 +965,20 @@ def _audit_target(
         target = f"资源：{resource.get('display_name') or arguments.get('resource_id')}"
         source_path = str(resource.get("local_path") or "") or None
     elif tool_name == "prepare_mail_resources":
-        target = f"工作区：{Path(str(structured.get('workspace_path') or arguments.get('target_workspace') or '待选择')).name}"
+        target = (
+            f"资料目录：{Path(str(structured.get('workspace_path') or arguments.get('target_workspace') or '待选择')).name}"
+            + (
+                "，完整邮件资料"
+                if structured.get("mode") == "complete"
+                else ""
+            )
+        )
         prepared = structured.get("prepared") or []
         if prepared:
             source_path = str(prepared[0].get("source_path") or "") or None
             prepared_path = str(prepared[0].get("prepared_path") or "") or None
     elif tool_name == "list_agent_workspaces":
-        target = "Agent 工作区"
+        target = "Agent 可用资料目录"
     elif tool_name == "get_mail_sync_status":
         target = "邮件同步状态"
     else:
@@ -938,10 +991,17 @@ def _audit_target(
 def _audit_details(tool_name: str, structured: dict[str, Any]) -> dict[str, Any]:
     if tool_name == "prepare_mail_resources":
         return {
+            "mode": structured.get("mode") or "resources",
+            "package_id": structured.get("package_id"),
+            "atomic_publish": bool(structured.get("atomic_publish")),
+            "source_archive_unchanged": bool(
+                structured.get("source_archive_unchanged")
+            ),
             "hashes": [
                 {
                     "resource_id": item.get("resource_id"),
-                    "filename": item.get("filename"),
+                    "filename": item.get("filename")
+                    or item.get("relative_path"),
                     "size_bytes": item.get("size_bytes"),
                     "sha256": item.get("sha256"),
                 }

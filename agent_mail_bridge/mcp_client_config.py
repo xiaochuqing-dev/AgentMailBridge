@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import re
@@ -17,13 +18,27 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from ruamel.yaml import YAML
+from ruamel.yaml.comments import CommentedMap
+
 from agent_mail_bridge.runtime_paths import get_runtime_paths
 
 
 SERVER_KEY = "agent-mail-bridge"
 CLIENT_ID_ENV = "AGENT_MAIL_BRIDGE_CLIENT_ID"
 CLIENT_TOKEN_ENV = "AGENT_MAIL_BRIDGE_CLIENT_TOKEN"
-SUPPORTED_CLIENTS = {"claude_code", "codex", "claude_desktop", "custom"}
+SUPPORTED_CLIENTS = {
+    "claude_code",
+    "codex",
+    "hermes",
+    "claude_desktop",
+    "custom",
+}
+KNOWN_VERSION_PATTERNS = {
+    "codex": re.compile(r"^(?:codex-cli\s+)?0\.145\.0(?:\s|$)", re.IGNORECASE),
+    "claude_code": re.compile(r"^2\.1\.220(?:\s|$)", re.IGNORECASE),
+    "hermes": re.compile(r"^Hermes Agent v0\.19\.0(?:\s|$)", re.IGNORECASE),
+}
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 _TOML_SERVER_HEADER = re.compile(
     r"^\s*\[\s*mcp_servers\.(?:agent-mail-bridge|\"agent-mail-bridge\"|'agent-mail-bridge')"
@@ -89,25 +104,39 @@ def mcp_client_command(
     scope: str = "user",
 ) -> str:
     command, args = mcp_launch()
+    runtime = get_runtime_paths()
     normalized = str(client or "").strip().casefold()
     env_items: list[str] = []
+    if not runtime.frozen:
+        env_items.extend(["--env", f"PYTHONPATH={runtime.source_root}"])
     if client_id:
         env_items.extend(["--env", f"{CLIENT_ID_ENV}={client_id}"])
     if client_token:
         env_items.extend(["--env", f"{CLIENT_TOKEN_ENV}={client_token}"])
-    if normalized == "claude":
+    if normalized in {"claude", "claude_code"}:
         prefix = [
             "claude",
             "mcp",
             "add",
+            *env_items,
             "--transport",
             "stdio",
             "--scope",
             scope,
-            *env_items,
             SERVER_KEY,
             "--",
         ]
+    elif normalized == "hermes":
+        prefix = ["hermes", "mcp", "add", SERVER_KEY, "--command", command]
+        hermes_env: list[str] = []
+        for key_value_index in range(0, len(env_items), 2):
+            if env_items[key_value_index] == "--env":
+                hermes_env.append(env_items[key_value_index + 1])
+        if hermes_env:
+            prefix.extend(["--env", *hermes_env])
+        if args:
+            prefix.extend(["--args", *args])
+        return subprocess.list2cmdline(prefix)
     else:
         prefix = [normalized or client, "mcp", "add", SERVER_KEY, *env_items, "--"]
     return subprocess.list2cmdline([*prefix, command, *args])
@@ -136,6 +165,15 @@ def codex_mcp_toml(
     ).strip()
 
 
+def hermes_mcp_yaml(
+    *,
+    client_id: str | None = None,
+    client_token: str | None = None,
+) -> str:
+    entry = _stdio_entry(client_id=client_id, client_token=client_token)
+    return _merge_hermes_yaml(b"", entry, remove=False).decode("utf-8").strip()
+
+
 def detect_client(
     client_type: str,
     *,
@@ -154,13 +192,22 @@ def detect_client(
             normalized, config_scope=config_scope, project_root=project_root
         )
     )
-    mode = "manual" if normalized == "custom" else "managed"
+    supported_version = _is_supported_version(normalized, version)
+    mode = (
+        "manual"
+        if normalized == "custom"
+        else "managed"
+        if installed and supported_version
+        else "assisted"
+    )
     status = (
         "manual_only"
         if normalized == "custom"
         else "not_installed"
         if not installed
         else "managed_supported"
+        if supported_version
+        else "version_unverified"
     )
     return ClientDetection(
         client_type=normalized,
@@ -209,6 +256,14 @@ def client_config_path(
                 "config_not_found", "未找到 Windows APPDATA 配置目录"
             )
         return Path(appdata) / "Claude" / "claude_desktop_config.json"
+    if normalized == "hermes":
+        hermes_home = os.getenv("HERMES_HOME")
+        if hermes_home:
+            return Path(hermes_home).expanduser().resolve() / "config.yaml"
+        local = os.getenv("LOCALAPPDATA")
+        if os.name == "nt" and local:
+            return Path(local) / "hermes" / "config.yaml"
+        return Path.home() / ".hermes" / "config.yaml"
     raise ClientConfigError("config_not_found", "自定义 Client 没有可自动修改的配置路径")
 
 
@@ -223,7 +278,12 @@ def preview_client_config(
     action: str = "apply",
 ) -> ConfigPlan:
     normalized = str(client_type or "").strip().casefold()
-    if normalized not in {"codex", "claude_code", "claude_desktop"}:
+    if normalized not in {
+        "codex",
+        "claude_code",
+        "hermes",
+        "claude_desktop",
+    }:
         raise ClientConfigError(
             "unsupported_client_version", "该 Client 仅支持辅助或手动配置"
         )
@@ -245,6 +305,8 @@ def preview_client_config(
     try:
         if normalized == "codex":
             planned = _merge_codex_toml(original, entry, remove=remove)
+        elif normalized == "hermes":
+            planned = _merge_hermes_yaml(original, entry, remove=remove)
         else:
             planned = _merge_json_config(original, entry, remove=remove)
     except ClientConfigError:
@@ -254,7 +316,12 @@ def preview_client_config(
             "config_parse_failed", "Client 配置格式损坏，已拒绝覆盖"
         ) from exc
     applied_hash = _sha256(planned)
-    preview = planned.decode("utf-8").replace(client_token, "[已隐藏 scoped token]")
+    preview = _config_preview(
+        client_type=normalized,
+        target=target,
+        entry=entry,
+        action=action,
+    )
     return ConfigPlan(
         client_id=client_id,
         client_type=normalized,
@@ -293,12 +360,14 @@ def apply_client_config(
     backup_dir = Path(backup_root).resolve() / plan.client_id
     try:
         backup_dir.mkdir(parents=True, exist_ok=True)
+        _protect_path(backup_dir, directory=True)
         if current_exists:
             backup_path = backup_dir / f"{backup_id}.bak"
             _atomic_replace(backup_path, current)
         else:
             backup_path = backup_dir / f"{backup_id}.missing"
             _atomic_replace(backup_path, b"")
+        _protect_path(backup_path, directory=False)
     except OSError as exc:
         raise ClientConfigError("config_backup_failed", "创建 Client 配置备份失败") from exc
     changed = current != plan.planned_bytes
@@ -364,6 +433,9 @@ def _stdio_entry(
 ) -> dict[str, Any]:
     command, args = mcp_launch()
     env: dict[str, str] = {}
+    runtime = get_runtime_paths()
+    if not runtime.frozen:
+        env["PYTHONPATH"] = str(runtime.source_root)
     if client_id:
         env[CLIENT_ID_ENV] = client_id
     if client_token:
@@ -453,6 +525,63 @@ def _merge_codex_toml(
     return planned
 
 
+def _merge_hermes_yaml(
+    original: bytes,
+    entry: dict[str, Any],
+    *,
+    remove: bool,
+) -> bytes:
+    yaml = YAML(typ="rt")
+    yaml.preserve_quotes = True
+    yaml.allow_duplicate_keys = False
+    yaml.indent(mapping=2, sequence=4, offset=2)
+    try:
+        data = yaml.load(original.decode("utf-8-sig")) if original else CommentedMap()
+    except Exception as exc:  # noqa: BLE001
+        raise ClientConfigError(
+            "config_parse_failed", "Hermes YAML 配置损坏，已拒绝覆盖"
+        ) from exc
+    if data is None:
+        data = CommentedMap()
+    if not isinstance(data, dict):
+        raise ClientConfigError(
+            "config_parse_failed", "Hermes YAML 配置根节点必须是对象"
+        )
+    servers = data.get("mcp_servers")
+    if servers is None:
+        if remove:
+            return original
+        servers = CommentedMap()
+        data["mcp_servers"] = servers
+    if not isinstance(servers, dict):
+        raise ClientConfigError(
+            "config_parse_failed", "Hermes mcp_servers 必须是对象"
+        )
+    if remove:
+        servers.pop(SERVER_KEY, None)
+    else:
+        hermes_entry = CommentedMap()
+        hermes_entry["command"] = str(entry["command"])
+        if entry.get("args"):
+            hermes_entry["args"] = list(entry["args"])
+        if entry.get("env"):
+            hermes_entry["env"] = CommentedMap(
+                (str(key), str(value))
+                for key, value in dict(entry["env"]).items()
+            )
+        servers[SERVER_KEY] = hermes_entry
+    stream = io.StringIO()
+    try:
+        yaml.dump(data, stream)
+        planned = stream.getvalue().encode("utf-8")
+        YAML(typ="safe").load(planned.decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        raise ClientConfigError(
+            "config_parse_failed", "生成的 Hermes YAML 未通过校验"
+        ) from exc
+    return planned
+
+
 def _codex_server_block(entry: dict[str, Any]) -> str:
     args = json.dumps(entry.get("args") or [], ensure_ascii=False)
     command = json.dumps(str(entry["command"]), ensure_ascii=False)
@@ -500,11 +629,13 @@ def _detect_executable_version(
         executable = shutil.which("claude")
     elif client_type == "claude_desktop":
         executable = _detect_claude_desktop()
+    elif client_type == "hermes":
+        executable = shutil.which("hermes")
     else:
         return None, None
     version = (
         _safe_version(executable)
-        if executable and client_type in {"codex", "claude_code"}
+        if executable and client_type in {"codex", "claude_code", "hermes"}
         else None
     )
     return executable, version
@@ -524,6 +655,12 @@ def _safe_version(executable: str) -> str | None:
     except (OSError, subprocess.SubprocessError):
         return None
     text = " ".join((completed.stdout or completed.stderr or "").split())
+    text = re.split(
+        r"\s+Install directory\s*:",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
     return text[:120] or None
 
 
@@ -554,3 +691,52 @@ def _atomic_replace(path: Path, data: bytes) -> None:
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _is_supported_version(
+    client_type: str, version: str | None
+) -> bool:
+    pattern = KNOWN_VERSION_PATTERNS.get(client_type)
+    return bool(pattern and version and pattern.search(version.strip()))
+
+
+def _config_preview(
+    *,
+    client_type: str,
+    target: Path,
+    entry: dict[str, Any],
+    action: str,
+) -> str:
+    env_names = sorted(str(key) for key in (entry.get("env") or {}))
+    command_name = Path(str(entry.get("command") or "")).name
+    summary = {
+        "操作": "移除" if action == "remove" else "新增或更新",
+        "Client": client_type,
+        "目标文件": _redacted_path(target),
+        "配置项": SERVER_KEY,
+        "command": command_name,
+        "args": list(entry.get("args") or []),
+        "环境变量名": env_names,
+        "环境变量值": "全部隐藏",
+        "写入保护": "先备份、Hash/mtime 冲突检测、原子替换、失败回滚",
+        "生效方式": (
+            "执行 /reload-mcp 或重启 Hermes"
+            if client_type == "hermes"
+            else "reload 或重启 Client"
+        ),
+    }
+    return json.dumps(summary, ensure_ascii=False, indent=2)
+
+
+def _redacted_path(path: Path) -> str:
+    resolved = Path(path)
+    parent = resolved.parent.name
+    return str(Path(parent) / resolved.name) if parent else resolved.name
+
+
+def _protect_path(path: Path, *, directory: bool) -> None:
+    try:
+        os.chmod(path, 0o700 if directory else 0o600)
+    except OSError:
+        # Windows ACL 与受管目录策略可能拒绝 chmod；备份仍位于当前用户 DATA_ROOT。
+        pass
