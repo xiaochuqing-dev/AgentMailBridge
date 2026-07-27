@@ -394,15 +394,15 @@ Gmail send、Outlook、Unified Inbox 不在本阶段；Generic 在独立第三�
 
 ## 65. commits
 
-已生成 `a4c275b feat: deliver scoped agent history workflows`、`385e3be test: validate real agents history and lifecycle`、`164984f docs: publish v1.6 integration and delivery guides`。本报告提交与最终 push status 提交将在 Git 收尾后补记。
+已生成 `a4c275b feat: deliver scoped agent history workflows`、`385e3be test: validate real agents history and lifecycle`、`164984f docs: publish v1.6 integration and delivery guides`、`9ef3238 docs: add v1.6 real acceptance report`。本节所在提交只记录最终 push status，因提交无法引用自身哈希而不列出该哈希。
 
-验收状态：CONDITIONALLY PASS
+验收状态：PASS
 
 ## 66. push status
 
-当前本地 master 已完成前三个普通提交；本报告尚未提交和推送，最终状态将在 push status 提交中更新。
+已使用普通 `git push origin master` 推送功能、测试、文档与报告提交，并验证本地 HEAD 与 `origin/master` 一致。本节所在 push status 提交继续使用普通 fast-forward push；最终远端对比以本报告提交后的 Git 核验结果为准。未创建分支、Tag、GitHub Release 或公开 Release Assets。
 
-验收状态：CONDITIONALLY PASS
+验收状态：PASS
 
 ## A. Agent 验收矩阵
 
