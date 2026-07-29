@@ -47,10 +47,17 @@ def test_formal_gui_uses_reference_three_column_layout(bridge_window):
     assert bridge_window.central_panel.width() >= 620
     assert set(bridge_window.pages) == {
         "inbox", "send", "history", "files_data", "settings", "advanced",
-        "logs", "maintenance", "agent", "about",
+        "logs", "maintenance", "agent", "pending_send", "about",
     }
     assert set(bridge_window.tab_buttons) == {"inbox", "send"}
-    assert set(bridge_window.nav_buttons) == {"agent", "history", "files_data", "settings", "about"}
+    assert set(bridge_window.nav_buttons) == {
+        "agent",
+        "pending_send",
+        "history",
+        "files_data",
+        "settings",
+        "about",
+    }
     assert all(
         row.value_label.minimumWidth() >= 126
         for row in bridge_window.service_rows.values()

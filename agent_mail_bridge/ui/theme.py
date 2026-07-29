@@ -532,6 +532,10 @@ def build_stylesheet(theme: str = "light") -> str:
     QMainWindow, QDialog, QWidget#windowRoot, QWidget#titleBar, QWidget#sidebar,
     QWidget#centralPanel, QWidget#rightPanelContent, QWidget#pageSurface,
     QWidget#bodySurface, QWidget#tabBar, QScrollArea {{ background: #171923; }}
+    QScrollArea#accountListScroll, QWidget#accountList {{
+        background: #171923;
+        border: none;
+    }}
     QFrame#mailDetailResourcesPane, QWidget#mailDetailResourcesContent {{
         background: #171923;
         border: none;

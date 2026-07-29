@@ -26,6 +26,8 @@ from agent_mail_bridge.config import AppConfig
 from agent_mail_bridge.credentials import WindowsCredentialBackend
 from agent_mail_bridge.database import (
     AGENT_INTEGRATION_MIGRATION_KEY,
+    V17_MAIL_FLOW_MIGRATION_KEY,
+    V17_MAIL_FLOW_SCHEMA_VERSION,
     close_connection,
     create_outbound_message,
     save_auto_receive_state,
@@ -124,48 +126,8 @@ def _packaged_probe(
     ):
         raise RuntimeError("packaged probe 缺少隔离 Client 身份")
     probe_env.update(client_auth_env)
-    migration_backup_created = True
-    if expected_version == "1.6.0":
-        if cfg is None:
-            raise RuntimeError(f"v{expected_version} packaged probe 缺少隔离配置")
-        anonymous_env = dict(env)
-        anonymous_env.pop("AGENT_MAIL_BRIDGE_CLIENT_ID", None)
-        anonymous_env.pop("AGENT_MAIL_BRIDGE_CLIENT_TOKEN", None)
-        bootstrap = subprocess.run(
-            [str(mcp)],
-            input=json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 0,
-                    "method": "initialize",
-                    "params": {
-                        "protocolVersion": "2025-06-18",
-                        "capabilities": {},
-                        "clientInfo": {
-                            "name": "lifecycle-migration-bootstrap",
-                            "version": "1",
-                        },
-                    },
-                },
-                ensure_ascii=False,
-            )
-            + "\n",
-            text=True,
-            encoding="utf-8",
-            capture_output=True,
-            env=anonymous_env,
-            timeout=60,
-            check=False,
-        )
-        if bootstrap.returncode != 0:
-            raise RuntimeError("隔离 MCP migration bootstrap 失败")
-        migration_backup_created = bool(
-            list(
-                (cfg.data_root_path / "backups").glob(
-                    "*before_v1_6_agent_ecosystem*.db"
-                )
-            )
-        )
+    if expected_version == "1.7.0" and cfg is None:
+        raise RuntimeError(f"v{expected_version} packaged probe 缺少隔离配置")
     requests = [
         {
             "jsonrpc": "2.0",
@@ -211,16 +173,31 @@ def _packaged_probe(
         .get("serverInfo", {})
         .get("version")
     )
+    migration_backup_created = (
+        bool(
+            list(
+                (cfg.data_root_path / "backups").glob(
+                    "*before_v1_7_mail_flow*.db"
+                )
+            )
+        )
+        if expected_version == "1.7.0" and cfg is not None
+        else True
+    )
     return {
         "version": version == expected_version,
         "gui_packaged_self_test": True,
         "mcp_initialize": server_version == expected_version,
-        "mcp_tools": len(tools) == 7,
+        "mcp_tools": len(tools) == _expected_mcp_tool_count(expected_version),
         "mcp_sync_status": not bool(by_id.get(3, {}).get("result", {}).get("isError")),
         "mcp_stdout_purity": "Traceback" not in completed.stderr,
         "mcp_eof_exit": completed.returncode == 0,
         "agent_migration_backup": migration_backup_created,
     }
+
+
+def _expected_mcp_tool_count(version: str) -> int:
+    return 7 if version == "1.6.0" else 11
 
 
 def _baseline_values(home: Path, suffix: str) -> dict[str, str]:
@@ -417,7 +394,7 @@ def _seed_baseline_from_source(
 ) -> tuple[AppConfig, dict[str, str]]:
     source_root = source_root.resolve()
     if not (source_root / "agent_mail_bridge" / "version.py").is_file():
-        raise RuntimeError("v1.5.0 基线源码目录无效")
+        raise RuntimeError("v1.6.0 基线源码目录无效")
     code = """
 import json
 import sys
@@ -443,7 +420,7 @@ print("CLIENT_AUTH=" + json.dumps(client_auth, separators=(",", ":")))
         timeout=300,
     )
     if "BASELINE_SEEDED" not in completed.stdout:
-        raise RuntimeError("v1.5.0 基线数据创建未完成")
+        raise RuntimeError("v1.6.0 基线数据创建未完成")
     auth_line = next(
         (
             line.removeprefix("CLIENT_AUTH=")
@@ -455,9 +432,9 @@ print("CLIENT_AUTH=" + json.dumps(client_auth, separators=(",", ":")))
     try:
         client_auth = json.loads(auth_line)
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise RuntimeError("v1.5.0 隔离 Client 创建未完成") from exc
+        raise RuntimeError("v1.6.0 隔离 Client 创建未完成") from exc
     if not isinstance(client_auth, dict):
-        raise RuntimeError("v1.5.0 隔离 Client 身份格式无效")
+        raise RuntimeError("v1.6.0 隔离 Client 身份格式无效")
     return _baseline_config(home, suffix), {
         str(key): str(value) for key, value in client_auth.items()
     }
@@ -516,6 +493,11 @@ def _snapshot(home: Path, cfg: AppConfig, credential_exists: bool) -> dict[str, 
             "SELECT schema_version FROM migration_metadata "
             "WHERE migration_key = ?",
             (AGENT_INTEGRATION_MIGRATION_KEY,),
+        ).fetchone()
+        v17_schema_row = connection.execute(
+            "SELECT schema_version FROM migration_metadata "
+            "WHERE migration_key = ?",
+            (V17_MAIL_FLOW_MIGRATION_KEY,),
         ).fetchone()
         table_names = {
             str(row[0])
@@ -585,13 +567,26 @@ def _snapshot(home: Path, cfg: AppConfig, credential_exists: bool) -> dict[str, 
                 str(row["client_id"]): {
                     "account": str(row["account_scope_mode"]),
                     "workspace": str(row["workspace_scope_mode"]),
+                    **(
+                        {
+                            "mailbox": str(row["mailbox_scope_mode"]),
+                            "send_account": str(
+                                row["send_account_scope_mode"]
+                            ),
+                            "attachment": str(row["attachment_scope_mode"]),
+                            "send_mode": str(row["send_mode"]),
+                        }
+                        if {
+                            "mailbox_scope_mode",
+                            "send_account_scope_mode",
+                            "attachment_scope_mode",
+                            "send_mode",
+                        }.issubset(agent_columns)
+                        else {}
+                    ),
                 }
                 for row in connection.execute(
-                    """
-                    SELECT client_id, account_scope_mode, workspace_scope_mode
-                    FROM agent_clients
-                    ORDER BY client_id
-                    """
+                    "SELECT * FROM agent_clients ORDER BY client_id"
                 )
             }
             if {
@@ -600,6 +595,37 @@ def _snapshot(home: Path, cfg: AppConfig, credential_exists: bool) -> dict[str, 
             }.issubset(agent_columns)
             else {}
         )
+        agent_client_capabilities = (
+            {
+                client_id: sorted(
+                    str(row["capability"])
+                    for row in connection.execute(
+                        """
+                        SELECT capability
+                        FROM agent_client_permissions
+                        WHERE client_id = ? AND enabled = 1 AND effect = 'allow'
+                        ORDER BY capability
+                        """,
+                        (client_id,),
+                    )
+                )
+                for client_id in agent_client_ids
+            }
+            if "agent_client_permissions" in table_names
+            else {}
+        )
+        v17_tables = {
+            "agent_client_mailbox_scopes",
+            "agent_client_send_account_scopes",
+            "agent_client_attachment_scopes",
+            "mailbox_sync_states",
+            "mail_package_mailboxes",
+            "send_requests",
+            "send_request_recipients",
+            "send_request_attachments",
+            "sent_server_mappings",
+            "mail_thread_relations",
+        }
     package_files: dict[str, str] = {}
     mail_root = cfg.received_dir / "mail"
     if mail_root.exists():
@@ -622,11 +648,14 @@ def _snapshot(home: Path, cfg: AppConfig, credential_exists: bool) -> dict[str, 
         "agent_schema_version": int(
             agent_schema_row[0] if agent_schema_row else 0
         ),
+        "v17_schema_version": int(v17_schema_row[0] if v17_schema_row else 0),
         "counts": counts,
         "agent_counts": agent_counts,
         "account_ids": account_ids,
         "agent_client_ids": agent_client_ids,
         "agent_client_scope_modes": agent_client_scope_modes,
+        "agent_client_capabilities": agent_client_capabilities,
+        "v17_tables_present": sorted(v17_tables & table_names),
         "raw_eml_count": sum(
             1 for path in package_files if path.endswith("/raw.eml")
         ),
@@ -642,6 +671,13 @@ def _snapshot(home: Path, cfg: AppConfig, credential_exists: bool) -> dict[str, 
             list(
                 (cfg.data_root_path / "backups").glob(
                     "*before_v1_6_agent_ecosystem*.db"
+                )
+            )
+        ),
+        "v17_migration_backup_count": len(
+            list(
+                (cfg.data_root_path / "backups").glob(
+                    "*before_v1_7_mail_flow*.db"
                 )
             )
         ),
@@ -699,8 +735,8 @@ def main() -> int:
         "schema_version": 1,
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "environment": "current Windows user, randomized AppId, isolated app/home paths",
-        "old_version": "1.5.0",
-        "new_version": "1.6.0",
+        "old_version": "1.6.0",
+        "new_version": "1.7.0",
         "production_install_untouched": True,
         "checks": {},
     }
@@ -745,7 +781,7 @@ def main() -> int:
             old_probe = _packaged_probe(
                 install_dir,
                 env,
-                "1.5.0",
+                "1.6.0",
                 cfg=cfg,
                 client_auth_env=lifecycle_client_auth,
             )
@@ -759,7 +795,7 @@ def main() -> int:
             upgraded_probe = _packaged_probe(
                 install_dir,
                 env,
-                "1.6.0",
+                "1.7.0",
                 cfg=cfg,
                 client_auth_env=lifecycle_client_auth,
             )
@@ -783,7 +819,7 @@ def main() -> int:
             reinstall_probe = _packaged_probe(
                 install_dir,
                 env,
-                "1.6.0",
+                "1.7.0",
                 cfg=cfg,
                 client_auth_env=lifecycle_client_auth,
             )
@@ -798,17 +834,52 @@ def main() -> int:
                 "old_install": all(old_probe.values()),
                 "upgrade_install": all(upgraded_probe.values()),
                 "db_integrity": after_upgrade["db_integrity"] == "ok",
-                "agent_migration_backup_created": (
-                    after_upgrade["agent_migration_backup_count"] > 0
+                "v17_migration_backup_created": (
+                    after_upgrade["v17_migration_backup_count"] > 0
                 ),
-                "agent_schema_v2": (
-                    after_upgrade["agent_schema_version"] == 2
+                "v17_schema_v1": (
+                    after_upgrade["v17_schema_version"]
+                    == V17_MAIL_FLOW_SCHEMA_VERSION
+                ),
+                "v17_tables_created": (
+                    len(after_upgrade["v17_tables_present"]) == 10
                 ),
                 "legacy_client_scope_not_expanded": all(
                     after_upgrade["agent_client_scope_modes"].get(
-                        client_id
+                        client_id, {}
+                    ).get("account")
+                    == before["agent_client_scope_modes"].get(
+                        client_id, {}
+                    ).get("account")
+                    and after_upgrade["agent_client_scope_modes"].get(
+                        client_id, {}
+                    ).get("workspace")
+                    == before["agent_client_scope_modes"].get(
+                        client_id, {}
+                    ).get("workspace")
+                    and after_upgrade["agent_client_scope_modes"].get(
+                        client_id, {}
+                    ).get("mailbox")
+                    == "selected"
+                    and after_upgrade["agent_client_scope_modes"].get(
+                        client_id, {}
+                    ).get("send_account")
+                    == "selected"
+                    and after_upgrade["agent_client_scope_modes"].get(
+                        client_id, {}
+                    ).get("attachment")
+                    == "selected"
+                    for client_id in before["agent_client_ids"]
+                ),
+                "legacy_client_send_default_disabled": all(
+                    "mail.send"
+                    not in after_upgrade["agent_client_capabilities"].get(
+                        client_id, []
                     )
-                    == {"account": "selected", "workspace": "selected"}
+                    and "send.status"
+                    not in after_upgrade["agent_client_capabilities"].get(
+                        client_id, []
+                    )
                     for client_id in before["agent_client_ids"]
                 ),
                 "upgrade_persistence": _same_persistent_facts(

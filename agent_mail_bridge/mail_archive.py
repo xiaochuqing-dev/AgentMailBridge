@@ -8,7 +8,9 @@ import json
 import os
 import re
 import shutil
+import sys
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -84,6 +86,11 @@ def archive_normalized_mail(
     account_ref = stable_account_ref(cfg)
     account_id = current_receive_account_id(cfg)
     package_id = stable_package_id(account_ref, message_id)
+    direction = (
+        "outbound"
+        if mail.direction == "outbound" or mail.outbound_origin == "outbound"
+        else "inbound"
+    )
     lock = _lock_for(package_id)
     with lock:
         existing = get_mail_package_by_identity(cfg.db_path, account_ref, message_id)
@@ -98,7 +105,13 @@ def archive_normalized_mail(
         package_root = (
             Path(str(existing["package_root"]))
             if existing and existing.get("package_root")
-            else _package_root(cfg, package_id, mail.subject, mail.saved_date)
+            else _package_root(
+                cfg,
+                package_id,
+                mail.subject,
+                mail.saved_date,
+                direction=direction,
+            )
         )
         if not mail.raw_bytes:
             raise ValueError("正式接收邮件缺少真实 RFC822 原文")
@@ -108,8 +121,9 @@ def archive_normalized_mail(
         } if existing else {}
         assert_within_root(package_root, cfg.data_root_path)
         is_new = not package_root.exists()
+        archive_base = cfg.sent_dir if direction == "outbound" else cfg.received_dir
         work_root = (
-            cfg.received_dir / "mail" / ".staging" / f"{package_id}.tmp"
+            archive_base / "mail" / ".staging" / f"{package_id}.tmp"
             if is_new else package_root
         )
         assert_within_root(work_root, cfg.data_root_path)
@@ -313,7 +327,15 @@ def archive_normalized_mail(
             "backend": mail.backend,
             "message_id": message_id,
             "provider_message_id": mail.backend_message_id or mail.uid or None,
+            "provider_uid": mail.uid or None,
+            "uidvalidity": mail.uidvalidity or None,
             "thread_ref": thread_ref,
+            "direction": direction,
+            "in_reply_to_raw": mail.in_reply_to_raw or None,
+            "references_raw": mail.references_raw or None,
+            "reply_to_package_id": mail.reply_to_package_id or None,
+            "forward_from_package_id": mail.forward_from_package_id or None,
+            "content_fingerprint": _mail_content_fingerprint(mail),
             "gmail_thread_id": mail.thread_id or None,
             "gmail_uid": mail.uid or None,
             "subject": mail.subject,
@@ -346,7 +368,7 @@ def archive_normalized_mail(
             if package_root.exists():
                 shutil.rmtree(work_root, ignore_errors=True)
             else:
-                os.replace(work_root, package_root)
+                _replace_atomically(work_root, package_root)
 
         compatibility_files = _compatibility_files(package_root, resources)
         store_mail_archive_atomically(cfg.db_path, package, resources, compatibility_files)
@@ -611,22 +633,48 @@ def _backfill_one_legacy(cfg: AppConfig, row: dict[str, Any]) -> None:
     if work_root != package_root:
         package_root.parent.mkdir(parents=True, exist_ok=True)
         if not package_root.exists():
-            os.replace(work_root, package_root)
+            _replace_atomically(work_root, package_root)
     store_mail_archive_atomically(cfg.db_path, package, resources, compatibility)
 
 
 def _package_root(
-    cfg: AppConfig, package_id: str, subject: str, saved_date: str
+    cfg: AppConfig,
+    package_id: str,
+    subject: str,
+    saved_date: str,
+    *,
+    direction: str = "inbound",
 ) -> Path:
     try:
         parsed = datetime.strptime(saved_date[:10], "%Y-%m-%d")
     except (TypeError, ValueError):
         parsed = datetime(1970, 1, 1)
-    base = cfg.received_dir / "mail" / f"{parsed.year:04d}" / f"{parsed.month:02d}" / f"{parsed.day:02d}"
+    archive_base = cfg.sent_dir if direction == "outbound" else cfg.received_dir
+    base = archive_base / "mail" / f"{parsed.year:04d}" / f"{parsed.month:02d}" / f"{parsed.day:02d}"
     slug = sanitize_filename(subject or "无标题邮件", max_len=48)
     available = max(0, 150 - len(str(base.resolve())) - len(package_id) - 2)
     slug = slug[:available].rstrip(" ._") if available else ""
     return base / (f"{package_id}_{slug}" if slug else package_id)
+
+
+def _mail_content_fingerprint(mail: NormalizedMail) -> str:
+    attachment_parts = sorted(
+        f"{item.filename.casefold()}:{len(item.content)}:"
+        f"{sha256_of_bytes(item.content)}"
+        for item in mail.attachments
+        if not item.error
+    )
+    material = "\n".join(
+        (
+            mail.subject.strip(),
+            (mail.body_text or "").replace("\r\n", "\n").strip(),
+            ",".join(
+                sorted(parse_mailboxes(mail.to_raw, mail.cc_raw, mail.bcc_raw))
+            ),
+            "|".join(attachment_parts),
+        )
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
 def _default_mailbox_ref(backend: str) -> str:
@@ -766,6 +814,12 @@ def _manifest(
         "mailbox_ref": package["mailbox_ref"],
         "message_id": package["message_id"],
         "thread_ref": package.get("thread_ref"),
+        "direction": package.get("direction", "inbound"),
+        "in_reply_to": package.get("in_reply_to_raw"),
+        "references": package.get("references_raw"),
+        "reply_to_package_id": package.get("reply_to_package_id"),
+        "forward_from_package_id": package.get("forward_from_package_id"),
+        "content_fingerprint": package.get("content_fingerprint"),
         "metadata": {
             "backend": package["backend"],
             "provider_message_id": package.get("provider_message_id"),
@@ -856,7 +910,7 @@ def _write_atomic(path: Path, data: bytes) -> None:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        _replace_atomically(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -866,7 +920,7 @@ def _copy_atomic(source: Path, target: Path) -> None:
     temporary = target.with_name(f".{uuid.uuid4().hex[:8]}.tmp")
     try:
         shutil.copy2(source, temporary)
-        os.replace(temporary, target)
+        _replace_atomically(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -874,3 +928,21 @@ def _copy_atomic(source: Path, target: Path) -> None:
 def _lock_for(package_id: str) -> threading.Lock:
     with _locks_guard:
         return _package_locks.setdefault(package_id, threading.Lock())
+
+
+def _replace_atomically(source: Path, target: Path) -> None:
+    """Retry only transient Windows replace races, preserving atomicity."""
+    delay = 0.001
+    for attempt in range(10):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError as exc:
+            retryable = (
+                sys.platform == "win32"
+                and getattr(exc, "winerror", None) in {5, 32}
+            )
+            if not retryable or attempt == 9:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 0.05)

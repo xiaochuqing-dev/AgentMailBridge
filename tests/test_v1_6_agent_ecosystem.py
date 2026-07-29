@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import threading
 from datetime import datetime, timedelta
@@ -166,7 +167,35 @@ def test_complete_mail_package_is_atomic_auditable_and_source_immutable(
         overwrite_policy="rename",
     )
     assert repeated.ok
-    assert repeated.details["target_directory"] != str(target)
+    assert repeated.details["reused"] is True
+    assert repeated.details["target_directory"] == str(target)
+
+    source_before_modified_copy = {
+        path.relative_to(source_root).as_posix(): sha256_of_file(path)
+        for path in source_root.rglob("*")
+        if path.is_file()
+    }
+    (target / "邮件正文.md").write_text("用户修改的工作副本", encoding="utf-8")
+    regenerated = service.prepare_mail_resources(
+        package_id,
+        [],
+        mode="complete",
+        target_workspace=str(workspace),
+        overwrite_policy="rename",
+    )
+    assert regenerated.ok
+    assert regenerated.details["reused"] is False
+    assert regenerated.details["existing_copy_modified"] is True
+    assert regenerated.details["target_directory"] != str(target)
+    assert (target / "邮件正文.md").read_text(encoding="utf-8") == "用户修改的工作副本"
+
+    shutil.rmtree(Path(regenerated.details["target_directory"]))
+    source_after_deleted_copy = {
+        path.relative_to(source_root).as_posix(): sha256_of_file(path)
+        for path in source_root.rglob("*")
+        if path.is_file()
+    }
+    assert source_after_deleted_copy == source_before_modified_copy
 
 
 def test_complete_mail_package_hash_mismatch_leaves_no_partial_result(

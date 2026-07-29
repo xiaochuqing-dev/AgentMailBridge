@@ -1,6 +1,6 @@
 # Hermes 接入指南
 
-AgentMailBridge v1.6.0 正式支持用户当前 Windows Hermes 入口，验证目标版本为 Hermes Agent 0.19.0。无需安装额外 Hermes 桌面版。
+AgentMailBridge v1.7.0 正式支持 Windows Hermes 入口。读取与发件分别授权；Hermes 只能使用当前 Client 获准的账号、邮箱目录和本地附件目录，且只能按用户选择使用发送前确认或自主发送。
 
 在 GUI 的“Agent 接入”点击“连接 Hermes”，默认使用推荐权限：所有当前及以后新增邮箱、正文/附件/邮件图片读取、按需刷新、所有当前及以后新增资料目录和完整邮件资料准备开启，结果提交关闭。完全信任仍受固定收件人、DATA_ROOT、ownership 与 Hash 边界约束。
 

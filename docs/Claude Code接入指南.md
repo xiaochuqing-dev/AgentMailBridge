@@ -1,6 +1,6 @@
 # Claude Code 接入指南
 
-v1.6.0 正式支持 Claude Code，当前验证版本为 2.1.220。先在 GUI 的“Agent 接入”点击“连接 Claude Code”，默认使用推荐权限；普通 Claude Desktop 聊天客户端是另一个产品入口，只保留兼容配置，不属于本指南的验收范围。
+v1.7.0 正式支持 Claude Code。先在 GUI 的“Agent 接入”连接 Claude Code，再明确设置读取账号/目录、发件账号、确认或自主发送和本地附件目录。普通 Claude Desktop 是另一个入口，只保留兼容配置。
 
 user 配置由 Claude Code 保存于用户配置；project 配置位于项目根目录 `.mcp.json`。AgentMailBridge 只合并 `mcpServers.agent-mail-bridge`，保留其他 server 和未知字段，写前备份并检测并发修改。JSON 会由标准库统一缩进。
 

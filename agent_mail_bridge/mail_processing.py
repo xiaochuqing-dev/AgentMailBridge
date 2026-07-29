@@ -7,14 +7,27 @@ from pathlib import Path
 from typing import Any
 
 from agent_mail_bridge.config import AppConfig
-from agent_mail_bridge.database import get_mail_package_by_identity
+from agent_mail_bridge.database import (
+    get_mailbox,
+    get_mail_package_by_identity,
+    record_package_mailbox_mapping,
+    upsert_mailboxes,
+)
 from agent_mail_bridge.mail_archive import archive_normalized_mail, stable_account_ref
+from agent_mail_bridge.mail_accounts import (
+    current_receive_account_id,
+    stable_mailbox_id,
+)
 from agent_mail_bridge.mail_common import (
     NormalizedMail,
     fallback_dedup_key,
     normalize_message_id,
 )
 from agent_mail_bridge.receive_rules import match_receive_rule
+from agent_mail_bridge.mail_threading import (
+    record_sent_mapping,
+    record_thread_relations,
+)
 from agent_mail_bridge.security import assert_within_root
 from agent_mail_bridge.utils import sanitize_filename, sha256_of_bytes, split_ext
 
@@ -45,6 +58,13 @@ def process_normalized_mail(
         provider_message_id=provider_message_id,
     )
     if existing and existing.get("archive_status") in {"ready", "legacy"}:
+        _record_mailbox_and_thread_facts(
+            cfg,
+            mail,
+            message_id,
+            str(existing.get("package_id") or ""),
+            local_outbound=bool(existing.get("local_outbound")),
+        )
         return {
             "status": "duplicate",
             "reason": "already_archived",
@@ -63,6 +83,13 @@ def process_normalized_mail(
             }
 
     archived = archive_normalized_mail(cfg, mail, message_id)
+    _record_mailbox_and_thread_facts(
+        cfg,
+        mail,
+        message_id,
+        archived.package_id,
+        local_outbound=False,
+    )
     return {
         "status": "saved" if archived.status == "ready" else archived.status,
         "message_id": message_id,
@@ -71,6 +98,82 @@ def process_normalized_mail(
         "attachments": archived.attachments,
         "error": archived.error,
     }
+
+
+def _record_mailbox_and_thread_facts(
+    cfg: AppConfig,
+    mail: NormalizedMail,
+    message_id: str,
+    package_id: str,
+    *,
+    local_outbound: bool,
+) -> None:
+    if not package_id:
+        return
+    account_id = current_receive_account_id(cfg)
+    mailbox_ref = mail.mailbox_ref or (
+        "gmail:INBOX" if mail.backend == "gmail_api" else "INBOX"
+    )
+    mailbox_id = stable_mailbox_id(account_id, mailbox_ref)
+    if get_mailbox(cfg.db_path, mailbox_id) is None:
+        lowered_ref = mailbox_ref.casefold()
+        role = (
+            "sent"
+            if mail.direction == "outbound" or "sent" in lowered_ref
+            else "inbox"
+            if lowered_ref == "inbox" or lowered_ref.endswith(":inbox")
+            else "other"
+        )
+        upsert_mailboxes(
+            cfg.db_path,
+            account_id,
+            [
+                {
+                    "external_ref": mailbox_ref,
+                    "raw_name": mailbox_ref,
+                    "display_name": mailbox_ref,
+                    "mailbox_role": role,
+                    "role_source": "message_fallback",
+                    "role_confidence": "fallback",
+                    "sync_enabled": role in {"inbox", "sent"},
+                }
+            ],
+        )
+    record_package_mailbox_mapping(
+        cfg.db_path,
+        package_id=package_id,
+        account_id=account_id,
+        mailbox_id=mailbox_id,
+        provider_message_id=mail.backend_message_id or None,
+        uidvalidity=mail.uidvalidity or None,
+        provider_uid=mail.uid or None,
+    )
+    record_thread_relations(
+        cfg.db_path,
+        account_id=account_id,
+        package_id=package_id,
+        in_reply_to_raw=mail.in_reply_to_raw,
+        references_raw=mail.references_raw,
+        reply_to_package_id=mail.reply_to_package_id or None,
+        forward_from_package_id=mail.forward_from_package_id or None,
+    )
+    if mail.direction == "outbound" and mail.backend != "smtp":
+        record_sent_mapping(
+            cfg.db_path,
+            account_id=account_id,
+            package_id=package_id,
+            mailbox_id=mailbox_id,
+            provider_message_id=mail.backend_message_id or None,
+            uidvalidity=mail.uidvalidity or None,
+            provider_uid=mail.uid or None,
+            message_id=message_id,
+            matched_by=(
+                "message_id_local_outbound"
+                if local_outbound
+                else "message_id"
+            ),
+            details={"source": mail.backend},
+        )
 
 
 def _write_deterministic_files(

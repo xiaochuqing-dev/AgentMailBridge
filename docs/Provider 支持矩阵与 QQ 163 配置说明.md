@@ -4,7 +4,7 @@
 
 | Provider | Auth | Login | Folder | Receive | Incremental | Send | Attachment | Restart | Error | Status |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Gmail | Desktop OAuth `gmail.readonly` 或应用专用密码 | 收件已验证 | Gmail API/IMAP 已实现 | 正式支持 | 已实现并长期回归 | planned | 收件已支持 | 已支持 | 已支持 | receive supported |
+| Gmail | Desktop OAuth `gmail.readonly` 或应用专用密码 | 收件已验证 | Gmail Label/IMAP 已实现 | 正式支持 | 已实现并长期回归 | 未实现 | 收件已支持 | 已支持 | 已支持 | receive supported / send not implemented |
 | QQ | 授权码 | PASS | PASS，真实发现 7 个目录 | PASS | PASS，第二轮无变化且无待重试 | PASS | PASS，含中文名、多附件、零字节、HTML、inline image | PASS | PASS，旧 Header 隔离重试已收口 | `supported` |
 | 163 | 授权码 | PASS | PASS，真实发现 INBOX、已发送、草稿箱、已删除、垃圾邮件、病毒文件夹 | PASS | PASS，第二轮无变化且无待重试 | PASS | PASS，含中文名、多附件、零字节、HTML、inline image | PASS | PASS，RFC 2971 IMAP ID quirk 已收口 | `supported` |
 | Generic-Test | 账号级 IMAP/SMTP secret | NOT_TESTED | LIST/SPECIAL-USE 已实现 | implementation ready | 自动化通过，真实 NOT_TESTED | implementation ready | 自动化通过，真实 NOT_TESTED | 自动化通过，真实 NOT_TESTED | 自动化通过，真实 NOT_TESTED | `implementation_ready_e2e_required` |

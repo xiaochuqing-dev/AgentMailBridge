@@ -10,6 +10,7 @@ import socket
 import smtplib
 import ssl
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable
 
 
@@ -31,6 +32,7 @@ SPECIAL_USE_ROLES = {
     "\\archive": "archive",
     "\\drafts": "drafts",
     "\\flagged": "flagged",
+    "\\important": "important",
     "\\junk": "junk",
     "\\sent": "sent",
     "\\trash": "trash",
@@ -50,6 +52,8 @@ class ProviderProfile:
     smtp_port: int = 465
     smtp_security: str = SECURITY_SSL
     imap_id_enabled: bool = False
+    sent_copy_mode: str = "provider_auto"
+    sent_mailbox: str = ""
     status: str = "planned"
 
     def to_settings(self) -> dict[str, Any]:
@@ -72,6 +76,7 @@ PROVIDER_PROFILES: tuple[ProviderProfile, ...] = (
         domains=("gmail.com", "googlemail.com"),
         imap_host="imap.gmail.com",
         smtp_host="smtp.gmail.com",
+        sent_copy_mode="unsupported",
         status="receive_supported",
     ),
     ProviderProfile(
@@ -80,6 +85,8 @@ PROVIDER_PROFILES: tuple[ProviderProfile, ...] = (
         domains=("qq.com",),
         imap_host="imap.qq.com",
         smtp_host="smtp.qq.com",
+        sent_copy_mode="imap_append",
+        sent_mailbox="Sent Messages",
         status="supported",
     ),
     ProviderProfile(
@@ -89,6 +96,8 @@ PROVIDER_PROFILES: tuple[ProviderProfile, ...] = (
         imap_host="imap.163.com",
         smtp_host="smtp.163.com",
         imap_id_enabled=True,
+        sent_copy_mode="provider_auto",
+        sent_mailbox="已发送",
         status="supported",
     ),
 )
@@ -201,6 +210,22 @@ def detect_provider_profile(email_address: str) -> ProviderProfile | None:
     )
 
 
+def sent_copy_profile(provider: str) -> tuple[str, str]:
+    """返回 Provider 的 Sent 保存职责和协议目录回退值。"""
+    normalized = str(provider or "").strip().casefold()
+    profile = next(
+        (
+            item
+            for item in PROVIDER_PROFILES
+            if item.profile_id.casefold() == normalized
+        ),
+        None,
+    )
+    if profile is None:
+        return "unknown", ""
+    return profile.sent_copy_mode, profile.sent_mailbox
+
+
 def validate_server_settings(settings: dict[str, Any]) -> dict[str, Any]:
     """校验 Generic 配置；禁止明文传输和秘密落入 provider_settings。"""
     safe = validate_non_secret_provider_settings(settings)
@@ -291,6 +316,10 @@ def resolve_imap_id_enabled(settings: dict[str, Any]) -> bool:
 
 
 def _mailbox_role(flags: Any, name: str) -> str:
+    return _mailbox_role_facts(flags, name)[0]
+
+
+def _mailbox_role_facts(flags: Any, name: str) -> tuple[str, str, str]:
     normalized_flags = {
         (item.decode("ascii", errors="ignore") if isinstance(item, bytes) else str(item))
         .strip()
@@ -299,10 +328,77 @@ def _mailbox_role(flags: Any, name: str) -> str:
     }
     for flag, role in SPECIAL_USE_ROLES.items():
         if flag in normalized_flags:
-            return role
+            return role, "special_use", "high"
     if mailbox_text(name).casefold() == "inbox":
-        return "inbox"
-    return "other"
+        return "inbox", "reserved_name", "high"
+    normalized_name = mailbox_text(name).strip().casefold()
+    candidates = {
+        "sent": "sent",
+        "sent messages": "sent",
+        "sent mail": "sent",
+        "已发送": "sent",
+        "已发送邮件": "sent",
+        "发件箱": "sent",
+        "drafts": "drafts",
+        "草稿箱": "drafts",
+        "spam": "junk",
+        "junk": "junk",
+        "垃圾邮件": "junk",
+        "trash": "trash",
+        "deleted messages": "trash",
+        "已删除": "trash",
+        "已删除邮件": "trash",
+        "废纸篓": "trash",
+        "archive": "archive",
+        "archives": "archive",
+        "归档": "archive",
+        "all mail": "all",
+        "所有邮件": "all",
+        "important": "important",
+        "重要邮件": "important",
+        "starred": "flagged",
+        "已加星标": "flagged",
+    }
+    if normalized_name in candidates:
+        return candidates[normalized_name], "auditable_name_fallback", "medium"
+    return "other", "unclassified", "unknown"
+
+
+def _mailbox_checkpoint(client: Any, name: Any, flags: Any) -> dict[str, int]:
+    normalized_flags = {
+        mailbox_text(item).strip().casefold()
+        for item in (flags or ())
+    }
+    if "\\noselect" in normalized_flags:
+        return {}
+    status: Any = {}
+    if hasattr(client, "folder_status"):
+        try:
+            status = client.folder_status(
+                name, ("UIDVALIDITY", "UIDNEXT", "HIGHESTMODSEQ")
+            )
+        except Exception:
+            status = {}
+    if not status and hasattr(client, "select_folder"):
+        try:
+            status = client.select_folder(name, readonly=True)
+        except Exception:
+            return {}
+    return {
+        "uidvalidity": int(
+            status.get(b"UIDVALIDITY")
+            or status.get("UIDVALIDITY")
+            or 0
+        ),
+        "uidnext": int(
+            status.get(b"UIDNEXT") or status.get("UIDNEXT") or 0
+        ),
+        "highestmodseq": int(
+            status.get(b"HIGHESTMODSEQ")
+            or status.get("HIGHESTMODSEQ")
+            or 0
+        ),
+    }
 
 
 def identify_imap_client(client: Any, *, enabled: bool) -> bool:
@@ -322,6 +418,84 @@ def identify_imap_client(client: Any, *, enabled: bool) -> bool:
         code, message = classify_protocol_error("imap", exc)
         raise ProviderFoundationError(code, message) from exc
     return True
+
+
+def append_imap_message(
+    *,
+    settings: dict[str, Any],
+    username: str,
+    secret: str,
+    folder: str,
+    raw_bytes: bytes,
+    flags: tuple[str, ...] = ("\\Seen",),
+    msg_time: datetime | None = None,
+    client_factory: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """用 IMAPClient APPEND 保存 exact MIME，不自行实现 IMAP 编码。"""
+    safe = validate_server_settings(settings)
+    mailbox = str(folder or "").strip()
+    if not safe.get("imap_host"):
+        raise ProviderFoundationError(
+            "imap_not_configured", "尚未配置 IMAP 服务器"
+        )
+    if not str(username).strip() or not secret:
+        raise ProviderFoundationError(
+            "imap_auth_required", "IMAP 账号或凭据缺失"
+        )
+    if not mailbox:
+        raise ProviderFoundationError(
+            "sent_mailbox_missing", "服务器已发送目录不可用"
+        )
+    if not isinstance(raw_bytes, bytes) or not raw_bytes:
+        raise ProviderFoundationError(
+            "invalid_sent_message", "待保存的邮件原文为空"
+        )
+    if client_factory is None:
+        try:
+            from imapclient import IMAPClient
+        except ImportError as exc:
+            raise ProviderFoundationError(
+                "imapclient_missing", "缺少 IMAPClient 运行依赖"
+            ) from exc
+        client_factory = IMAPClient
+    use_ssl = safe["imap_security"] == SECURITY_SSL
+    client: Any | None = None
+    try:
+        client = client_factory(
+            safe["imap_host"],
+            port=safe["imap_port"],
+            ssl=use_ssl,
+            timeout=safe["connect_timeout"],
+            use_uid=True,
+        )
+        if not use_ssl:
+            client.starttls(ssl_context=ssl.create_default_context())
+        client.login(str(username).strip(), secret)
+        identify_imap_client(
+            client, enabled=bool(safe.get("imap_id_enabled"))
+        )
+        client.append(
+            mailbox,
+            raw_bytes,
+            flags=tuple(flags),
+            msg_time=msg_time,
+        )
+        return {
+            "status": "appended",
+            "size_bytes": len(raw_bytes),
+            "mailbox": mailbox,
+        }
+    except ProviderFoundationError:
+        raise
+    except Exception as exc:
+        code, message = classify_protocol_error("imap", exc)
+        raise ProviderFoundationError(code, message) from exc
+    finally:
+        if client is not None:
+            try:
+                client.logout()
+            except Exception:
+                pass
 
 
 def discover_imap_mailboxes(
@@ -367,12 +541,35 @@ def discover_imap_mailboxes(
             else str(item)
             for item in client.capabilities()
         )
+        listed = list(client.list_folders())
+        if (
+            any(item.casefold() == "xlist" for item in capabilities)
+            and hasattr(client, "xlist_folders")
+        ):
+            try:
+                xlist_by_name = {
+                    mailbox_text(name).casefold(): tuple(flags or ())
+                    for flags, _delimiter, name in client.xlist_folders()
+                }
+            except Exception:
+                xlist_by_name = {}
+        else:
+            xlist_by_name = {}
         mailboxes: list[dict[str, Any]] = []
-        for flags, delimiter, name in client.list_folders():
+        for flags, delimiter, name in listed:
             normalized_name = mailbox_text(name)
-            role = _mailbox_role(flags, normalized_name)
+            merged_flags = tuple(flags or ())
+            xlist_flags = xlist_by_name.get(normalized_name.casefold(), ())
+            if xlist_flags:
+                merged_flags = tuple(
+                    dict.fromkeys((*merged_flags, *xlist_flags))
+                )
+            role, role_source, role_confidence = _mailbox_role_facts(
+                merged_flags, normalized_name
+            )
             item: dict[str, Any] = {
                 "external_ref": normalized_name,
+                "raw_name": normalized_name,
                 "display_name": normalized_name,
                 "delimiter": (
                     delimiter.decode("ascii", errors="ignore")
@@ -383,17 +580,16 @@ def discover_imap_mailboxes(
                     flag.decode("ascii", errors="ignore")
                     if isinstance(flag, bytes)
                     else str(flag)
-                    for flag in flags
+                    for flag in merged_flags
                 ),
                 "mailbox_role": role,
+                "role_source": role_source,
+                "role_confidence": role_confidence,
+                "sync_enabled": role in {"inbox", "sent"},
             }
-            if role == "inbox":
-                selected = client.select_folder(name, readonly=True)
-                item["checkpoint"] = {
-                    "uidvalidity": int(selected.get(b"UIDVALIDITY") or 0),
-                    "uidnext": int(selected.get(b"UIDNEXT") or 0),
-                    "highestmodseq": int(selected.get(b"HIGHESTMODSEQ") or 0),
-                }
+            checkpoint = _mailbox_checkpoint(client, name, merged_flags)
+            if checkpoint:
+                item["checkpoint"] = checkpoint
             mailboxes.append(item)
         return {"capabilities": capabilities, "mailboxes": mailboxes}
     except ProviderFoundationError:

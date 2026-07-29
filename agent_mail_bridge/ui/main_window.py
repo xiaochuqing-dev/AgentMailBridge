@@ -656,6 +656,7 @@ class BridgeWindow(QMainWindow):
         nav_layout.addWidget(self.agent_nav_button)
         nav_layout.addWidget(horizontal_line())
         nav_specs = (
+            ("pending_send", "send", "待确认发送"),
             ("history", "clock", "历史记录"),
             ("files_data", "database", "文件与数据"),
             ("settings", "settings", "设置"),
@@ -724,6 +725,7 @@ class BridgeWindow(QMainWindow):
             "logs": self._build_logs_page(),
             "maintenance": self._build_maintenance_page(),
             "agent": self._build_agent_page(),
+            "pending_send": self._build_pending_send_page(),
             "about": self._build_about_page(),
         }
         for page in self.pages.values():
@@ -732,10 +734,12 @@ class BridgeWindow(QMainWindow):
         self.mail_detail_page = self._build_mail_detail_page()
         self.mail_thread_page = self._build_mail_thread_page()
         self.outbound_detail_page = self._build_outbound_detail_page()
+        self.pending_send_detail_page = self._build_pending_send_detail_page()
         for page in (
             self.mail_detail_page,
             self.mail_thread_page,
             self.outbound_detail_page,
+            self.pending_send_detail_page,
         ):
             self.page_stack.addWidget(page)
         layout.addWidget(self.page_stack, 1)
@@ -1892,7 +1896,7 @@ class BridgeWindow(QMainWindow):
         status_header.addWidget(self.mcp_status_label)
         status_layout.addLayout(status_header)
         capability = QLabel(
-            f"版本 {__version__}　支持搜索邮件、读取正文与附件、准备完整邮件资料，以及发送最终结果。"
+            f"版本 {__version__}　支持授权范围内的邮件读取、完整资料准备、新建、回复、回复全部、转发和发件状态查询。"
         )
         capability.setObjectName("hint")
         capability.setWordWrap(True)
@@ -2120,7 +2124,8 @@ class BridgeWindow(QMainWindow):
         self.mcp_table.setColumnWidth(4, 92)
         layout.addWidget(self.mcp_table, 1)
         security = QLabel(
-            "安全边界：Agent 不能指定收件人、读取凭据、修改或删除邮件，也不能扫描任意目录。"
+            "安全边界：Agent 可向合法地址发件，但不能读取任何邮箱凭据或 Client token，"
+            "也不能越过已授权账号、邮箱目录和本地附件目录。"
         )
         security.setObjectName("hint")
         security.setWordWrap(True)
@@ -2131,6 +2136,141 @@ class BridgeWindow(QMainWindow):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setWidget(page)
         return scroll
+
+    def _build_pending_send_page(self) -> QWidget:
+        page, layout = self._standard_page(
+            "待确认发送",
+            "只有在这里由用户确认后，待确认邮件才会连接真实邮箱服务器并发送。",
+        )
+        warning = QFrame()
+        warning.setObjectName("card")
+        warning_layout = QHBoxLayout(warning)
+        warning_layout.setContentsMargins(18, 14, 18, 14)
+        warning_text = QLabel(
+            "待确认请求在确认前不会连接 SMTP、不会发送，也不会创建发送成功事实。"
+        )
+        warning_text.setWordWrap(True)
+        warning_layout.addWidget(warning_text, 1)
+        self.pending_send_refresh_button = self._button(
+            "刷新", self._refresh_pending_send_requests, outline=True
+        )
+        warning_layout.addWidget(self.pending_send_refresh_button)
+        layout.addWidget(warning)
+
+        self.pending_send_table = DataTable(
+            [
+                "Agent",
+                "发件账号",
+                "操作",
+                "收件人",
+                "主题",
+                "附件",
+                "创建 / 过期",
+                "状态",
+                "操作",
+            ]
+        )
+        self.pending_send_table.setObjectName("mailRecordTable")
+        self.pending_send_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.NoSelection
+        )
+        self.pending_send_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.pending_send_table.setWordWrap(True)
+        self.pending_send_table.setTextElideMode(Qt.TextElideMode.ElideNone)
+        header = self.pending_send_table.horizontalHeader()
+        for column in (0, 1, 2, 5, 7, 8):
+            header.setSectionResizeMode(
+                column, QHeaderView.ResizeMode.ResizeToContents
+            )
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        self.pending_send_table.cellDoubleClicked.connect(
+            lambda row, _column: self._open_pending_send_row(row)
+        )
+        layout.addWidget(self.pending_send_table, 1)
+        self.pending_send_empty_label = QLabel("当前没有待确认发送请求")
+        self.pending_send_empty_label.setObjectName("hint")
+        self.pending_send_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.pending_send_empty_label)
+        return page
+
+    def _build_pending_send_detail_page(self) -> QWidget:
+        page, layout = self._standard_page(
+            "确认发送详情",
+            "核对完整内容后确认发送，或取消并让 Agent 重新生成。",
+        )
+        top = QHBoxLayout()
+        top.addWidget(
+            self._button(
+                "← 返回待确认发送",
+                lambda: self.select_page("pending_send"),
+                text_only=True,
+            )
+        )
+        top.addStretch(1)
+        layout.addLayout(top)
+
+        notice = QLabel(
+            "当前邮件尚未发送。点击确认后将连接真实邮箱服务器并发送一次。"
+        )
+        notice.setObjectName("warningText")
+        notice.setWordWrap(True)
+        layout.addWidget(notice)
+
+        header_card = QFrame()
+        header_card.setObjectName("card")
+        header_layout = QVBoxLayout(header_card)
+        header_layout.setContentsMargins(18, 14, 18, 14)
+        self.pending_send_detail_subject = QLabel("无主题邮件")
+        self.pending_send_detail_subject.setObjectName("sectionTitle")
+        self.pending_send_detail_subject.setWordWrap(True)
+        self.pending_send_detail_meta = QLabel("—")
+        self.pending_send_detail_meta.setObjectName("hint")
+        self.pending_send_detail_meta.setWordWrap(True)
+        self.pending_send_detail_recipients = QLabel("—")
+        self.pending_send_detail_recipients.setWordWrap(True)
+        header_layout.addWidget(self.pending_send_detail_subject)
+        header_layout.addWidget(self.pending_send_detail_meta)
+        header_layout.addWidget(self.pending_send_detail_recipients)
+        layout.addWidget(header_card)
+
+        body_title = QLabel("正文完整预览")
+        body_title.setObjectName("sectionTitle")
+        layout.addWidget(body_title)
+        self.pending_send_detail_body = QTextEdit()
+        self.pending_send_detail_body.setReadOnly(True)
+        self.pending_send_detail_body.setMinimumHeight(220)
+        layout.addWidget(self.pending_send_detail_body, 1)
+
+        attachment_title = QLabel("附件")
+        attachment_title.setObjectName("sectionTitle")
+        layout.addWidget(attachment_title)
+        self.pending_send_detail_attachments = QLabel("无附件")
+        self.pending_send_detail_attachments.setWordWrap(True)
+        self.pending_send_detail_attachments.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        layout.addWidget(self.pending_send_detail_attachments)
+
+        actions = QHBoxLayout()
+        self.pending_send_confirm_button = self._button(
+            "确认发送", self._confirm_current_pending_send, primary=True
+        )
+        self.pending_send_cancel_button = self._button(
+            "取消", self._cancel_current_pending_send
+        )
+        self.pending_send_regenerate_button = self._button(
+            "返回 Agent 重新生成",
+            self._regenerate_current_pending_send,
+            outline=True,
+        )
+        actions.addWidget(self.pending_send_confirm_button)
+        actions.addWidget(self.pending_send_cancel_button)
+        actions.addWidget(self.pending_send_regenerate_button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+        return page
 
     def _build_mail_detail_page(self) -> QWidget:
         page, layout = self._standard_page(
@@ -4053,6 +4193,10 @@ class BridgeWindow(QMainWindow):
             agent_clients = self.service.list_agent_clients().details.get(
                 "clients", []
             )
+            pending_send_requests = (
+                self.service.list_pending_send_requests()
+                .details.get("requests", [])
+            )
         except Exception as exc:  # noqa: BLE001
             return ServiceResult(
                 OperationStatus.FAILED,
@@ -4073,6 +4217,7 @@ class BridgeWindow(QMainWindow):
                 "mail_sync": mail_sync,
                 "workspaces": workspaces,
                 "agent_clients": agent_clients,
+                "pending_send_requests": pending_send_requests,
             },
         )
 
@@ -4112,6 +4257,10 @@ class BridgeWindow(QMainWindow):
         if hasattr(self, "agent_client_table"):
             self._populate_agent_clients(
                 result.details.get("agent_clients", [])
+            )
+        if hasattr(self, "pending_send_table"):
+            self._populate_pending_send_requests(
+                result.details.get("pending_send_requests", [])
             )
         maintenance = result.details.get("maintenance", {})
         maintenance_details = maintenance.get("details", {})
@@ -5735,6 +5884,220 @@ class BridgeWindow(QMainWindow):
     def _return_from_outbound_detail(self) -> None:
         self.select_page(self._detail_return_page)
 
+    def _refresh_pending_send_requests(self) -> None:
+        self._run_task(
+            "正在刷新待确认发送",
+            self.service.list_pending_send_requests,
+            lambda result: (
+                self._populate_pending_send_requests(
+                    result.details.get("requests", [])
+                )
+                if result.ok
+                else self._show_service_result(result)
+            ),
+            button=self.pending_send_refresh_button,
+            working_text="刷新中…",
+            refresh_on_finish=False,
+        )
+
+    def _populate_pending_send_requests(
+        self, requests: list[dict] | None = None
+    ) -> None:
+        if not hasattr(self, "pending_send_table"):
+            return
+        rows = list(requests or [])
+        self.pending_send_rows = rows
+        self.pending_send_table.setRowCount(0)
+        operation_text = {
+            "new": "新建",
+            "reply": "回复",
+            "reply_all": "回复全部",
+            "forward": "转发",
+        }
+        for row_index, request in enumerate(rows):
+            recipients = request.get("recipients") or {}
+            to_values = list(recipients.get("to") or [])
+            cc_values = list(recipients.get("cc") or [])
+            bcc_values = list(recipients.get("bcc") or [])
+            recipient_text = "；".join(
+                part
+                for part in (
+                    f"To: {', '.join(to_values)}" if to_values else "",
+                    f"Cc: {', '.join(cc_values)}" if cc_values else "",
+                    f"Bcc: {', '.join(bcc_values)}" if bcc_values else "",
+                )
+                if part
+            )
+            values = [
+                str(request.get("client_display_name") or "Agent"),
+                str(
+                    request.get("sender_display_name")
+                    or request.get("sender_address")
+                    or "未识别账号"
+                ),
+                operation_text.get(
+                    str(request.get("operation") or ""),
+                    str(request.get("operation") or "新建"),
+                ),
+                recipient_text or "未填写",
+                str(request.get("subject") or "无主题"),
+                str(len(request.get("attachments") or [])),
+                (
+                    f"{self._short_time(request.get('created_at'), include_date=True)}\n"
+                    f"至 {self._short_time(request.get('expires_at'), include_date=True)}"
+                ),
+                "待确认",
+            ]
+            self.pending_send_table.insertRow(row_index)
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setToolTip(value)
+                item.setData(Qt.ItemDataRole.UserRole, request)
+                self.pending_send_table.setItem(row_index, column, item)
+            detail_button = self._button(
+                "查看并确认",
+                lambda checked=False, index=row_index: self._open_pending_send_row(
+                    index
+                ),
+                outline=True,
+            )
+            self.pending_send_table.setCellWidget(row_index, 8, detail_button)
+            self.pending_send_table.setRowHeight(
+                row_index,
+                self._wrapped_row_height(
+                    self.pending_send_table,
+                    ((3, recipient_text), (4, values[4]), (6, values[6])),
+                    minimum=62,
+                ),
+            )
+        self.pending_send_empty_label.setVisible(not rows)
+
+    def _open_pending_send_row(self, row: int) -> None:
+        if row < 0 or row >= len(getattr(self, "pending_send_rows", [])):
+            return
+        request = dict(self.pending_send_rows[row])
+        self.current_pending_send_request = request
+        operation_text = {
+            "new": "新建",
+            "reply": "回复",
+            "reply_all": "回复全部",
+            "forward": "转发",
+        }.get(
+            str(request.get("operation") or ""),
+            str(request.get("operation") or "新建"),
+        )
+        self.pending_send_detail_subject.setText(
+            str(request.get("subject") or "无主题邮件")
+        )
+        self.pending_send_detail_meta.setText(
+            "\n".join(
+                [
+                    f"发起 Agent：{request.get('client_display_name') or 'Agent'}",
+                    (
+                        "发件账号："
+                        f"{request.get('sender_display_name') or ''} "
+                        f"{request.get('sender_address') or ''}"
+                    ).strip(),
+                    f"操作类型：{operation_text}",
+                    (
+                        "原邮件："
+                        f"{request.get('source_package_id') or '不适用'}"
+                    ),
+                    (
+                        "创建时间："
+                        f"{self._short_time(request.get('created_at'), include_date=True)}"
+                    ),
+                    (
+                        "有效期至："
+                        f"{self._short_time(request.get('expires_at'), include_date=True)}"
+                    ),
+                ]
+            )
+        )
+        recipients = request.get("recipients") or {}
+        self.pending_send_detail_recipients.setText(
+            "\n".join(
+                [
+                    f"To：{', '.join(recipients.get('to') or []) or '无'}",
+                    f"Cc：{', '.join(recipients.get('cc') or []) or '无'}",
+                    f"Bcc：{', '.join(recipients.get('bcc') or []) or '无'}",
+                ]
+            )
+        )
+        body_text = str(request.get("body_text") or "")
+        body_html = str(request.get("body_html") or "")
+        self.pending_send_detail_body.setPlainText(
+            body_text
+            if not body_html
+            else f"{body_text}\n\nHTML 正文：\n{body_html}"
+        )
+        attachments = list(request.get("attachments") or [])
+        self.pending_send_detail_attachments.setText(
+            "\n".join(
+                (
+                    f"{index}. {item.get('display_name') or '未命名附件'}"
+                    f"　{format_size(item.get('size_bytes'))}"
+                    f"　来源：{'邮件归档' if item.get('source_kind') == 'mail_resource' else '已授权本地目录'}"
+                )
+                for index, item in enumerate(attachments, start=1)
+            )
+            or "无附件"
+        )
+        self.page_stack.setCurrentWidget(self.pending_send_detail_page)
+        self._set_exclusive_checked(self.tab_buttons, "")
+        self._set_exclusive_checked(self.nav_buttons, "pending_send")
+        if hasattr(self, "right_panel"):
+            self.right_panel.setVisible(False)
+
+    def _confirm_current_pending_send(self) -> None:
+        request = getattr(self, "current_pending_send_request", None)
+        if not request:
+            self.show_message("待确认请求已不存在，请刷新", "error")
+            return
+        confirmation = QMessageBox.question(
+            self,
+            "确认真实发送",
+            "当前邮件尚未发送。点击“是”后将连接真实邮箱服务器并发送一次。是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            return
+        send_request_id = str(request.get("send_request_id") or "")
+        self._run_task(
+            "正在确认并发送邮件",
+            lambda: self.service.confirm_agent_send_request(send_request_id),
+            self._finish_pending_send_action,
+            button=self.pending_send_confirm_button,
+            working_text="发送中…",
+            refresh_on_finish=False,
+        )
+
+    def _cancel_current_pending_send(self) -> None:
+        self._cancel_pending_send(regenerate=False)
+
+    def _regenerate_current_pending_send(self) -> None:
+        self._cancel_pending_send(regenerate=True)
+
+    def _cancel_pending_send(self, *, regenerate: bool) -> None:
+        request = getattr(self, "current_pending_send_request", None)
+        if not request:
+            self.show_message("待确认请求已不存在，请刷新", "error")
+            return
+        result = self.service.cancel_agent_send_request(
+            str(request.get("send_request_id") or "")
+        )
+        if result.ok and regenerate:
+            result.message = "原请求已取消，请返回 Agent 重新生成；邮件不会发送"
+        self._finish_pending_send_action(result)
+
+    def _finish_pending_send_action(self, result: ServiceResult) -> None:
+        self._show_service_result(result)
+        if result.ok:
+            self.current_pending_send_request = None
+            self.select_page("pending_send")
+            self._refresh_pending_send_requests()
+
     def _populate_agent_clients(self, clients: list[dict] | None = None) -> None:
         if not hasattr(self, "agent_client_table"):
             return
@@ -5777,22 +6140,45 @@ class BridgeWindow(QMainWindow):
             )
             capabilities = set(client.get("capabilities") or [])
             account_count = len(client.get("account_ids") or [])
-            workspace_count = len(client.get("workspace_ids") or [])
-            mode_text = {
-                "recommended": "推荐权限",
-                "full": "完全信任",
-                "custom": "自定义权限",
-            }.get(str(client.get("permission_mode") or ""), "自定义权限")
-            scope_summary = (
-                "邮箱动态全部 · 资料目录动态全部"
+            mailbox_count = len(client.get("mailbox_ids") or [])
+            send_account_count = len(client.get("send_account_ids") or [])
+            attachment_count = len(
+                client.get("attachment_workspace_ids") or []
+            )
+            read_allowed = bool(
+                {"mail.search", "mail.get", "resource.read"} & capabilities
+            )
+            send_allowed = "mail.send" in capabilities
+            account_scope = (
+                "全部（含未来新增）"
                 if client.get("account_scope_mode") == "all"
-                and client.get("workspace_scope_mode") == "all"
-                else f"邮箱 {account_count} · 资料目录 {workspace_count}"
+                else f"已选 {account_count}"
+            )
+            mailbox_scope_text = (
+                "全部已启用（含未来新增）"
+                if client.get("mailbox_scope_mode") == "all"
+                else f"已选 {mailbox_count}"
+            )
+            send_scope = (
+                "全部可发件账号（含未来新增）"
+                if client.get("send_account_scope_mode") == "all"
+                else f"已选 {send_account_count}"
+            )
+            attachment_scope = (
+                "全部资料目录（含未来新增）"
+                if client.get("attachment_scope_mode") == "all"
+                else f"已选 {attachment_count}"
+            )
+            permission_summary = (
+                f"读取：{'允许' if read_allowed else '不允许'} · 账号 {account_scope} · 目录 {mailbox_scope_text}\n"
+                f"发件：{'允许' if send_allowed else '不允许'} · 账号 {send_scope} · "
+                f"{'自主发送' if client.get('send_mode') == 'autonomous' else '发送前确认'}\n"
+                f"本地附件：{attachment_scope}"
             )
             values = [
                 f"{client.get('display_name') or 'Agent Client'}\n{self._agent_client_type_text(str(client.get('client_type') or 'custom'))}",
                 f"{install_text}\n{state_text}",
-                f"{mode_text} · 完整邮件资料{'允许' if 'resource.prepare' in capabilities else '关闭'}\n{scope_summary}",
+                permission_summary,
                 self._short_time(client.get("last_seen_at"), include_date=True),
             ]
             for column, value in enumerate(values):
@@ -5807,20 +6193,20 @@ class BridgeWindow(QMainWindow):
             grid.setVerticalSpacing(3)
             buttons = [
                 (
-                    "权限",
+                    "修改权限",
                     lambda checked=False, value=client: self._edit_agent_client_permissions(value),
                 ),
                 (
-                    "配置",
+                    "检查并修复",
                     lambda checked=False, value=client: self._configure_agent_client(value),
                 ),
                 (
-                    "测试",
+                    "检查连接",
                     lambda checked=False, value=client: self._test_agent_client(value),
                 ),
                 (
-                    "恢复",
-                    lambda checked=False, value=client: self._restore_latest_agent_config(value),
+                    "审计",
+                    lambda checked=False, value=client: self._show_agent_client_audit(value),
                 ),
                 (
                     "恢复启用" if state == "paused" else "暂停",
@@ -5837,7 +6223,18 @@ class BridgeWindow(QMainWindow):
                 button.setEnabled(state != "revoked")
                 grid.addWidget(button, position // 3, position % 3)
             self.agent_client_table.setCellWidget(index, 4, actions)
-            self.agent_client_table.setRowHeight(index, 72)
+            self.agent_client_table.setRowHeight(index, 96)
+
+    def _show_agent_client_audit(self, client: dict) -> None:
+        client_id = str(client.get("client_id") or "")
+        index = self.mcp_client_filter.findData(client_id)
+        if index >= 0:
+            self.mcp_client_filter.setCurrentIndex(index)
+        self._populate_mcp_history()
+        self.show_message(
+            f"已筛选 {client.get('display_name') or 'Client'} 的最近调用审计",
+            "normal",
+        )
 
     @staticmethod
     def _agent_client_type_text(client_type: str) -> str:
@@ -5865,11 +6262,11 @@ class BridgeWindow(QMainWindow):
         layout.addWidget(mode_title)
         recommended_mode = QRadioButton("推荐权限（默认）")
         recommended_mode.setToolTip(
-            "当前及未来新增邮箱、资料目录自动可用；允许读取、搜索、刷新和完整邮件资料准备，不允许提交结果"
+            "当前及未来新增邮箱、邮箱目录和资料目录自动可读；发件权限稍后单独设置"
         )
         full_mode = QRadioButton("完全信任")
         full_mode.setToolTip(
-            "当前及未来新增邮箱、资料目录自动可用，并开放全部七项能力；固定收件人与文件边界仍保持"
+            "开放全部工具能力；发件账号与发送方式仍须在下一步明确核对"
         )
         custom_mode = QRadioButton("自定义")
         recommended_mode.setChecked(True)
@@ -5940,8 +6337,8 @@ class BridgeWindow(QMainWindow):
         layout.addWidget(advanced_panel)
 
         notice = QLabel(
-            "推荐权限会动态覆盖当前及未来新增邮箱和资料目录，但不会开放 result.submit。"
-            "完全信任仍保持固定收件人、全局允许目录、ownership 与 Hash 边界。"
+            "创建后将进入人话权限设置，可分别选择读取账号、邮箱目录、发件账号、"
+            "发送前确认或自主发送，以及本地附件目录。"
         )
         notice.setObjectName("hint")
         notice.setWordWrap(True)
@@ -6003,76 +6400,257 @@ class BridgeWindow(QMainWindow):
             client,
         )
         self.show_message("Client 已创建，完成配置前保持未启用", "success")
+        self._edit_agent_client_permissions(client)
         self._configure_agent_client(client)
 
     def _edit_agent_client_permissions(self, client: dict) -> None:
         dialog = QDialog(self)
         dialog.setWindowTitle(f"权限 - {client.get('display_name')}")
-        dialog.resize(560, 600)
-        layout = QVBoxLayout(dialog)
-        current_mode = str(client.get("permission_mode") or "custom")
-        recommended_mode = QRadioButton("推荐权限（动态全部邮箱与资料目录）")
-        full_mode = QRadioButton("完全信任（动态全部邮箱与资料目录）")
-        custom_mode = QRadioButton("自定义")
-        {
-            "recommended": recommended_mode,
-            "full": full_mode,
-            "custom": custom_mode,
-        }.get(current_mode, custom_mode).setChecked(True)
-        mode_group = QButtonGroup(dialog)
-        for radio in (recommended_mode, full_mode, custom_mode):
-            mode_group.addButton(radio)
-            layout.addWidget(radio)
-        layout.addWidget(horizontal_line())
+        dialog.resize(760, 780)
+        dialog_layout = QVBoxLayout(dialog)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(4, 4, 12, 4)
+        layout.setSpacing(12)
+
         current_caps = set(client.get("capabilities") or [])
         current_accounts = set(client.get("account_ids") or [])
         current_workspaces = set(client.get("workspace_ids") or [])
-        cap_checks: list[tuple[QCheckBox, str]] = []
-        for label, capability in (
-            ("搜索邮件", "mail.search"),
-            ("读取邮件", "mail.get"),
-            ("读取文本资源", "resource.read"),
-            ("准备资源与完整邮件资料", "resource.prepare"),
-            ("查看同步状态", "sync.status"),
-            ("按需刷新邮件", "sync.ensure_fresh"),
-            ("列出资料目录", "workspace.list"),
-            ("提交最终结果", "result.submit"),
-        ):
-            check = QCheckBox(label)
-            check.setChecked(capability in current_caps)
-            cap_checks.append((check, capability))
-            layout.addWidget(check)
-        layout.addWidget(horizontal_line())
+        current_mailboxes = set(client.get("mailbox_ids") or [])
+        current_send_accounts = set(client.get("send_account_ids") or [])
+        current_attachment_workspaces = set(
+            client.get("attachment_workspace_ids") or []
+        )
+        account_result = self.service.list_mail_accounts()
+        accounts = list(account_result.details.get("accounts", []))
+        mailboxes = list(account_result.details.get("mailboxes", []))
+        workspaces = self.service.list_agent_workspaces().details.get(
+            "workspace_details", []
+        )
+
+        def section(title: str, description: str) -> QVBoxLayout:
+            frame = QFrame()
+            frame.setObjectName("card")
+            frame_layout = QVBoxLayout(frame)
+            frame_layout.setContentsMargins(16, 12, 16, 12)
+            heading = QLabel(title)
+            heading.setObjectName("sectionTitle")
+            frame_layout.addWidget(heading)
+            hint = QLabel(description)
+            hint.setObjectName("hint")
+            hint.setWordWrap(True)
+            frame_layout.addWidget(hint)
+            layout.addWidget(frame)
+            return frame_layout
+
+        def scope_combo(current: str) -> QComboBox:
+            combo = QComboBox()
+            combo.addItem("所有当前及以后新增", "all")
+            combo.addItem("仅选择部分", "selected")
+            index = combo.findData(current)
+            combo.setCurrentIndex(index if index >= 0 else 1)
+            return combo
+
+        read_layout = section(
+            "读取邮件",
+            "允许后可在所选账号和目录中搜索、读取正文与资源、刷新同步并准备完整邮件资料。",
+        )
+        read_enabled = QCheckBox("允许读取邮件")
+        read_enabled.setChecked(
+            bool(
+                {
+                    "mail.search",
+                    "mail.get",
+                    "resource.read",
+                    "resource.prepare",
+                }
+                & current_caps
+            )
+        )
+        read_layout.addWidget(read_enabled)
+        read_account_scope = scope_combo(
+            str(client.get("account_scope_mode") or "selected")
+        )
+        read_layout.addWidget(QLabel("邮箱账号范围"))
+        read_layout.addWidget(read_account_scope)
         account_checks: list[tuple[QCheckBox, str]] = []
-        for account in self.service.list_mail_accounts().details.get("accounts", []):
+        for account in accounts:
             check = QCheckBox(
-                f"邮箱：{account.get('display_name') or account.get('provider')}"
+                (
+                    f"{account.get('display_name') or account.get('provider')}"
+                    f"　{account.get('email_address') or ''}"
+                ).strip()
             )
             account_id = str(account["account_id"])
             check.setChecked(account_id in current_accounts)
             account_checks.append((check, account_id))
-            layout.addWidget(check)
+            read_layout.addWidget(check)
+        mailbox_scope = scope_combo(
+            str(client.get("mailbox_scope_mode") or "selected")
+        )
+        read_layout.addWidget(QLabel("邮箱目录范围"))
+        read_layout.addWidget(mailbox_scope)
+        account_names = {
+            str(item.get("account_id") or ""): str(
+                item.get("display_name")
+                or item.get("email_address")
+                or item.get("provider")
+                or "邮箱"
+            )
+            for item in accounts
+        }
+        mailbox_checks: list[tuple[QCheckBox, str]] = []
+        for mailbox in mailboxes:
+            mailbox_id = str(mailbox.get("mailbox_id") or "")
+            if not mailbox_id:
+                continue
+            display_name = str(
+                mailbox.get("display_name")
+                or mailbox.get("raw_name")
+                or mailbox.get("external_ref")
+                or "邮箱目录"
+            )
+            role = str(mailbox.get("mailbox_role") or "other")
+            check = QCheckBox(
+                f"{account_names.get(str(mailbox.get('account_id') or ''), '邮箱')} · {display_name}（{role}）"
+            )
+            check.setChecked(mailbox_id in current_mailboxes)
+            check.setEnabled(bool(mailbox.get("enabled", True)))
+            mailbox_checks.append((check, mailbox_id))
+            read_layout.addWidget(check)
+
+        send_layout = section(
+            "发送邮件",
+            "允许 Agent 使用获准账号新建、回复、回复全部和转发。收件人可为任意合法邮箱地址。",
+        )
+        send_enabled = QCheckBox("允许发送邮件")
+        send_enabled.setChecked("mail.send" in current_caps)
+        send_layout.addWidget(send_enabled)
+        send_account_scope = scope_combo(
+            str(client.get("send_account_scope_mode") or "selected")
+        )
+        send_layout.addWidget(QLabel("发件账号范围"))
+        send_layout.addWidget(send_account_scope)
+        send_account_checks: list[tuple[QCheckBox, str]] = []
+        for account in accounts:
+            if not (
+                account.get("send_enabled")
+                and "send" in set(account.get("capabilities") or [])
+            ):
+                continue
+            account_id = str(account["account_id"])
+            check = QCheckBox(
+                (
+                    f"{account.get('display_name') or account.get('provider')}"
+                    f"　{account.get('email_address') or ''}"
+                ).strip()
+            )
+            check.setChecked(account_id in current_send_accounts)
+            send_account_checks.append((check, account_id))
+            send_layout.addWidget(check)
+        send_mode = QComboBox()
+        send_mode.addItem("发送前确认", "confirm")
+        send_mode.addItem("Agent 自主发送", "autonomous")
+        send_mode_index = send_mode.findData(
+            str(client.get("send_mode") or "confirm")
+        )
+        send_mode.setCurrentIndex(max(0, send_mode_index))
+        send_layout.addWidget(QLabel("发送方式"))
+        send_layout.addWidget(send_mode)
+        send_notice = QLabel(
+            "发送前确认：请求进入待确认列表，用户确认后才发送。"
+            "Agent 自主发送：工具调用通过权限校验后立即真实发送。"
+        )
+        send_notice.setObjectName("hint")
+        send_notice.setWordWrap(True)
+        send_layout.addWidget(send_notice)
+
+        workspace_layout = section(
+            "资料目录",
+            "完整邮件资料输出和本地附件分别授权；邮件归档内附件仍由邮件读取范围控制。",
+        )
+        output_scope = scope_combo(
+            str(client.get("workspace_scope_mode") or "selected")
+        )
+        workspace_layout.addWidget(QLabel("完整邮件资料输出目录范围"))
+        workspace_layout.addWidget(output_scope)
         workspace_checks: list[tuple[QCheckBox, str]] = []
-        for workspace in self.service.list_agent_workspaces().details.get(
-            "workspace_details", []
-        ):
-            check = QCheckBox(f"资料目录：{workspace.get('display_path')}")
+        for workspace in workspaces:
+            check = QCheckBox(str(workspace.get("display_path") or "资料目录"))
             workspace_id = str(workspace["workspace_id"])
             check.setChecked(workspace_id in current_workspaces)
             workspace_checks.append((check, workspace_id))
-            layout.addWidget(check)
-        custom_controls = [
-            check for check, _value in cap_checks + account_checks + workspace_checks
-        ]
+            workspace_layout.addWidget(check)
+        attachment_scope = scope_combo(
+            str(client.get("attachment_scope_mode") or "selected")
+        )
+        workspace_layout.addWidget(QLabel("本地附件目录范围"))
+        workspace_layout.addWidget(attachment_scope)
+        attachment_checks: list[tuple[QCheckBox, str]] = []
+        for workspace in workspaces:
+            check = QCheckBox(str(workspace.get("display_path") or "资料目录"))
+            workspace_id = str(workspace["workspace_id"])
+            check.setChecked(workspace_id in current_attachment_workspaces)
+            attachment_checks.append((check, workspace_id))
+            workspace_layout.addWidget(check)
 
-        def sync_custom_controls() -> None:
-            enabled = custom_mode.isChecked()
-            for control in custom_controls:
-                control.setEnabled(enabled)
+        compatibility_layout = section(
+            "兼容能力",
+            "固定结果提交是旧版 submit_result 能力，与通用 Agent 发件权限相互独立。",
+        )
+        result_submit = QCheckBox("允许提交固定收件人的最终结果")
+        result_submit.setChecked("result.submit" in current_caps)
+        compatibility_layout.addWidget(result_submit)
 
-        for radio in (recommended_mode, full_mode, custom_mode):
-            radio.toggled.connect(sync_custom_controls)
-        sync_custom_controls()
+        def sync_controls() -> None:
+            read_selected = (
+                read_enabled.isChecked()
+                and read_account_scope.currentData() == "selected"
+            )
+            for check, _value in account_checks:
+                check.setEnabled(read_selected)
+            mailbox_selected = (
+                read_enabled.isChecked()
+                and mailbox_scope.currentData() == "selected"
+            )
+            for check, _value in mailbox_checks:
+                check.setEnabled(mailbox_selected)
+            sending = send_enabled.isChecked()
+            send_account_scope.setEnabled(sending)
+            send_mode.setEnabled(sending)
+            for check, _value in send_account_checks:
+                check.setEnabled(
+                    sending and send_account_scope.currentData() == "selected"
+                )
+            for check, _value in workspace_checks:
+                check.setEnabled(output_scope.currentData() == "selected")
+            for check, _value in attachment_checks:
+                check.setEnabled(
+                    attachment_scope.currentData() == "selected"
+                )
+
+        for control in (
+            read_enabled,
+            read_account_scope,
+            mailbox_scope,
+            send_enabled,
+            send_account_scope,
+            output_scope,
+            attachment_scope,
+        ):
+            if isinstance(control, QComboBox):
+                control.currentIndexChanged.connect(
+                    lambda _index: sync_controls()
+                )
+            else:
+                control.toggled.connect(sync_controls)
+        sync_controls()
+        layout.addStretch(1)
+        scroll.setWidget(content)
+        dialog_layout.addWidget(scroll, 1)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save
             | QDialogButtonBox.StandardButton.Cancel
@@ -6080,25 +6658,45 @@ class BridgeWindow(QMainWindow):
         buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存并立即生效")
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
+        dialog_layout.addWidget(buttons)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        permission_mode = (
-            "recommended"
-            if recommended_mode.isChecked()
-            else "full"
-            if full_mode.isChecked()
-            else "custom"
-        )
-        dynamic_scope = permission_mode in {"recommended", "full"}
+        read_capabilities = {
+            "mail.search",
+            "mail.get",
+            "resource.read",
+            "resource.prepare",
+            "sync.status",
+            "sync.ensure_fresh",
+            "workspace.list",
+            "mail.accounts.list",
+            "mailboxes.list",
+        }
+        capabilities: set[str] = set()
+        if read_enabled.isChecked():
+            capabilities.update(read_capabilities)
+        if send_enabled.isChecked():
+            capabilities.update(
+                {"mail.send", "send.status", "mail.accounts.list"}
+            )
+        if result_submit.isChecked():
+            capabilities.add("result.submit")
         result = self.service.set_agent_client_permissions(
             str(client["client_id"]),
-            capabilities=[
-                capability for check, capability in cap_checks if check.isChecked()
-            ],
+            capabilities=sorted(capabilities),
             account_ids=[
                 account_id
                 for check, account_id in account_checks
+                if check.isChecked()
+            ],
+            mailbox_ids=[
+                mailbox_id
+                for check, mailbox_id in mailbox_checks
+                if check.isChecked()
+            ],
+            send_account_ids=[
+                account_id
+                for check, account_id in send_account_checks
                 if check.isChecked()
             ],
             workspace_ids=[
@@ -6106,9 +6704,18 @@ class BridgeWindow(QMainWindow):
                 for check, workspace_id in workspace_checks
                 if check.isChecked()
             ],
-            permission_mode=permission_mode,
-            account_scope_mode="all" if dynamic_scope else "selected",
-            workspace_scope_mode="all" if dynamic_scope else "selected",
+            attachment_workspace_ids=[
+                workspace_id
+                for check, workspace_id in attachment_checks
+                if check.isChecked()
+            ],
+            permission_mode="custom",
+            account_scope_mode=str(read_account_scope.currentData()),
+            mailbox_scope_mode=str(mailbox_scope.currentData()),
+            send_account_scope_mode=str(send_account_scope.currentData()),
+            workspace_scope_mode=str(output_scope.currentData()),
+            attachment_scope_mode=str(attachment_scope.currentData()),
+            send_mode=str(send_mode.currentData()),
         )
         self._show_service_result(result)
         self.request_refresh()
@@ -6143,10 +6750,10 @@ class BridgeWindow(QMainWindow):
         notice.setWordWrap(True)
         layout.addWidget(notice)
         buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Apply
+            QDialogButtonBox.StandardButton.Save
             | QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.button(QDialogButtonBox.StandardButton.Apply).setText("备份并应用")
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("备份并应用")
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)

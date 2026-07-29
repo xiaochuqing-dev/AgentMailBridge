@@ -1,5 +1,17 @@
 # CHANGELOG
 
+## 1.7.0 Full Agent Mail Read, Send, Reply & Desktop Closure - 2026-07-29
+
+- 新增 Provider-neutral 邮箱目录、独立 checkpoint、任意历史范围与多目录导入；Inbox、Sent、Archive、Spam/Trash、Gmail Label 和自定义目录均作为稳定事实，`all` 动态扩展而 `selected` 不扩张。
+- Client 权限拆分为读取账号、邮箱目录、发件账号和本地附件目录范围；旧 Client 默认无通用发件权限，暂停、撤销、账号停用和目录停用立即生效。
+- MCP 扩展为 11 个工具，新增账号/目录发现、统一 `send_mail` 和发件状态查询；支持 new、reply、reply_all、forward、多 To/Cc/Bcc、Unicode、HTML、链接和多附件。
+- 通用发件只保留发送前确认与 Agent 自主发送两种模式。待确认请求持久化且只能在 GUI 确认或取消；确认时重验权限、期限、附件大小与 SHA-256，幂等重试和双击确认最多发送一次。
+- MIME 只构建一次，实际 SMTP bytes 与 outbound `raw.eml` 完全一致；Bcc 不进入公开头。发送结果形成正式 outbound package，并通过 Message-ID、Provider ID 和内容指纹与服务器 Sent 回流映射去重。
+- 邮件事实增加方向、Message-ID、In-Reply-To、References、回复/转发来源和确定性 thread 关系，不使用相似主题 AI 聚类。
+- 完整邮件资料增加幂等复用：副本未修改时返回 `reused=true`，工作副本变化时保留原副本并可重命名重新准备，删除工作副本不影响正式归档。
+- 修复 Codex Desktop 真实验收发现的默认工作区选择矛盾：内部 DATA_ROOT 不再干扰唯一可见授权工作区的默认选择；`prepare_mail_resources` 新增明确的 `workspace_id` 参数并保留 `target_workspace` 兼容。
+- GUI 新增人话权限面板和“待确认发送”入口；Gmail scope 继续严格保持 `gmail.readonly`，QQ/163 正式收发，Generic 仍为 implementation ready / E2E required，Outlook 未实现。
+
 ## 1.6.0 Agent Ecosystem, History Import & Complete Mail Package - 2026-07-27
 
 - 推荐 Agent 调整为 Codex、Claude Code 和 Hermes；新增 Hermes 0.19.0 Windows YAML 适配、安装/版本检测、保留注释与未知字段的合并、备份、恢复和安全 assisted 降级。普通 Claude Desktop 仅保留兼容入口。

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from agent_mail_bridge.database import get_connection, get_mail_package, query_mail_resources
 from agent_mail_bridge.mail_common import (
@@ -20,7 +20,9 @@ def list_mail_messages(
     *,
     account_id: str | None = None,
     account_ref: str | None = None,
+    mailbox_id: str | None = None,
     mailbox_ref: str | None = None,
+    mail_direction: str | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
     sender: str | None = None,
@@ -38,7 +40,15 @@ def list_mail_messages(
     params: list[Any] = []
     _equal_filter(where, params, "account_id", account_id)
     _equal_filter(where, params, "account_ref", account_ref)
+    if mailbox_id:
+        where.append(
+            "EXISTS (SELECT 1 FROM mail_package_mailboxes pm "
+            "WHERE pm.package_id = mail_packages.package_id "
+            "AND pm.mailbox_id = ?)"
+        )
+        params.append(mailbox_id)
     _equal_filter(where, params, "mailbox_ref", mailbox_ref)
+    _equal_filter(where, params, "direction", mail_direction)
     _equal_filter(where, params, "archive_status", status)
     if date_from:
         where.append("COALESCE(received_at, saved_at) >= ?")
@@ -81,6 +91,34 @@ def get_mail_message(db_path, package_id: str) -> dict[str, Any] | None:
         _resource_dto(resource, package_root=dto["package_root"])
         for resource in query_mail_resources(db_path, package_id)
     ]
+    connection = get_connection(db_path)
+    dto["mailboxes"] = [
+        dict(row)
+        for row in connection.execute(
+            """
+            SELECT pm.mailbox_id, m.external_ref, m.display_name,
+                   m.mailbox_role, pm.provider_message_id, pm.uidvalidity,
+                   pm.provider_uid, pm.first_seen_at, pm.last_seen_at
+            FROM mail_package_mailboxes pm
+            JOIN mailboxes m ON m.mailbox_id = pm.mailbox_id
+            WHERE pm.package_id = ?
+            ORDER BY pm.first_seen_at, pm.id
+            """,
+            (package_id,),
+        ).fetchall()
+    ]
+    dto["thread_relations"] = [
+        dict(row)
+        for row in connection.execute(
+            """
+            SELECT related_package_id, relation_type, source, created_at
+            FROM mail_thread_relations
+            WHERE package_id = ?
+            ORDER BY created_at, id
+            """,
+            (package_id,),
+        ).fetchall()
+    ]
     return dto
 
 
@@ -98,7 +136,9 @@ def list_mail_threads(
     *,
     account_id: str | None = None,
     account_ref: str | None = None,
+    mailbox_id: str | None = None,
     mailbox_ref: str | None = None,
+    mail_direction: str | None = None,
     limit: int = 100,
     offset: int = 0,
 ) -> list[dict[str, Any]]:
@@ -157,7 +197,10 @@ def search_mail_facts(
     *,
     account_id: str | None = None,
     account_ref: str | None = None,
+    mailbox_id: str | None = None,
+    mailbox_ids: Iterable[str] | None = None,
     mailbox_ref: str | None = None,
+    mail_direction: str | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
     subject: str | None = None,
@@ -208,6 +251,33 @@ def search_mail_facts(
     if mailbox_ref:
         where.append("p.mailbox_ref = ?")
         params.append(mailbox_ref)
+    if mailbox_id:
+        where.append(
+            "EXISTS (SELECT 1 FROM mail_package_mailboxes pm "
+            "WHERE pm.package_id = p.package_id AND pm.mailbox_id = ?)"
+        )
+        params.append(mailbox_id)
+    if mailbox_ids is not None:
+        allowed_mailboxes = sorted(
+            {str(value) for value in mailbox_ids if str(value)}
+        )
+        if allowed_mailboxes:
+            placeholders = ",".join("?" for _ in allowed_mailboxes)
+            where.append(
+                "("
+                f"p.mailbox_id IN ({placeholders}) OR EXISTS ("
+                "SELECT 1 FROM mail_package_mailboxes pm "
+                "WHERE pm.package_id = p.package_id "
+                f"AND pm.mailbox_id IN ({placeholders}))"
+                ")"
+            )
+            params.extend(allowed_mailboxes)
+            params.extend(allowed_mailboxes)
+        else:
+            where.append("0 = 1")
+    if mail_direction:
+        where.append("p.direction = ?")
+        params.append(mail_direction)
     if date_from:
         where.append("COALESCE(p.received_at, p.saved_at) >= ?")
         params.append(date_from)
@@ -281,6 +351,12 @@ def _package_dto(row: dict[str, Any]) -> dict[str, Any]:
         "message_id": str(row.get("message_id") or ""),
         "provider_message_id": str(row.get("provider_message_id") or ""),
         "thread_ref": str(row.get("thread_ref") or ""),
+        "direction": str(row.get("direction") or "inbound"),
+        "in_reply_to": str(row.get("in_reply_to_raw") or ""),
+        "references": str(row.get("references_raw") or ""),
+        "reply_to_package_id": str(row.get("reply_to_package_id") or ""),
+        "forward_from_package_id": str(row.get("forward_from_package_id") or ""),
+        "content_fingerprint": str(row.get("content_fingerprint") or ""),
         "subject": str(row.get("subject") or ""),
         "from": readable_from,
         "from_display": from_display,

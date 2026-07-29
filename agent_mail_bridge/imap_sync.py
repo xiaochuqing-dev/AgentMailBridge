@@ -30,6 +30,11 @@ from agent_mail_bridge.logging_setup import get_logger
 from agent_mail_bridge.mail_accounts import current_receive_account_id
 from agent_mail_bridge.mail_common import normalized_mail_from_raw
 from agent_mail_bridge.mail_processing import process_normalized_mail
+from agent_mail_bridge.mailbox_sync import (
+    mailbox_direction,
+    selected_sync_mailboxes,
+    update_mailbox_checkpoint,
+)
 from agent_mail_bridge.provider_foundation import (
     _mailbox_role,
     classify_protocol_error,
@@ -57,25 +62,97 @@ def receive_imap_account(
     automatic: bool = False,
     client_factory: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
-    """按 UID 增量同步一个账号的 INBOX，并复用统一 Mail Package 流程。"""
+    """一个连接内按目录独立 UID checkpoint 同步所有已启用邮箱目录。"""
     incoming = effective_incoming_runtime(cfg)
     account_id = current_receive_account_id(cfg)
-    mailbox = incoming.mailbox or "INBOX"
     scan_cap = max(1, int(limit or cfg.receive_scan_cap or cfg.max_fetch_limit))
     result = _empty_result()
+    result["mailboxes"] = []
     client: Any | None = None
     try:
         client = _connect(incoming, client_factory)
         _refresh_mailboxes(cfg, account_id, client)
-        selected = client.select_folder(mailbox, readonly=not bool(mark_seen))
+        mailboxes = selected_sync_mailboxes(cfg.db_path, account_id)
+        if not mailboxes:
+            mailboxes = upsert_mailboxes(
+                cfg.db_path,
+                account_id,
+                [
+                    {
+                        "external_ref": incoming.mailbox or "INBOX",
+                        "display_name": incoming.mailbox or "INBOX",
+                        "mailbox_role": "inbox",
+                        "role_source": "configured_fallback",
+                        "role_confidence": "fallback",
+                        "sync_enabled": True,
+                    }
+                ],
+            )
+        for mailbox in mailboxes:
+            _sync_imap_mailbox(
+                cfg,
+                account_id=account_id,
+                incoming=incoming,
+                client=client,
+                mailbox=mailbox,
+                scan_cap=scan_cap,
+                result=result,
+            )
+    except Exception as exc:  # noqa: BLE001
+        code, message = _classify_connection_error(exc)
+        result.update(ok=False, global_error=True, error_code=code)
+        result["errors"].append(message)
+    finally:
+        _logout(client)
+
+    retries = count_receive_retries(cfg.db_path, account_id=account_id)
+    result["pending_retries"] = retries["pending"]
+    result["needs_attention"] = retries["needs_attention"]
+    if not automatic and result["errors"]:
+        logger.warning("IMAP 同步完成但存在错误：%s", result["errors"][0])
+    return result
+
+
+def _sync_imap_mailbox(
+    cfg: AppConfig,
+    *,
+    account_id: str,
+    incoming: Any,
+    client: Any,
+    mailbox: dict[str, Any],
+    scan_cap: int,
+    result: dict[str, Any],
+) -> None:
+    mailbox_name = str(mailbox["external_ref"])
+    mailbox_id = str(mailbox["mailbox_id"])
+    folder_result = {
+        "mailbox_id": mailbox_id,
+        "mailbox": mailbox_name,
+        "direction": mailbox_direction(mailbox),
+        "status": "success",
+        "fetched": 0,
+        "saved": 0,
+        "failed": 0,
+    }
+    result["mailboxes"].append(folder_result)
+    before = {
+        key: int(result.get(key) or 0)
+        for key in ("fetched", "saved", "failed")
+    }
+    try:
+        selected = client.select_folder(mailbox_name, readonly=True)
         uidvalidity = _response_int(selected, b"UIDVALIDITY")
         uidnext = _response_int(selected, b"UIDNEXT")
         highestmodseq = _response_int(selected, b"HIGHESTMODSEQ")
-        checkpoint = _load_mailbox_checkpoint(cfg, account_id, mailbox)
+        checkpoint = _load_mailbox_checkpoint(
+            cfg, account_id, mailbox_name
+        )
         previous_validity = int(checkpoint.get("uidvalidity") or 0)
         last_uid = int(checkpoint.get("last_uid") or 0)
         validity_changed = bool(
-            previous_validity and uidvalidity and previous_validity != uidvalidity
+            previous_validity
+            and uidvalidity
+            and previous_validity != uidvalidity
         )
         if validity_changed:
             last_uid = 0
@@ -83,8 +160,10 @@ def receive_imap_account(
                 int(checkpoint.get("uidvalidity_reset_count") or 0) + 1
             )
             result["uidvalidity_changed"] = True
-            result["stale_retries_retired"] = _retire_stale_mailbox_retries(
-                cfg, account_id, mailbox, uidvalidity
+            result["stale_retries_retired"] += (
+                _retire_stale_mailbox_retries(
+                    cfg, account_id, mailbox_name, uidvalidity
+                )
             )
 
         overlap_start = (
@@ -104,51 +183,41 @@ def receive_imap_account(
         candidates = _append_due_retry_uids(
             cfg,
             account_id,
-            mailbox,
+            mailbox_name,
             candidates,
             scan_cap,
             uidvalidity=uidvalidity,
             accept_legacy=not validity_changed,
         )
-        result["fetched"] = len(candidates)
-
+        result["fetched"] += len(candidates)
         successful_new_uids: list[int] = []
         for batch in _chunks(candidates, DEFAULT_BATCH_SIZE):
             fetched = _fetch_with_isolation(client, batch)
             for uid in batch:
                 resource_ids = _retry_resource_ids(
-                    mailbox, uid, uidvalidity
+                    mailbox_name, uid, uidvalidity
                 )
                 resource_id = resource_ids[0]
-                if not _retry_is_due(
-                    cfg,
-                    account_id,
-                    resource_ids,
-                ):
+                if not _retry_is_due(cfg, account_id, resource_ids):
                     result["skipped"] += 1
                     result["retry_deferred"] += 1
                     continue
                 raw_or_error = fetched.get(uid)
-                if isinstance(raw_or_error, Exception):
-                    _record_message_failure(
-                        cfg,
-                        account_id,
-                        resource_id,
-                        uid,
-                        raw_or_error,
-                        result,
-                        compatible_resource_ids=resource_ids,
-                    )
-                    continue
                 if not isinstance(raw_or_error, bytes):
+                    error = (
+                        raw_or_error
+                        if isinstance(raw_or_error, Exception)
+                        else ImapSyncError(
+                            "imap_fetch_missing",
+                            "服务器未返回该 UID 的 RFC822 原文",
+                        )
+                    )
                     _record_message_failure(
                         cfg,
                         account_id,
                         resource_id,
                         uid,
-                        ImapSyncError(
-                            "imap_fetch_missing", "服务器未返回该 UID 的 RFC822 原文"
-                        ),
+                        error,
                         result,
                         compatible_resource_ids=resource_ids,
                     )
@@ -158,19 +227,21 @@ def receive_imap_account(
                         cfg,
                         raw_or_error,
                         uid=uid,
-                        mailbox=mailbox,
+                        mailbox=mailbox_name,
                         result=result,
                         apply_receive_rule=True,
+                        direction=mailbox_direction(mailbox),
+                        uidvalidity=uidvalidity,
                     )
                     if single.get("status") == "partial":
                         raise ImapSyncError(
                             "mail_archive_partial",
                             str(single.get("error") or "邮件归档部分完成"),
                         )
-                    if mark_seen:
-                        _mark_seen(client, uid)
                     clear_receive_retries(
-                        cfg.db_path, "imap", resource_ids,
+                        cfg.db_path,
+                        "imap",
+                        resource_ids,
                         account_id=account_id,
                     )
                     if uid > last_uid:
@@ -185,7 +256,6 @@ def receive_imap_account(
                         result,
                         compatible_resource_ids=resource_ids,
                     )
-
         new_last_uid = max([last_uid, *successful_new_uids])
         checkpoint.update(
             {
@@ -196,20 +266,61 @@ def receive_imap_account(
                 "strategy": "polling_uid_checkpoint",
             }
         )
-        _save_mailbox_checkpoint(cfg, account_id, mailbox, checkpoint)
+        _save_mailbox_checkpoint(
+            cfg, account_id, mailbox_name, checkpoint
+        )
+        state = (
+            "partial"
+            if int(result.get("failed") or 0) > before["failed"]
+            else "no_changes"
+            if int(result.get("saved") or 0) == before["saved"]
+            else "success"
+        )
+        update_mailbox_checkpoint(
+            cfg.db_path,
+            mailbox_id,
+            uidvalidity=uidvalidity,
+            uidnext=uidnext,
+            highestmodseq=highestmodseq,
+            last_uid=new_last_uid,
+            checkpoint=checkpoint,
+            result=state,
+        )
+        folder_result["status"] = state
     except Exception as exc:  # noqa: BLE001
         code, message = _classify_connection_error(exc)
-        result.update(ok=False, global_error=True, error_code=code)
-        result["errors"].append(message)
+        folder_result["status"] = "failed"
+        folder_result["error_code"] = code
+        result["errors"].append(
+            f"邮箱目录 {mailbox_name} 同步失败：{message}"
+        )
+        result["failed"] += 1
+        try:
+            update_mailbox_checkpoint(
+                cfg.db_path,
+                mailbox_id,
+                uidvalidity=int(mailbox.get("uidvalidity") or 0),
+                uidnext=int(mailbox.get("uidnext") or 0),
+                highestmodseq=int(
+                    mailbox.get("highestmodseq") or 0
+                ),
+                last_uid=0,
+                checkpoint={},
+                result="failed",
+                error=code,
+            )
+        except Exception:  # noqa: BLE001
+            pass
     finally:
-        _logout(client)
-
-    retries = count_receive_retries(cfg.db_path, account_id=account_id)
-    result["pending_retries"] = retries["pending"]
-    result["needs_attention"] = retries["needs_attention"]
-    if not automatic and result["errors"]:
-        logger.warning("IMAP 同步完成但存在错误：%s", result["errors"][0])
-    return result
+        folder_result["fetched"] = (
+            int(result.get("fetched") or 0) - before["fetched"]
+        )
+        folder_result["saved"] = (
+            int(result.get("saved") or 0) - before["saved"]
+        )
+        folder_result["failed"] = (
+            int(result.get("failed") or 0) - before["failed"]
+        )
 
 
 def rescan_imap_account(
@@ -222,109 +333,63 @@ def rescan_imap_account(
     progress_callback: Callable[[dict[str, Any]], None] | None,
     page_size: int,
     scan_cap: int,
+    mailbox_ids: Iterable[str] | None = None,
     client_factory: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
-    """显式历史补扫；不推进普通增量 checkpoint。"""
+    """按已启用目录显式补扫历史；不推进普通增量 checkpoint。"""
     incoming = effective_incoming_runtime(cfg)
     account_id = current_receive_account_id(cfg)
-    mailbox = incoming.mailbox or "INBOX"
     result = _empty_result()
     result.update(
         matched=0,
         rule_skipped=0,
         cancelled=False,
         truncated=False,
+        mailboxes=[],
     )
     client: Any | None = None
     try:
         client = _connect(incoming, client_factory)
-        selected = client.select_folder(mailbox, readonly=True)
-        uidvalidity = _response_int(selected, b"UIDVALIDITY")
-        uids = sorted(
-            int(uid)
-            for uid in client.search(
-                [
-                    "SINCE",
-                    date_from.date(),
-                    "BEFORE",
-                    date_to.date() + timedelta(days=1),
-                ]
-            )
+        _refresh_mailboxes(cfg, account_id, client)
+        mailboxes = selected_sync_mailboxes(
+            cfg.db_path, account_id, mailbox_ids=mailbox_ids
         )
-        safe_cap = max(1, min(int(scan_cap), 10_000))
-        if len(uids) > safe_cap:
-            uids = uids[-safe_cap:]
-            result["truncated"] = True
-        safe_page = max(1, min(int(page_size), 500))
-        for page in _chunks(uids, safe_page):
-            if cancel_check and cancel_check():
-                result["cancelled"] = True
-                break
-            fetched = _fetch_with_isolation(client, page)
-            for uid in page:
-                if cancel_check and cancel_check():
-                    result["cancelled"] = True
-                    break
-                result["fetched"] += 1
-                raw_or_error = fetched.get(uid)
-                if not isinstance(raw_or_error, bytes):
-                    error = (
-                        raw_or_error
-                        if isinstance(raw_or_error, Exception)
-                        else ImapSyncError(
-                            "imap_fetch_missing",
-                            "服务器未返回该 UID 的 RFC822 原文",
-                        )
-                    )
-                    _record_message_failure(
-                        cfg,
-                        account_id,
-                        _retry_resource_id(mailbox, uid, uidvalidity),
-                        uid,
-                        error,
-                        result,
-                        compatible_resource_ids=_retry_resource_ids(
-                            mailbox, uid, uidvalidity
-                        ),
-                    )
-                    continue
-                try:
-                    single = _process_raw(
-                        cfg,
-                        raw_or_error,
-                        uid=uid,
-                        mailbox=mailbox,
-                        result=result,
-                        apply_receive_rule=apply_receive_rule,
-                        date_from=date_from,
-                        date_to=date_to,
-                    )
-                    status = str(single.get("status") or "")
-                    if status == "skipped":
-                        result["rule_skipped"] += 1
-                    elif status in {"saved", "partial", "duplicate"}:
-                        result["matched"] += 1
-                except Exception as exc:  # noqa: BLE001
-                    _record_message_failure(
-                        cfg,
-                        account_id,
-                        _retry_resource_id(mailbox, uid, uidvalidity),
-                        uid,
-                        exc,
-                        result,
-                        compatible_resource_ids=_retry_resource_ids(
-                            mailbox, uid, uidvalidity
-                        ),
-                    )
-                if progress_callback:
-                    try:
-                        progress_callback(dict(result))
-                    except Exception:  # noqa: BLE001
-                        logger.warning(
-                            "IMAP 历史补扫进度回调失败", exc_info=True
-                        )
+        for mailbox in mailboxes:
             if result["cancelled"]:
                 break
+            folder = {
+                "mailbox_id": str(mailbox["mailbox_id"]),
+                "mailbox": str(mailbox["external_ref"]),
+                "direction": mailbox_direction(mailbox),
+                "status": "success",
+            }
+            result["mailboxes"].append(folder)
+            try:
+                _rescan_imap_mailbox(
+                    cfg,
+                    account_id=account_id,
+                    client=client,
+                    mailbox=mailbox,
+                    date_from=date_from,
+                    date_to=date_to,
+                    apply_receive_rule=apply_receive_rule,
+                    cancel_check=cancel_check,
+                    progress_callback=progress_callback,
+                    page_size=page_size,
+                    scan_cap=scan_cap,
+                    result=result,
+                )
+                folder["status"] = (
+                    "cancelled" if result["cancelled"] else "success"
+                )
+            except Exception as exc:  # noqa: BLE001
+                code, message = _classify_connection_error(exc)
+                folder["status"] = "failed"
+                folder["error_code"] = code
+                result["failed"] += 1
+                result["errors"].append(
+                    f"邮箱目录 {mailbox['external_ref']} 历史补扫失败：{message}"
+                )
     except Exception as exc:  # noqa: BLE001
         code, message = _classify_connection_error(exc)
         result.update(ok=False, global_error=True, error_code=code)
@@ -335,6 +400,117 @@ def rescan_imap_account(
     result["pending_retries"] = retries["pending"]
     result["needs_attention"] = retries["needs_attention"]
     return result
+
+
+def _rescan_imap_mailbox(
+    cfg: AppConfig,
+    *,
+    account_id: str,
+    client: Any,
+    mailbox: dict[str, Any],
+    date_from: datetime,
+    date_to: datetime,
+    apply_receive_rule: bool,
+    cancel_check: Callable[[], bool] | None,
+    progress_callback: Callable[[dict[str, Any]], None] | None,
+    page_size: int,
+    scan_cap: int,
+    result: dict[str, Any],
+) -> None:
+    mailbox_name = str(mailbox["external_ref"])
+    selected = client.select_folder(mailbox_name, readonly=True)
+    uidvalidity = _response_int(selected, b"UIDVALIDITY")
+    uids = sorted(
+        int(uid)
+        for uid in client.search(
+            [
+                "SINCE",
+                date_from.date(),
+                "BEFORE",
+                date_to.date() + timedelta(days=1),
+            ]
+        )
+    )
+    safe_cap = max(1, min(int(scan_cap), 10_000))
+    if len(uids) > safe_cap:
+        uids = uids[-safe_cap:]
+        result["truncated"] = True
+    safe_page = max(1, min(int(page_size), 500))
+    for page in _chunks(uids, safe_page):
+        if cancel_check and cancel_check():
+            result["cancelled"] = True
+            break
+        fetched = _fetch_with_isolation(client, page)
+        for uid in page:
+            if cancel_check and cancel_check():
+                result["cancelled"] = True
+                break
+            result["fetched"] += 1
+            raw_or_error = fetched.get(uid)
+            if not isinstance(raw_or_error, bytes):
+                error = (
+                    raw_or_error
+                    if isinstance(raw_or_error, Exception)
+                    else ImapSyncError(
+                        "imap_fetch_missing",
+                        "服务器未返回该 UID 的 RFC822 原文",
+                    )
+                )
+                _record_message_failure(
+                    cfg,
+                    account_id,
+                    _retry_resource_id(
+                        mailbox_name, uid, uidvalidity
+                    ),
+                    uid,
+                    error,
+                    result,
+                    compatible_resource_ids=_retry_resource_ids(
+                        mailbox_name, uid, uidvalidity
+                    ),
+                )
+                continue
+            try:
+                single = _process_raw(
+                    cfg,
+                    raw_or_error,
+                    uid=uid,
+                    mailbox=mailbox_name,
+                    result=result,
+                    apply_receive_rule=apply_receive_rule,
+                    direction=mailbox_direction(mailbox),
+                    uidvalidity=uidvalidity,
+                    date_from=date_from,
+                    date_to=date_to,
+                )
+                status = str(single.get("status") or "")
+                if status == "skipped":
+                    result["rule_skipped"] += 1
+                elif status in {"saved", "partial", "duplicate"}:
+                    result["matched"] += 1
+            except Exception as exc:  # noqa: BLE001
+                _record_message_failure(
+                    cfg,
+                    account_id,
+                    _retry_resource_id(
+                        mailbox_name, uid, uidvalidity
+                    ),
+                    uid,
+                    exc,
+                    result,
+                    compatible_resource_ids=_retry_resource_ids(
+                        mailbox_name, uid, uidvalidity
+                    ),
+                )
+            if progress_callback:
+                try:
+                    progress_callback(dict(result))
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "IMAP 历史补扫进度回调失败", exc_info=True
+                    )
+        if result["cancelled"]:
+            break
 
 
 def _connect(incoming: Any, client_factory: Callable[..., Any] | None) -> Any:
@@ -470,6 +646,8 @@ def _process_raw(
     mailbox: str,
     result: dict[str, Any],
     apply_receive_rule: bool,
+    direction: str = "inbound",
+    uidvalidity: int = 0,
     date_from: datetime | None = None,
     date_to: datetime | None = None,
 ) -> dict[str, Any]:
@@ -484,6 +662,8 @@ def _process_raw(
         saved_date=received_at.strftime("%Y-%m-%d"),
         max_attachment_bytes=cfg.max_attachment_bytes,
         mailbox_ref=mailbox,
+        direction=direction,
+        uidvalidity=uidvalidity,
     )
     if date_from is not None or date_to is not None:
         normalized_at = datetime.fromisoformat(normalized.received_at)

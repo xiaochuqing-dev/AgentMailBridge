@@ -25,8 +25,18 @@ from agent_mail_bridge.database import (
     query_agent_client_permissions,
     query_agent_clients,
     query_mail_accounts,
+    query_mailboxes,
     replace_agent_client_permissions,
     update_agent_client,
+)
+from agent_mail_bridge.send_permissions import (
+    SEND_MODES,
+    effective_attachment_workspace_ids,
+    effective_mailbox_ids,
+    effective_send_account_ids,
+    query_extended_scopes,
+    replace_extended_scopes,
+    validate_extended_scope_values,
 )
 from agent_mail_bridge.mail_resource_access import (
     workspace_dtos,
@@ -51,8 +61,12 @@ CAPABILITIES = {
     "sync.ensure_fresh",
     "workspace.list",
     "result.submit",
+    "mail.accounts.list",
+    "mailboxes.list",
+    "mail.send",
+    "send.status",
 }
-RECOMMENDED_CAPABILITIES = CAPABILITIES - {"result.submit"}
+RECOMMENDED_CAPABILITIES = CAPABILITIES - {"result.submit", "mail.send", "send.status"}
 
 TOOL_CAPABILITIES = {
     "search_mails": "mail.search",
@@ -62,6 +76,10 @@ TOOL_CAPABILITIES = {
     "get_mail_sync_status": "sync.status",
     "list_agent_workspaces": "workspace.list",
     "submit_result": "result.submit",
+    "list_mail_accounts": "mail.accounts.list",
+    "list_mailboxes": "mailboxes.list",
+    "send_mail": "mail.send",
+    "get_send_request_status": "send.status",
 }
 
 ACCOUNT_SCOPE_CAPABILITY = "account.access"
@@ -76,6 +94,9 @@ ERROR_MESSAGES = {
     "capability_denied": "该 Agent Client 未获准使用此能力",
     "account_denied": "该 Agent Client 未获准访问此邮箱账号",
     "workspace_denied": "该 Agent Client 未获准使用此资料目录",
+    "mailbox_denied": "该 Agent Client 未获准访问此邮箱目录",
+    "send_account_denied": "该 Agent Client 未获准使用此发件账号",
+    "attachment_scope_denied": "该 Agent Client 未获准使用此附件资料目录",
     "token_rotation_failed": "Client scoped token 轮换失败，旧 token 仍然有效",
     "token_rotation_rollback_failed": "Client scoped token 轮换回滚失败，请暂停该 Client 后处理",
 }
@@ -97,13 +118,23 @@ class AgentIdentity:
     config_scope: str
     permission_mode: str
     account_scope_mode: str
+    mailbox_scope_mode: str
+    send_account_scope_mode: str
     workspace_scope_mode: str
+    attachment_scope_mode: str
+    send_mode: str
     capabilities: frozenset[str]
     denied_capabilities: frozenset[str]
     account_ids: frozenset[str]
     denied_account_ids: frozenset[str]
+    mailbox_ids: frozenset[str]
+    denied_mailbox_ids: frozenset[str]
+    send_account_ids: frozenset[str]
+    denied_send_account_ids: frozenset[str]
     workspace_ids: frozenset[str]
     denied_workspace_ids: frozenset[str]
+    attachment_workspace_ids: frozenset[str]
+    denied_attachment_workspace_ids: frozenset[str]
 
 
 def new_client_id() -> str:
@@ -138,7 +169,11 @@ class AgentIntegrationService:
         config_scope: str = "user",
         permission_mode: str = "custom",
         account_scope_mode: str = "selected",
+        mailbox_scope_mode: str = "selected",
+        send_account_scope_mode: str = "selected",
         workspace_scope_mode: str = "selected",
+        attachment_scope_mode: str = "selected",
+        send_mode: str = "confirm",
         notes: str | None = None,
     ) -> tuple[dict[str, Any], str]:
         normalized_type = str(client_type or "").strip().casefold()
@@ -158,13 +193,29 @@ class AgentIntegrationService:
             raise ValueError("配置方式无效")
         normalized_permission_mode = str(permission_mode or "custom").strip().casefold()
         normalized_account_scope = str(account_scope_mode or "selected").strip().casefold()
+        normalized_mailbox_scope = str(mailbox_scope_mode or "selected").strip().casefold()
+        normalized_send_account_scope = str(
+            send_account_scope_mode or "selected"
+        ).strip().casefold()
         normalized_workspace_scope = str(workspace_scope_mode or "selected").strip().casefold()
+        normalized_attachment_scope = str(
+            attachment_scope_mode or "selected"
+        ).strip().casefold()
+        normalized_send_mode = str(send_mode or "confirm").strip().casefold()
         if normalized_permission_mode not in PERMISSION_MODES:
             raise ValueError("权限模式无效")
         if normalized_account_scope not in SCOPE_MODES:
             raise ValueError("邮箱范围模式无效")
+        if normalized_mailbox_scope not in SCOPE_MODES:
+            raise ValueError("邮箱目录范围模式无效")
+        if normalized_send_account_scope not in SCOPE_MODES:
+            raise ValueError("发件账号范围模式无效")
         if normalized_workspace_scope not in SCOPE_MODES:
             raise ValueError("资料输出目录范围模式无效")
+        if normalized_attachment_scope not in SCOPE_MODES:
+            raise ValueError("附件资料目录范围模式无效")
+        if normalized_send_mode not in SEND_MODES:
+            raise ValueError("发件模式无效")
         client_id = new_client_id()
         token = new_client_token()
         credential_ref = agent_client_credential_name(client_id)
@@ -182,7 +233,11 @@ class AgentIntegrationService:
                 enabled=False,
                 permission_mode=normalized_permission_mode,
                 account_scope_mode=normalized_account_scope,
+                mailbox_scope_mode=normalized_mailbox_scope,
+                send_account_scope_mode=normalized_send_account_scope,
                 workspace_scope_mode=normalized_workspace_scope,
+                attachment_scope_mode=normalized_attachment_scope,
+                send_mode=normalized_send_mode,
                 notes=(" ".join(str(notes or "").split())[:500] or None),
             )
         except Exception:
@@ -244,6 +299,62 @@ class AgentIntegrationService:
             changed += 1
         return changed
 
+    def seed_v17_legacy_mailbox_scopes(self) -> int:
+        """升级时把旧读权限固化到当前目录，不授权未来新增目录。"""
+        changed = 0
+        for client in query_agent_clients(
+            self.cfg.db_path, include_revoked=True
+        ):
+            client_id = str(client["client_id"])
+            rows = query_agent_client_permissions(self.cfg.db_path, client_id)
+            has_mail_read = any(
+                row.get("enabled")
+                and row.get("effect") == "allow"
+                and row.get("capability")
+                in {"mail.search", "mail.get", "resource.read", "resource.prepare"}
+                for row in rows
+            )
+            if (
+                not has_mail_read
+                or str(client.get("mailbox_scope_mode") or "selected")
+                != "selected"
+            ):
+                continue
+            existing = query_extended_scopes(self.cfg.db_path, client_id)
+            if existing["mailbox_ids"] or existing["denied_mailbox_ids"]:
+                continue
+            selected_accounts = {
+                str(row["account_id"])
+                for row in rows
+                if row.get("enabled")
+                and row.get("effect") == "allow"
+                and row.get("capability") == ACCOUNT_SCOPE_CAPABILITY
+                and row.get("account_id")
+            }
+            if str(client.get("account_scope_mode") or "selected") == "all":
+                selected_accounts = {
+                    str(row["account_id"])
+                    for row in query_mail_accounts(
+                        self.cfg.db_path, enabled_only=True
+                    )
+                }
+            mailbox_ids = {
+                str(row["mailbox_id"])
+                for row in query_mailboxes(
+                    self.cfg.db_path, enabled_only=True
+                )
+                if str(row["account_id"]) in selected_accounts
+            }
+            if not mailbox_ids:
+                continue
+            replace_extended_scopes(
+                self.cfg.db_path,
+                client_id,
+                mailbox_ids=mailbox_ids,
+            )
+            changed += 1
+        return changed
+
     def set_permissions(
         self,
         client_id: str,
@@ -251,24 +362,50 @@ class AgentIntegrationService:
         capabilities: Iterable[str],
         account_ids: Iterable[str],
         workspace_ids: Iterable[str],
+        mailbox_ids: Iterable[str] = (),
+        send_account_ids: Iterable[str] = (),
+        attachment_workspace_ids: Iterable[str] = (),
         denied_capabilities: Iterable[str] = (),
         denied_account_ids: Iterable[str] = (),
         denied_workspace_ids: Iterable[str] = (),
+        denied_mailbox_ids: Iterable[str] = (),
+        denied_send_account_ids: Iterable[str] = (),
+        denied_attachment_workspace_ids: Iterable[str] = (),
         permission_mode: str = "custom",
         account_scope_mode: str = "selected",
+        mailbox_scope_mode: str = "selected",
+        send_account_scope_mode: str = "selected",
         workspace_scope_mode: str = "selected",
+        attachment_scope_mode: str = "selected",
+        send_mode: str = "confirm",
     ) -> list[dict[str, Any]]:
         if get_agent_client(self.cfg.db_path, client_id) is None:
             raise AgentAccessError("unknown_client")
         normalized_permission_mode = str(permission_mode or "custom").strip().casefold()
         normalized_account_scope = str(account_scope_mode or "selected").strip().casefold()
+        normalized_mailbox_scope = str(mailbox_scope_mode or "selected").strip().casefold()
+        normalized_send_account_scope = str(
+            send_account_scope_mode or "selected"
+        ).strip().casefold()
         normalized_workspace_scope = str(workspace_scope_mode or "selected").strip().casefold()
+        normalized_attachment_scope = str(
+            attachment_scope_mode or "selected"
+        ).strip().casefold()
+        normalized_send_mode = str(send_mode or "confirm").strip().casefold()
         if normalized_permission_mode not in PERMISSION_MODES:
             raise ValueError("权限模式无效")
         if normalized_account_scope not in SCOPE_MODES:
             raise ValueError("邮箱范围模式无效")
+        if normalized_mailbox_scope not in SCOPE_MODES:
+            raise ValueError("邮箱目录范围模式无效")
+        if normalized_send_account_scope not in SCOPE_MODES:
+            raise ValueError("发件账号范围模式无效")
         if normalized_workspace_scope not in SCOPE_MODES:
             raise ValueError("资料输出目录范围模式无效")
+        if normalized_attachment_scope not in SCOPE_MODES:
+            raise ValueError("附件资料目录范围模式无效")
+        if normalized_send_mode not in SEND_MODES:
+            raise ValueError("发件模式无效")
         allow_caps = {str(item).strip() for item in capabilities}
         if normalized_permission_mode == "recommended":
             allow_caps = set(RECOMMENDED_CAPABILITIES)
@@ -317,6 +454,39 @@ class AgentIntegrationService:
             selected_workspaces.add(
                 workspace_id_for_path(self.cfg.data_root_path)
             )
+        selected_mailboxes = {
+            str(item).strip() for item in mailbox_ids if str(item).strip()
+        }
+        denied_mailboxes = {
+            str(item).strip() for item in denied_mailbox_ids if str(item).strip()
+        }
+        selected_send_accounts = {
+            str(item).strip() for item in send_account_ids if str(item).strip()
+        }
+        denied_send_accounts = {
+            str(item).strip()
+            for item in denied_send_account_ids
+            if str(item).strip()
+        }
+        selected_attachment_workspaces = {
+            str(item).strip()
+            for item in attachment_workspace_ids
+            if str(item).strip()
+        }
+        denied_attachment_workspaces = {
+            str(item).strip()
+            for item in denied_attachment_workspace_ids
+            if str(item).strip()
+        }
+        validate_extended_scope_values(
+            self.cfg.db_path,
+            mailbox_ids=selected_mailboxes | denied_mailboxes,
+            send_account_ids=selected_send_accounts | denied_send_accounts,
+            attachment_workspace_ids=(
+                selected_attachment_workspaces | denied_attachment_workspaces
+            ),
+            configured_roots=self.cfg.effective_allowed_send_roots,
+        )
         rows: list[dict[str, Any]] = [
             {"capability": item, "effect": "allow"} for item in sorted(allow_caps)
         ]
@@ -360,12 +530,38 @@ class AgentIntegrationService:
             for item in sorted(denied_workspaces)
         )
         saved = replace_agent_client_permissions(self.cfg.db_path, client_id, rows)
+        replace_extended_scopes(
+            self.cfg.db_path,
+            client_id,
+            mailbox_ids=(
+                selected_mailboxes
+                if normalized_mailbox_scope == "selected"
+                else ()
+            ),
+            denied_mailbox_ids=denied_mailboxes,
+            send_account_ids=(
+                selected_send_accounts
+                if normalized_send_account_scope == "selected"
+                else ()
+            ),
+            denied_send_account_ids=denied_send_accounts,
+            attachment_workspace_ids=(
+                selected_attachment_workspaces
+                if normalized_attachment_scope == "selected"
+                else ()
+            ),
+            denied_attachment_workspace_ids=denied_attachment_workspaces,
+        )
         update_agent_client(
             self.cfg.db_path,
             client_id,
             permission_mode=normalized_permission_mode,
             account_scope_mode=normalized_account_scope,
+            mailbox_scope_mode=normalized_mailbox_scope,
+            send_account_scope_mode=normalized_send_account_scope,
             workspace_scope_mode=normalized_workspace_scope,
+            attachment_scope_mode=normalized_attachment_scope,
+            send_mode=normalized_send_mode,
         )
         return saved
 
@@ -561,9 +757,19 @@ class AgentIntegrationService:
         account_scope_mode = str(
             row.get("account_scope_mode") or "selected"
         ).casefold()
+        mailbox_scope_mode = str(
+            row.get("mailbox_scope_mode") or "selected"
+        ).casefold()
+        send_account_scope_mode = str(
+            row.get("send_account_scope_mode") or "selected"
+        ).casefold()
         workspace_scope_mode = str(
             row.get("workspace_scope_mode") or "selected"
         ).casefold()
+        attachment_scope_mode = str(
+            row.get("attachment_scope_mode") or "selected"
+        ).casefold()
+        send_mode = str(row.get("send_mode") or "confirm").casefold()
         current_accounts = frozenset(
             str(item["account_id"])
             for item in query_mail_accounts(
@@ -584,6 +790,26 @@ class AgentIntegrationService:
             if workspace_scope_mode == "all"
             else selected_workspaces - deny_workspaces
         )
+        extended = query_extended_scopes(self.cfg.db_path, normalized_id)
+        allow_mailboxes = effective_mailbox_ids(
+            self.cfg.db_path,
+            account_ids=allow_accounts,
+            mode=mailbox_scope_mode,
+            selected=extended["mailbox_ids"],
+            denied=extended["denied_mailbox_ids"],
+        )
+        allow_send_accounts = effective_send_account_ids(
+            self.cfg.db_path,
+            mode=send_account_scope_mode,
+            selected=extended["send_account_ids"],
+            denied=extended["denied_send_account_ids"],
+        )
+        allow_attachment_workspaces = effective_attachment_workspace_ids(
+            self.cfg.effective_allowed_send_roots,
+            mode=attachment_scope_mode,
+            selected=extended["attachment_workspace_ids"],
+            denied=extended["denied_attachment_workspace_ids"],
+        )
         update_agent_client(
             self.cfg.db_path,
             normalized_id,
@@ -596,13 +822,29 @@ class AgentIntegrationService:
             config_scope=str(row["config_scope"]),
             permission_mode=str(row.get("permission_mode") or "custom"),
             account_scope_mode=account_scope_mode,
+            mailbox_scope_mode=mailbox_scope_mode,
+            send_account_scope_mode=send_account_scope_mode,
             workspace_scope_mode=workspace_scope_mode,
+            attachment_scope_mode=attachment_scope_mode,
+            send_mode=send_mode,
             capabilities=allow_caps,
             denied_capabilities=deny_caps,
             account_ids=allow_accounts,
             denied_account_ids=deny_accounts,
+            mailbox_ids=allow_mailboxes,
+            denied_mailbox_ids=frozenset(
+                extended["denied_mailbox_ids"]
+            ),
+            send_account_ids=allow_send_accounts,
+            denied_send_account_ids=frozenset(
+                extended["denied_send_account_ids"]
+            ),
             workspace_ids=allow_workspaces,
             denied_workspace_ids=deny_workspaces,
+            attachment_workspace_ids=allow_attachment_workspaces,
+            denied_attachment_workspace_ids=frozenset(
+                extended["denied_attachment_workspace_ids"]
+            ),
         )
 
     def require_capability(
@@ -642,10 +884,57 @@ class AgentIntegrationService:
         row = get_mail_package(self.cfg.db_path, package_id)
         return str((row or {}).get("account_id") or "")
 
+    def require_mailbox(
+        self, identity: AgentIdentity, mailbox_id: str | None
+    ) -> str:
+        normalized = str(mailbox_id or "").strip()
+        if not normalized or normalized not in identity.mailbox_ids:
+            raise AgentAccessError("mailbox_denied")
+        row = next(
+            (
+                item
+                for item in query_mailboxes(
+                    self.cfg.db_path, enabled_only=True
+                )
+                if str(item["mailbox_id"]) == normalized
+            ),
+            None,
+        )
+        if row is None or str(row["account_id"]) not in identity.account_ids:
+            raise AgentAccessError("mailbox_denied")
+        return normalized
+
+    def require_send_account(
+        self, identity: AgentIdentity, account_id: str | None
+    ) -> str:
+        normalized = str(account_id or "").strip()
+        if not normalized and len(identity.send_account_ids) == 1:
+            normalized = next(iter(identity.send_account_ids))
+        if (
+            not normalized
+            or normalized in identity.denied_send_account_ids
+            or normalized not in identity.send_account_ids
+        ):
+            raise AgentAccessError("send_account_denied")
+        account = get_mail_account(self.cfg.db_path, normalized)
+        if (
+            account is None
+            or not account.get("enabled")
+            or not account.get("send_enabled")
+        ):
+            raise AgentAccessError("send_account_denied")
+        return normalized
+
     def require_workspace(
         self, identity: AgentIdentity, requested: str | None
     ) -> tuple[str, str]:
         rows = workspace_dtos(self.cfg)
+        authorized_rows = [
+            row
+            for row in rows
+            if str(row["workspace_id"]) in identity.workspace_ids
+            and str(row["workspace_id"]) not in identity.denied_workspace_ids
+        ]
         selected = None
         if requested:
             selected = next(
@@ -659,16 +948,8 @@ class AgentIntegrationService:
                 ),
                 None,
             )
-        elif len(identity.workspace_ids) == 1:
-            workspace_id = next(iter(identity.workspace_ids))
-            selected = next(
-                (
-                    row
-                    for row in rows
-                    if str(row["workspace_id"]) == workspace_id
-                ),
-                None,
-            )
+        elif len(authorized_rows) == 1:
+            selected = authorized_rows[0]
         if selected is None:
             raise AgentAccessError("workspace_denied")
         workspace_id = str(selected["workspace_id"])
@@ -697,6 +978,26 @@ class AgentIntegrationService:
                 continue
             return workspace_id, str(root)
         raise AgentAccessError("workspace_denied")
+
+    def require_attachment_path(
+        self, identity: AgentIdentity, requested_path: str
+    ) -> tuple[str, str]:
+        candidate = Path(str(requested_path or "")).expanduser().resolve()
+        for root_value in self.cfg.effective_allowed_send_roots:
+            root = Path(root_value).resolve()
+            workspace_id = workspace_id_for_path(root)
+            if (
+                workspace_id not in identity.attachment_workspace_ids
+                or workspace_id
+                in identity.denied_attachment_workspace_ids
+            ):
+                continue
+            try:
+                assert_within_root(candidate, root)
+            except SecurityError:
+                continue
+            return workspace_id, str(root)
+        raise AgentAccessError("attachment_scope_denied")
 
     @staticmethod
     def _client_view(row: dict[str, Any]) -> dict[str, Any]:

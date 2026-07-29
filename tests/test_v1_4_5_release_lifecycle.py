@@ -13,11 +13,17 @@ from agent_mail_bridge.mail_accounts import (
 from agent_mail_bridge.models import OperationStatus, ServiceResult
 from scripts.release_lifecycle_validation import (
     _close_runtime_handles,
+    _expected_mcp_tool_count,
     _same_persistent_facts,
     _seed_baseline,
     _snapshot,
     _uninstall,
 )
+
+
+def test_lifecycle_uses_versioned_mcp_tool_counts():
+    assert _expected_mcp_tool_count("1.6.0") == 7
+    assert _expected_mcp_tool_count("1.7.0") == 11
 
 
 def test_gmail_diagnostic_uses_account_specific_oauth_paths(

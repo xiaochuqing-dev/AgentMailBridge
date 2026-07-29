@@ -28,6 +28,7 @@ from agent_mail_bridge.database import (
     close_connection,
     init_db,
     message_id_exists,
+    query_mailboxes,
     query_received_files_by_message,
     query_received_messages_by_date,
 )
@@ -41,7 +42,11 @@ def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
 
 
-def _make_service(messages_list_resp=None, messages_get_map=None):
+def _make_service(
+    messages_list_resp=None,
+    messages_get_map=None,
+    labels_list_resp=None,
+):
     """构造一个 mock Gmail API service。
 
     messages_list_resp: list() 的返回 dict（含 messages 列表）。
@@ -73,6 +78,11 @@ def _make_service(messages_list_resp=None, messages_get_map=None):
         return result
 
     msgs.get.side_effect = _get
+    users.labels.return_value.list.return_value.execute.return_value = (
+        labels_list_resp
+        if labels_list_resp is not None
+        else {"labels": []}
+    )
 
     # attachments
     atts = msgs.attachments.return_value
@@ -196,6 +206,40 @@ class TestEmptyList:
         assert result["saved"] == 0
         assert result["skipped"] == 0
         assert result["errors"] == []
+
+    def test_discovers_system_and_user_labels_without_expanding_defaults(
+        self, tmp_cfg
+    ):
+        service = _make_service(
+            messages_list_resp={"messages": []},
+            labels_list_resp={
+                "labels": [
+                    {"id": "INBOX", "name": "Inbox", "type": "system"},
+                    {"id": "SENT", "name": "Sent", "type": "system"},
+                    {"id": "SPAM", "name": "Spam", "type": "system"},
+                    {"id": "TRASH", "name": "Trash", "type": "system"},
+                    {
+                        "id": "Label_42",
+                        "name": "项目资料",
+                        "type": "user",
+                    },
+                ]
+            },
+        )
+        result = receive_gmail_api_messages(tmp_cfg, service=service)
+        assert result["ok"] is True
+        rows = query_mailboxes(tmp_cfg.db_path)
+        by_ref = {row["external_ref"]: row for row in rows}
+        assert by_ref["gmail:INBOX"]["mailbox_role"] == "inbox"
+        assert by_ref["gmail:SENT"]["mailbox_role"] == "sent"
+        assert by_ref["gmail:SPAM"]["mailbox_role"] == "junk"
+        assert by_ref["gmail:TRASH"]["mailbox_role"] == "trash"
+        assert by_ref["gmail:Label_42"]["mailbox_role"] == "other"
+        assert {
+            ref
+            for ref, row in by_ref.items()
+            if row["sync_enabled"]
+        } == {"gmail:INBOX", "gmail:SENT"}
 
 
 class TestSingleMessage:

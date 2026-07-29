@@ -326,6 +326,8 @@ def test_mcp_tools_structured_output_and_audit_omit_content(
     assert names == [
         "submit_result", "search_mails", "get_mail", "read_mail_resource",
         "prepare_mail_resources", "list_agent_workspaces", "get_mail_sync_status",
+        "list_mail_accounts", "list_mailboxes", "send_mail",
+        "get_send_request_status",
     ]
     response = server.handle_message(
         {
@@ -446,7 +448,7 @@ def test_real_stdio_protocol_reads_and_prepares_archived_resource(
     responses = [json.loads(line) for line in completed.stdout.splitlines()]
     assert completed.stderr == ""
     assert len(responses) == 7
-    assert len(responses[1]["result"]["tools"]) == 7
+    assert len(responses[1]["result"]["tools"]) == 11
     tools = {item["name"]: item for item in responses[1]["result"]["tools"]}
     assert tools["search_mails"]["annotations"]["readOnlyHint"] is True
     assert tools["read_mail_resource"]["annotations"]["openWorldHint"] is False

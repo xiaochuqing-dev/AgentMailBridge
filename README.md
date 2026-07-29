@@ -1,10 +1,10 @@
 # AgentMailBridge
 
-AgentMailBridge v1.6.0 是面向个人用户的本地优先 Windows 邮箱桥接工具，也是 Codex、Claude Code 和 Hermes 共用的确定性邮件事实后端。邮箱只需接入一次；Agent 不获得邮箱密码或 OAuth Token，只通过七个事实工具搜索、读取和准备用户明确选择的邮件。普通 Claude Desktop 聊天客户端仅保留兼容接入，不是本阶段重点。
+AgentMailBridge v1.7.0 是面向个人用户的本地优先 Windows 邮箱桥接工具，也是 Codex、Claude Code 和 Hermes 共用的确定性邮件事实与收发后端。邮箱只需接入一次；用户可授权 Agent 读取任何已同步账号、目录和历史邮件，也可授权任意已接通的发件账号，用于新建、回复、回复全部和转发。Agent 永远不会获得邮箱密码、授权码、OAuth Token 或 Client token。普通 Claude Desktop 聊天客户端仅保留兼容接入。
 
 每封邮件形成一个包含真实 `raw.eml`、可读正文、附件、邮件内图片、受控下载和来源 Hash 的本地事实包。用户可导入接入前的历史邮件，也可把整封邮件的完整资料原子复制到允许目录供 Agent 处理，内部归档保持不变。
 
-每个 Agent Client 使用稳定 `client_id`、独立 scoped token 和确定性权限。首次连接默认使用“推荐权限”：当前及以后新增的邮箱和资料目录自动可用，搜索、读取、按需刷新和完整资料准备开启，主动发送/结果提交关闭。完全信任和自定义模式仍受固定收件人、`DATA_ROOT`、ownership 与 Hash 边界约束。未知、暂停或撤销 Client 默认拒绝。
+每个 Agent Client 使用稳定 `client_id`、独立 scoped token 和确定性权限。读取账号、邮箱目录、发件账号和本地附件目录都可选择动态 `all` 或显式 `selected`；旧 Client 默认不获得新发件权限。通用发件只有“发送前确认”和“Agent 自主发送”两种模式，不提供草稿模式。未知、暂停或撤销 Client 默认拒绝；发件确认时会再次检查 Client、账号、目录、附件大小与 SHA-256。
 
 ## Multi-Account Runtime
 
@@ -34,22 +34,22 @@ Account Runtime Router 由 `account_id` 解析 Provider Adapter、运行配置�
 
 - 顶部主工作区只有“收件”和“发件”。
 - 左侧统一“邮箱账号”列表展示真实账号、Provider、地址、能力和启停状态；“添加邮箱账号”可创建 Gmail、QQ、163 与 Generic 账号，动态账号页可测试连接、发现目录、管理按账号凭据/OAuth，并安全移除账号。
-- 左侧独立“Agent 接入”入口与“历史记录”“文件与数据”“设置”“关于”组成贴合的统一导航卡；高级设置是“设置 > 高级设置”的二级页面。
+- 左侧独立“Agent 接入”和“待确认发送”入口与“历史记录”“文件与数据”“设置”“关于”组成统一导航卡；高级设置是“设置 > 高级设置”的二级页面。
 - 历史记录只回答“发生过什么业务行为”，以产品化摘要、中文状态和结构化详情展示收件、发件和 Agent / MCP；文件与数据管理真实收件文件、发送归档、Agent 结果、存储概览、备份、恢复和一致性扫描。
 - 收件页不重复显示 Gmail 管理卡；正常窗口完整展示今日文件与最近日志，不出现页面级滚动，较矮窗口才启用滚动兜底。数据较多时表格内部滚动，不使用分页。
 - 收件和发件共用顶部唯一“刷新本地页面数据”入口；新配置默认接收“当前扫描范围内全部邮件”。“仅 Gmail 自发自收邮件（高级）”和自定义规则仍可明确选择；自定义规则可按发件人/域名、主题关键词和是否含附件过滤。手动、自动、Gmail API、IMAP 和 MCP 新鲜度同步共用同一业务规则。
-- “立即收取”只检查当前增量范围；“导入历史邮件”提供最近 30 天、最近 1 年、2024 全年、全部历史和自定义范围，自动按季度分段，持久化进度、计数、取消和继续状态，不推进普通增量 checkpoint。
+- “立即收取”检查当前增量范围；“导入历史邮件”支持最近 30 天、最近 1 年、任意自然年、跨年、自定义范围和全部历史，并可限定多个邮箱目录，持久化分段、计数、取消和继续状态。
 - 收件结果明确区分成功、无新邮件、部分完成和失败；无新邮件不计入失败或错误。
 - “今日收到邮件”每封邮件只显示一条紧凑记录；RFC 2047 联系人显示名会解码，正文摘要最多一至两行，附件、邮件图片、链接和下载数量始终可见。双击整行或点击“查看邮件”进入详情；正文和资源使用可拖动纵向分隔，图片、附件、链接与下载只在非空时分区显示。
 - 收件搜索使用邮件事实层，可按主题、发件人、收件人、抄送人、完整可读正文、附件名、邮件图片名、链接文字、域名、URL 和状态查找；同一邮件多个资源命中仍只显示一条。
-- 发件页可从已启用且具备正式 send 能力的账号中选择发件身份，并支持一个用户明确输入的合法 To、可选主题、正文、0 至多个附件和 0 至多个链接；发送前展示实际账号与收件人并拒绝空值、非法地址、多地址和 CRLF 注入。MCP 不获得此自由选择能力。
+- GUI 手动发件与 Agent 发件保持独立。Agent 在 Client 获准范围内可使用多个 To、Cc、Bcc、多个附件和链接，并可新建、回复、回复全部或转发；收件人不默认固定。确认模式在“待确认发送”展示完整正文与附件，用户确认前不连接 SMTP；自主模式在权限校验后直接发送。
 - “文件与数据”以 `mail_resources` 作为新收件资源权威来源，并保留未映射旧数据兼容；表格显示所属邮件，可从文件进入邮件详情，也可从邮件详情定位附件。未知大小、真实 0 字节和文件不存在分别显示。
 - 右侧连接健康以五个独立状态项展示 Gmail、QQ SMTP、Agent/MCP、凭据/OAuth 和 SQLite/数据目录，并提供定向处理入口。
 - v1.2.0 的收件、发件资源和最近调用表格使用统一整行视觉，浅色/深色 Hover 不闪白、不出现竖向单元格分割或选择分块，同时保持 Windows 中文 UI、线性图标和 100%/125%/150% DPI 适配。
 
 ## Windows 安装
 
-运行 `AgentMailBridge-1.6.0-Setup.exe`。默认安装到 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需 Python、Git 或管理员权限。桌面和开始菜单只指向 `AgentMailBridge.exe`；内部 `AgentMailBridgeMCP.exe` 不创建快捷方式、托盘或开机启动项。
+运行 `AgentMailBridge-1.7.0-Setup.exe`。默认安装到 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需 Python、Git 或管理员权限。桌面和开始菜单只指向 `AgentMailBridge.exe`；内部 `AgentMailBridgeMCP.exe` 不创建快捷方式、托盘或开机启动项。
 
 安装版数据位置：
 
@@ -81,21 +81,25 @@ Token 仅在 state 校验成功后交换，并通过同目录临时文件、落�
 | Codex | managed / assisted | 桌面版、CLI 与编辑器入口共用用户级 `config.toml`；未验证版本只辅助配置 |
 | Claude Code | managed / assisted | 用户级 `~/.claude.json` 可备份和幂等合并；项目级适配器可用 |
 | Hermes | managed / assisted | Windows `%LOCALAPPDATA%\hermes\config.yaml` 保留注释和未知字段，支持 `hermes mcp test` 与 `/reload-mcp` |
-| Claude Desktop | compatibility only | 保留已有兼容配置，不作为推荐入口或 v1.6.0 验收阻断项 |
+| Claude Desktop | compatibility only | 保留已有兼容配置，不作为推荐入口 |
 | Custom MCP | manual | 复制最小 JSON/TOML stdio 示例并自行导入 |
 
 自动写入前必须显示已隐藏 scoped token 的预览。应用时保存原文件和 Hash，检测 hash/mtime 并发冲突，使用临时文件、fsync 和原子替换；损坏配置不会覆盖，失败会恢复，用户也可恢复备份。重复连接只更新 `agent-mail-bridge` 项，不删除其他 MCP Server 或未知字段。撤销只移除本产品管理项并让该 token 立即失效。
 
 stdio 配置需要携带 Client 专属 scoped token，这是本地 Client 协议的启动身份，不是邮箱凭据。GUI 管理副本保存在 Windows Credential Manager，SQLite 只保存 token Hash；外部 Client 配置中的 scoped token 可能被同一 Windows 用户读取，因此本机同用户进程不是强隔离边界。每个 token 可单独轮换或撤销。
 
-MCP 按需启动，stdin 关闭后退出，并提供七个工具：
+MCP 按需启动，stdin 关闭后退出，并提供 11 个工具：
 
 - `search_mails`：按最新、今天、昨天、最近若干天或日期范围搜索，支持账号、主题、发件人、收件人、附件和状态过滤；账号范围始终受当前 Client allowlist 限制。
 - `get_mail`：分页读取邮件元数据、完整可读正文和资源清单。
 - `read_mail_resource`：严格按邮件归属分页读取文本、CSV/TSV、图片元数据和真实 raw.eml，二进制只返回安全描述。
-- `prepare_mail_resources`：默认兼容旧的指定资源准备；`mode=complete` 会原子准备正文、真实 raw、邮件信息、附件、邮件内图片、已归档下载和双 manifest，逐项校验 ownership、大小与 SHA-256。
+- `prepare_mail_resources`：默认兼容旧的指定资源准备；`mode=complete` 原子准备完整资料。同一 package、目标和 Hash 未变化时返回 `reused=true` 并复用原目录；工作副本被修改时不覆盖，可重新准备到新目录。
 - `list_agent_workspaces`：列出明确授权的 Agent 可用资料目录。
 - `get_mail_sync_status`：读取指定或当前账号的后台同步、新鲜度、重试和跨进程互斥状态。
+- `list_mail_accounts`：列出当前 Client 可读取或可发件的账号事实，不返回任何秘密。
+- `list_mailboxes`：列出获准账号的 Inbox、Sent、Archive、Spam/Trash 和自定义目录事实。
+- `send_mail`：统一执行 new、reply、reply_all 和 forward；支持多 To/Cc/Bcc、链接、邮件归档附件和授权本地附件。
+- `get_send_request_status`：查询待确认、已取消、已发送、结果不确定或归档失败状态。
 - `submit_result`：保持向后兼容，把 Agent 最终结果发送到固定 Gmail。
 
 `submit_result` 结构仍为：
@@ -108,7 +112,7 @@ MCP 按需启动，stdin 关闭后退出，并提供七个工具：
 }
 ```
 
-邮件读取只能访问 `DATA_ROOT` 内的规范归档，不能读取凭据或任意文件系统路径；资料准备只能写入用户明确授权的目录。MCP/Agent 结果收件人固定为 `OWNER_GMAIL`；`submit_result` 还必须通过当前 Client 自己的资料目录范围、全局允许目录、Hash、大小和 staging 校验。
+邮件读取只能访问 `DATA_ROOT` 内的规范归档，不能读取凭据或任意文件系统路径；资料准备只能写入用户明确授权的目录。只有兼容 `submit_result` 的结果收件人固定为 `OWNER_GMAIL`；通用 `send_mail` 可向任意合法地址发件，但必须通过 Client 发件权限、发件账号和附件目录范围。
 
 Windows MCP stdin、stdout 和 stderr 明确使用 UTF-8，首条请求可兼容 UTF-8 BOM；stdout 只输出逐行 JSON-RPC 并在每条响应后 flush。中文目录、中文文件名、空格路径和中文标题可直接提交，不需要 Agent 修改 code page 或手工执行 Copy-Item。
 
@@ -155,8 +159,8 @@ python scripts\provider_mime_receive_validation.py --from-account-id <account_id
 
 构建流程会先执行 Preflight，再运行完整 pytest、构建 GUI 与内部 MCP、执行 packaged smoke 和秘密排除扫描，并生成：
 
-- `release\AgentMailBridge-1.6.0-Setup.exe`
-- `release\AgentMailBridge-1.6.0-Windows-x64.zip`
+- `release\AgentMailBridge-1.7.0-Setup.exe`
+- `release\AgentMailBridge-1.7.0-Windows-x64.zip`
 - `release\checksums.sha256`
 
 详细说明见 `docs/GUI使用说明.md`、`docs/MCP使用说明.md`、`docs/Agent Client身份与权限设计.md`、`docs/Credential与Client Token说明.md`、四类 Client 接入指南、`docs/安全与诊断说明.md`、`docs/Windows安装与升级说明.md` 和最终专项报告。

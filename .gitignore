@@ -60,6 +60,7 @@ ENV/
 
 # --- 本地数据（默认不提交） ---
 AgentMailBridgeData/
+.agentmailbridge/
 agent_mail_bridge.db
 agent_mail_bridge.db-journal
 agent_mail_bridge.db-wal

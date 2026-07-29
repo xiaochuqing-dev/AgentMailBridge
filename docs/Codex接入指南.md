@@ -1,6 +1,6 @@
 # Codex 接入指南
 
-v1.6.0 把 Codex 作为推荐入口，当前验证版本为 Codex CLI 0.145.0。先在 GUI 的“Agent 接入”点击“连接 Codex”，默认使用推荐权限；只有自定义模式才需要选择技术能力、邮箱和资料目录。
+v1.7.0 把 Codex Desktop 与 Codex CLI 作为推荐入口。先在 GUI 的“Agent 接入”连接 Codex，再用人话分别授权读取账号/目录、发件账号、确认或自主发送和本地附件目录。桌面真实任务必须实际调用工具，不能用 CLI 或配置存在替代。
 
 用户级配置默认位于 `~/.codex/config.toml`；项目级配置位于项目根目录 `.codex/config.toml`，只应在可信项目使用。AgentMailBridge 只更新 `[mcp_servers.agent-mail-bridge]` 及其 env table，保留其他 TOML section；写前备份并核对 Hash 与 mtime。
 

@@ -516,7 +516,7 @@ def test_gmail_send_is_not_claimed_and_mcp_boundary_is_unchanged(tmp_cfg):
     gmail = get_provider_adapter("gmail")
     assert not gmail.supports("send")
     tools = _all_tools()
-    assert len(tools) == 7
+    assert len(tools) == 11
     submit = next(item for item in tools if item["name"] == "submit_result")
     submit_properties = submit["inputSchema"]["properties"]
     assert "recipient" not in submit_properties

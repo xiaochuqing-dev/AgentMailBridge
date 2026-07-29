@@ -104,16 +104,20 @@ def main() -> int:
         encoded[0] = "\ufeff" + encoded[0]
         encoded.insert(2, "{malformed")
         payload = "\n".join(encoded) + "\n"
-        completed = subprocess.run(
-            [str(executable)],
-            input=payload,
-            text=True,
-            encoding="utf-8",
-            capture_output=True,
-            env=env,
-            timeout=30,
-            check=False,
-        )
+        try:
+            completed = subprocess.run(
+                [str(executable)],
+                input=payload,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                env=env,
+                timeout=30,
+                check=False,
+            )
+        finally:
+            close_connection()
+            logging.shutdown()
         if completed.returncode != 0:
             raise SystemExit(f"MCP 返回码异常：{completed.returncode}；stderr={completed.stderr[-500:]}")
         responses = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
@@ -131,6 +135,10 @@ def main() -> int:
             "prepare_mail_resources",
             "list_agent_workspaces",
             "get_mail_sync_status",
+            "list_mail_accounts",
+            "list_mailboxes",
+            "send_mail",
+            "get_send_request_status",
         ]:
             raise SystemExit("MCP 工具列表异常")
         result = by_id[4]["result"]["structuredContent"]
@@ -148,8 +156,6 @@ def main() -> int:
             raise SystemExit("MCP 未知 method 未返回 method not found")
         if "Traceback" in completed.stderr:
             raise SystemExit("MCP stderr 出现异常回溯")
-        close_connection()
-        logging.shutdown()
     print("packaged MCP smoke PASS")
     return 0
 

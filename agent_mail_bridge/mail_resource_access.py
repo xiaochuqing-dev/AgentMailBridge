@@ -320,6 +320,7 @@ def _prepare_complete_mail_package(
             "邮件归档目录不可用",
         ) from exc
     source_snapshot = _archive_snapshot(package_root)
+    source_fingerprint = _archive_snapshot_fingerprint(source_snapshot)
     requested_subdir = _safe_subdir(target_subdir)
     relative_destination = requested_subdir or Path("完整邮件资料")
     parent_parts = [
@@ -330,6 +331,41 @@ def _prepare_complete_mail_package(
     ]
     parent = _ensure_workspace_directory(workspace, parent_parts)
     destination = parent / relative_destination.name
+    existing_copy_modified = False
+    if destination.exists():
+        reused = _reusable_complete_copy(
+            destination,
+            package_id=package_id,
+            source_fingerprint=source_fingerprint,
+            source_manifest=package_root / "manifest.json",
+        )
+        if reused is not None:
+            return {
+                "mode": "complete",
+                "mail_id": package_id,
+                "package_id": package_id,
+                "account_id": str(message.get("account_id") or ""),
+                "workspace_id": _workspace_id(workspace),
+                "workspace_path": str(workspace),
+                "target_directory": str(destination),
+                "manifest_path": str(destination / "完整资料manifest.json"),
+                "prepared": reused,
+                "failures": [],
+                "prepared_count": len(reused),
+                "failed_count": 0,
+                "status": "success",
+                "atomic_publish": True,
+                "reused": True,
+                "existing_copy_modified": False,
+                "source_archive_unchanged": True,
+                "source_archive_file_count": len(source_snapshot),
+            }
+        existing_copy_modified = True
+        if policy == "error":
+            raise MailAccessError(
+                "complete_mail_copy_modified",
+                "现有完整邮件资料副本已变化，未覆盖；可使用 rename 重新准备到新目录",
+            )
     destination = _complete_collision_target(destination, policy)
     # 临时名与中文目标名解耦，避免 Windows 未启用长路径时重复准备越过 MAX_PATH。
     stage = parent / f".ambc-{uuid.uuid4().hex[:12]}.tmp"
@@ -416,7 +452,11 @@ def _prepare_complete_mail_package(
 
         stage_step = "write_manifest"
         manifest_path = stage / "完整资料manifest.json"
-        manifest = _complete_package_manifest(message, prepared)
+        manifest = _complete_package_manifest(
+            message,
+            prepared,
+            source_archive_fingerprint=source_fingerprint,
+        )
         _atomic_write_json(manifest_path, manifest)
         manifest_fact = _prepared_fact(manifest_path, "complete.manifest", "")
         prepared.append(manifest_fact)
@@ -520,6 +560,8 @@ def _prepare_complete_mail_package(
         "failed_count": 0,
         "status": "success",
         "atomic_publish": True,
+        "reused": False,
+        "existing_copy_modified": existing_copy_modified,
         "source_archive_unchanged": True,
         "source_archive_file_count": len(source_snapshot),
     }
@@ -654,6 +696,22 @@ def _archive_snapshot(root: Path) -> dict[str, tuple[int, int, str]]:
         ) from exc
 
 
+def _archive_snapshot_fingerprint(
+    snapshot: dict[str, tuple[int, int, str]]
+) -> str:
+    digest = hashlib.sha256()
+    for relative_path, (size_bytes, _mtime_ns, file_sha256) in sorted(
+        snapshot.items()
+    ):
+        digest.update(relative_path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(size_bytes).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(file_sha256.encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
 def _complete_mail_info(message: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -679,7 +737,10 @@ def _complete_mail_info(message: dict[str, Any]) -> dict[str, Any]:
 
 
 def _complete_package_manifest(
-    message: dict[str, Any], prepared: list[dict[str, Any]]
+    message: dict[str, Any],
+    prepared: list[dict[str, Any]],
+    *,
+    source_archive_fingerprint: str,
 ) -> dict[str, Any]:
     resources = []
     for resource in message.get("resources") or []:
@@ -704,14 +765,129 @@ def _complete_package_manifest(
             }
         )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "package_id": str(message.get("package_id") or ""),
         "account_id": str(message.get("account_id") or ""),
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "source_archive_immutable": True,
+        "source_archive_fingerprint": source_archive_fingerprint,
         "files": [dict(item) for item in prepared],
         "resources": resources,
     }
+
+
+def _reusable_complete_copy(
+    destination: Path,
+    *,
+    package_id: str,
+    source_fingerprint: str,
+    source_manifest: Path,
+) -> list[dict[str, Any]] | None:
+    if (
+        destination.is_symlink()
+        or (
+            hasattr(destination, "is_junction")
+            and destination.is_junction()
+        )
+        or not destination.is_dir()
+    ):
+        raise MailAccessError(
+            "complete_mail_prepare_denied",
+            "完整邮件资料目标不能是符号链接、目录联接或普通文件",
+        )
+    manifest_path = destination / "完整资料manifest.json"
+    try:
+        if (
+            manifest_path.is_symlink()
+            or (
+                hasattr(manifest_path, "is_junction")
+                and manifest_path.is_junction()
+            )
+            or not manifest_path.is_file()
+        ):
+            return None
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(manifest, dict)
+            or str(manifest.get("package_id") or "") != package_id
+        ):
+            return None
+        recorded_fingerprint = str(
+            manifest.get("source_archive_fingerprint") or ""
+        )
+        files = manifest.get("files")
+        if not isinstance(files, list):
+            return None
+        prepared: list[dict[str, Any]] = []
+        original_manifest_sha = ""
+        for raw_fact in files:
+            if not isinstance(raw_fact, dict):
+                return None
+            relative_text = str(raw_fact.get("relative_path") or "")
+            relative = Path(relative_text)
+            if (
+                not relative_text
+                or relative.is_absolute()
+                or ".." in relative.parts
+            ):
+                return None
+            candidate = destination.joinpath(relative)
+            if (
+                candidate.is_symlink()
+                or (
+                    hasattr(candidate, "is_junction")
+                    and candidate.is_junction()
+                )
+                or not candidate.is_file()
+            ):
+                return None
+            resolved = candidate.resolve(strict=True)
+            assert_within_root(resolved, destination)
+            expected_size = int(raw_fact.get("size_bytes"))
+            expected_sha = str(raw_fact.get("sha256") or "")
+            if (
+                resolved.stat().st_size != expected_size
+                or not expected_sha
+                or sha256_of_file(resolved) != expected_sha
+            ):
+                return None
+            if str(raw_fact.get("resource_id") or "") == "archive.manifest":
+                original_manifest_sha = expected_sha
+            prepared.append(
+                {
+                    **raw_fact,
+                    "prepared_path": str(resolved),
+                }
+            )
+        if recorded_fingerprint:
+            if recorded_fingerprint != source_fingerprint:
+                return None
+        else:
+            if (
+                not original_manifest_sha
+                or not source_manifest.is_file()
+                or sha256_of_file(source_manifest) != original_manifest_sha
+            ):
+                return None
+        prepared.append(
+            {
+                "resource_id": "complete.manifest",
+                "relative_path": "完整资料manifest.json",
+                "source_relative_path": "",
+                "size_bytes": manifest_path.stat().st_size,
+                "sha256": sha256_of_file(manifest_path),
+                "prepared_path": str(manifest_path),
+            }
+        )
+        return prepared
+    except (
+        json.JSONDecodeError,
+        OSError,
+        SecurityError,
+        TypeError,
+        ValueError,
+    ):
+        return None
 
 
 def _complete_collision_target(path: Path, policy: str) -> Path:

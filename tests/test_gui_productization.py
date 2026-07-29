@@ -10,7 +10,12 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtGui import QImage
-from PySide6.QtWidgets import QApplication, QPushButton
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QDialogButtonBox,
+    QPushButton,
+)
 
 from agent_mail_bridge.application_service import ApplicationService
 from agent_mail_bridge.models import OperationStatus, ReceiveResult, ServiceResult
@@ -114,6 +119,7 @@ def test_dark_theme_defines_neutral_text_and_card_surfaces(product_window):
     assert "QFrame#accountPanel, QFrame#credentialCard" in stylesheet
     assert "QPushButton#accountChoice:checked" in stylesheet
     assert "QPushButton#textButton, QPushButton#compactButton" in stylesheet
+    assert "QScrollArea#accountListScroll, QWidget#accountList" in stylesheet
     assert "color: #C6BEFF" in stylesheet
     assert "#242736" in stylesheet
 
@@ -121,3 +127,57 @@ def test_dark_theme_defines_neutral_text_and_card_surfaces(product_window):
 def test_gui_fixture_never_reads_project_oauth_files(product_window, tmp_path):
     assert product_window.service.cfg.gmail_api_credentials_path.parent == tmp_path
     assert product_window.service.cfg.gmail_api_token_path.parent == tmp_path
+
+
+def test_managed_client_apply_button_accepts_and_starts_task(
+    product_window, product_qt_app, monkeypatch
+):
+    preview = ServiceResult(
+        OperationStatus.SUCCESS,
+        details={
+            "target_path": ".codex/config.toml",
+            "preview": '{"token": "<redacted>"}',
+            "plan_id": "plan_test",
+        },
+    )
+    monkeypatch.setattr(
+        product_window.service,
+        "preview_agent_client_config",
+        lambda _client_id: preview,
+    )
+    started: dict[str, object] = {}
+
+    def capture_task(title, task, finished, *, refresh_on_finish=True):
+        started.update(
+            title=title,
+            task=task,
+            finished=finished,
+            refresh_on_finish=refresh_on_finish,
+        )
+
+    monkeypatch.setattr(product_window, "_run_task", capture_task)
+
+    def click_apply(dialog):
+        button_box = dialog.findChild(QDialogButtonBox)
+        assert button_box is not None
+        apply_button = next(
+            button
+            for button in button_box.findChildren(QPushButton)
+            if button.text() == "备份并应用"
+        )
+        apply_button.click()
+        product_qt_app.processEvents()
+        return dialog.result()
+
+    monkeypatch.setattr(QDialog, "exec", click_apply)
+    product_window._configure_agent_client(
+        {
+            "client_id": "client_test",
+            "client_type": "codex",
+            "installed": True,
+            "install_status": "managed_supported",
+        }
+    )
+
+    assert started["refresh_on_finish"] is False
+    assert callable(started["task"])

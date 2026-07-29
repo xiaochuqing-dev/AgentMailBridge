@@ -198,7 +198,8 @@ def test_imap_initial_incremental_uidvalidity_and_failure_isolation(tmp_cfg):
     )
     assert first["ok"]
     assert first["saved"] == 2
-    assert first["failed"] == 1
+    # Inbox 与 Sent 使用独立 checkpoint；同一缺失 UID 在两个目录各记录一次。
+    assert first["failed"] == 2
     checkpoint = json.loads(
         get_auto_receive_state(
             tmp_cfg.db_path, account_id=account_id

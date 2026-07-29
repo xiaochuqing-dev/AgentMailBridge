@@ -26,6 +26,7 @@ from agent_mail_bridge.config import AppConfig
 from agent_mail_bridge.database import (
     clear_receive_retry,
     count_receive_retries,
+    get_mail_account,
     insert_received_file,
     insert_received_message,
     log_event,
@@ -34,6 +35,8 @@ from agent_mail_bridge.database import (
     receive_retry_is_due,
     record_receive_failure,
     record_receive_rule_evaluation,
+    record_package_mailbox_mapping,
+    sync_mail_accounts,
 )
 from agent_mail_bridge.logging_setup import get_logger
 from agent_mail_bridge.mail_common import (
@@ -44,7 +47,16 @@ from agent_mail_bridge.mail_common import (
 )
 from agent_mail_bridge.mail_processing import process_normalized_mail
 from agent_mail_bridge.mail_archive import stable_account_ref
-from agent_mail_bridge.mail_accounts import current_receive_account_id
+from agent_mail_bridge.mail_accounts import (
+    current_receive_account_id,
+    legacy_accounts_from_config,
+    stable_mailbox_id,
+)
+from agent_mail_bridge.mailbox_sync import (
+    discover_gmail_mailboxes,
+    mailbox_direction,
+    selected_sync_mailboxes,
+)
 from agent_mail_bridge.receive_rules import receive_rule_fingerprint
 from agent_mail_bridge.security import (
     check_size_ok,
@@ -100,6 +112,12 @@ def receive_gmail_api_messages(
     from agent_mail_bridge.config import require_receive_config
     require_receive_config(cfg)
     account_id = current_receive_account_id(cfg)
+    if not account_id or get_mail_account(cfg.db_path, account_id) is None:
+        sync_mail_accounts(
+            cfg.db_path,
+            legacy_accounts_from_config(cfg),
+        )
+        account_id = current_receive_account_id(cfg)
 
     if limit is None:
         page_size = cfg.gmail_api_max_results
@@ -141,25 +159,54 @@ def receive_gmail_api_messages(
             result["global_error"] = True
             result["errors"].append(msg)
             return result
+    try:
+        discover_gmail_mailboxes(
+            service=service,
+            db_path=cfg.db_path,
+            account_id=account_id,
+        )
+        mailboxes = selected_sync_mailboxes(cfg.db_path, account_id)
+    except Exception as exc:  # noqa: BLE001
+        result.update(ok=False, global_error=True)
+        result["errors"].append(_describe_api_error(exc))
+        return result
 
     # ---- list 邮件 id ----
     try:
-        messages: list[dict[str, Any]] = []
-        page_token: str | None = None
+        message_map: dict[str, dict[str, Any]] = {}
         query = _query_with_lookback(cfg)
-        while len(messages) < scan_cap:
-            request: dict[str, Any] = {
-                "userId": "me",
-                "q": query,
-                "maxResults": min(page_size, scan_cap - len(messages)),
-            }
-            if page_token:
-                request["pageToken"] = page_token
-            list_resp = service.users().messages().list(**request).execute()
-            messages.extend(list_resp.get("messages", []) or [])
-            page_token = list_resp.get("nextPageToken")
-            if not page_token:
-                break
+        for mailbox in mailboxes:
+            folder_messages = 0
+            page_token: str | None = None
+            while folder_messages < scan_cap:
+                request: dict[str, Any] = {
+                    "userId": "me",
+                    "q": query,
+                    "labelIds": [str(mailbox["raw_name"])],
+                    "maxResults": min(
+                        page_size, scan_cap - folder_messages
+                    ),
+                }
+                if page_token:
+                    request["pageToken"] = page_token
+                list_resp = (
+                    service.users().messages().list(**request).execute()
+                )
+                page_messages = list_resp.get("messages", []) or []
+                folder_messages += len(page_messages)
+                for item in page_messages:
+                    provider_id = str(item.get("id") or "")
+                    if not provider_id:
+                        continue
+                    current = message_map.setdefault(
+                        provider_id,
+                        {**item, "mailboxes": []},
+                    )
+                    current["mailboxes"].append(mailbox)
+                page_token = list_resp.get("nextPageToken")
+                if not page_token:
+                    break
+        messages = list(message_map.values())
     except Exception as exc:  # noqa: BLE001
         msg = _describe_api_error(exc)
         logger.error(msg)
@@ -176,7 +223,13 @@ def receive_gmail_api_messages(
     ):
         resource_id = str(retry.get("resource_id") or "")
         if resource_id and resource_id not in known_ids:
-            messages.append({"id": resource_id, "retry": True})
+            messages.append(
+                {
+                    "id": resource_id,
+                    "retry": True,
+                    "mailboxes": mailboxes[:1],
+                }
+            )
             known_ids.add(resource_id)
     result["fetched"] = len(messages)
 
@@ -191,7 +244,12 @@ def receive_gmail_api_messages(
             continue
         try:
             _process_one_unified(
-                service, cfg, gmail_message_id, gmail_thread_id, result,
+                service,
+                cfg,
+                gmail_message_id,
+                gmail_thread_id,
+                result,
+                mailboxes=item.get("mailboxes") or mailboxes[:1],
             )
             clear_receive_retry(
                 cfg.db_path, "gmail_api", gmail_message_id, account_id=account_id
@@ -240,11 +298,19 @@ def rescan_gmail_api_messages(
     scan_id: str,
     page_size: int = 100,
     scan_cap: int = 5000,
+    mailbox_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """分页重扫明确历史范围，不复用普通 lookback，也不修改 Gmail 状态。"""
     from agent_mail_bridge.config import require_receive_config
 
     require_receive_config(cfg)
+    account_id = current_receive_account_id(cfg)
+    if not account_id or get_mail_account(cfg.db_path, account_id) is None:
+        sync_mail_accounts(
+            cfg.db_path,
+            legacy_accounts_from_config(cfg),
+        )
+        account_id = current_receive_account_id(cfg)
     safe_page_size = max(1, min(int(page_size), 500))
     safe_scan_cap = max(1, min(int(scan_cap), 10_000))
     result: dict[str, Any] = {
@@ -278,110 +344,153 @@ def rescan_gmail_api_messages(
             result.update(ok=False, global_error=True)
             result["errors"].append(_describe_auth_error(exc))
             return result
+    try:
+        discover_gmail_mailboxes(
+            service=service,
+            db_path=cfg.db_path,
+            account_id=account_id,
+        )
+        mailboxes = selected_sync_mailboxes(
+            cfg.db_path, account_id, mailbox_ids=mailbox_ids
+        )
+    except Exception as exc:  # noqa: BLE001
+        result.update(ok=False, global_error=True)
+        result["errors"].append(_describe_api_error(exc))
+        return result
     query = _historical_query(cfg, date_from, date_to)
-    page_token: str | None = None
     fingerprint = receive_rule_fingerprint(cfg) if apply_receive_rule else "all_scanned_override"
     account_ref = stable_account_ref(cfg)
-    account_id = current_receive_account_id(cfg)
-    while result["fetched"] < safe_scan_cap:
-        if cancel_check and cancel_check():
-            result["cancelled"] = True
-            break
-        request: dict[str, Any] = {
-            "userId": "me",
-            "q": query,
-            "maxResults": min(safe_page_size, safe_scan_cap - result["fetched"]),
-        }
-        if page_token:
-            request["pageToken"] = page_token
-        try:
-            page = service.users().messages().list(**request).execute()
-        except Exception as exc:  # noqa: BLE001
-            result.update(ok=False, global_error=True)
-            result["errors"].append(_describe_api_error(exc))
-            break
-        messages = page.get("messages", []) or []
-        for item in messages:
+    for mailbox in mailboxes:
+        page_token: str | None = None
+        folder_fetched = 0
+        result.setdefault("mailboxes", []).append(
+            {
+                "mailbox_id": str(mailbox["mailbox_id"]),
+                "mailbox": str(mailbox["external_ref"]),
+                "direction": mailbox_direction(mailbox),
+                "status": "success",
+            }
+        )
+        while folder_fetched < safe_scan_cap:
             if cancel_check and cancel_check():
                 result["cancelled"] = True
                 break
-            provider_id = str(item.get("id") or "")
-            thread_id = str(item.get("threadId") or "")
-            result["fetched"] += 1
+            request: dict[str, Any] = {
+                "userId": "me",
+                "q": query,
+                "labelIds": [str(mailbox["raw_name"])],
+                "maxResults": min(
+                    safe_page_size, safe_scan_cap - folder_fetched
+                ),
+            }
+            if page_token:
+                request["pageToken"] = page_token
             try:
-                single = _process_one_unified(
-                    service,
-                    cfg,
-                    provider_id,
-                    thread_id,
-                    result,
-                    apply_receive_rule=apply_receive_rule,
-                )
-                status = str(single.get("status") or "")
-                if status == "skipped":
-                    result["rule_skipped"] += 1
-                    evaluation_result = "rule_skipped"
-                elif status == "duplicate":
-                    result["matched"] += 1
-                    evaluation_result = "duplicate"
-                else:
-                    result["matched"] += 1
-                    evaluation_result = status or "saved"
-                record_receive_rule_evaluation(
-                    cfg.db_path,
-                    account_ref=account_ref,
-                    account_id=account_id,
-                    backend="gmail_api",
-                    provider_message_id=provider_id,
-                    message_id=str(single.get("message_id") or "") or None,
-                    result=evaluation_result,
-                    reason=str(single.get("reason") or "matched"),
-                    rule_fingerprint=fingerprint,
-                    scan_id=scan_id,
-                )
-                clear_receive_retry(
-                    cfg.db_path, "gmail_api", provider_id, account_id=account_id
-                )
+                page = service.users().messages().list(**request).execute()
             except Exception as exc:  # noqa: BLE001
-                is_partial = isinstance(exc, Exception) and type(exc).__name__ == "MailArchivePartialError"
-                if is_partial:
-                    result["matched"] += 1
                 result["failed"] += 1
-                result["errors"].append(f"历史邮件处理失败：{type(exc).__name__}")
-                record_receive_failure(
-                    cfg.db_path,
-                    backend="gmail_api",
-                    resource_id=provider_id,
-                    message_id=str(getattr(exc, "message_id", provider_id)),
-                    error=str(exc),
-                    account_id=account_id,
-                )
-                record_receive_rule_evaluation(
-                    cfg.db_path,
-                    account_ref=account_ref,
-                    account_id=account_id,
-                    backend="gmail_api",
-                    provider_message_id=provider_id,
-                    message_id=str(getattr(exc, "message_id", "")) or None,
-                    result="partial" if is_partial else "failed",
-                    reason=type(exc).__name__,
-                    rule_fingerprint=fingerprint,
-                    scan_id=scan_id,
-                )
-            if progress_callback:
-                try:
-                    progress_callback(dict(result))
-                except Exception:  # noqa: BLE001 - 进度展示失败不能中断邮件归档
-                    logger.warning("历史补扫进度回调失败", exc_info=True)
-            if result["fetched"] >= safe_scan_cap:
+                result["errors"].append(_describe_api_error(exc))
                 break
+            messages = page.get("messages", []) or []
+            for item in messages:
+                if cancel_check and cancel_check():
+                    result["cancelled"] = True
+                    break
+                provider_id = str(item.get("id") or "")
+                thread_id = str(item.get("threadId") or "")
+                result["fetched"] += 1
+                folder_fetched += 1
+                try:
+                    single = _process_one_unified(
+                        service,
+                        cfg,
+                        provider_id,
+                        thread_id,
+                        result,
+                        apply_receive_rule=apply_receive_rule,
+                        mailboxes=[mailbox],
+                    )
+                    status = str(single.get("status") or "")
+                    if status == "skipped":
+                        result["rule_skipped"] += 1
+                        evaluation_result = "rule_skipped"
+                    elif status == "duplicate":
+                        result["matched"] += 1
+                        evaluation_result = "duplicate"
+                    else:
+                        result["matched"] += 1
+                        evaluation_result = status or "saved"
+                    record_receive_rule_evaluation(
+                        cfg.db_path,
+                        account_ref=account_ref,
+                        account_id=account_id,
+                        backend="gmail_api",
+                        provider_message_id=provider_id,
+                        message_id=str(single.get("message_id") or "") or None,
+                        result=evaluation_result,
+                        reason=str(single.get("reason") or "matched"),
+                        rule_fingerprint=fingerprint,
+                        scan_id=scan_id,
+                    )
+                    clear_receive_retry(
+                        cfg.db_path,
+                        "gmail_api",
+                        provider_id,
+                        account_id=account_id,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    is_partial = (
+                        type(exc).__name__ == "MailArchivePartialError"
+                    )
+                    if is_partial:
+                        result["matched"] += 1
+                    result["failed"] += 1
+                    result["errors"].append(
+                        f"历史邮件处理失败：{type(exc).__name__}"
+                    )
+                    record_receive_failure(
+                        cfg.db_path,
+                        backend="gmail_api",
+                        resource_id=provider_id,
+                        message_id=str(
+                            getattr(exc, "message_id", provider_id)
+                        ),
+                        error=str(exc),
+                        account_id=account_id,
+                    )
+                    record_receive_rule_evaluation(
+                        cfg.db_path,
+                        account_ref=account_ref,
+                        account_id=account_id,
+                        backend="gmail_api",
+                        provider_message_id=provider_id,
+                        message_id=str(
+                            getattr(exc, "message_id", "")
+                        )
+                        or None,
+                        result="partial" if is_partial else "failed",
+                        reason=type(exc).__name__,
+                        rule_fingerprint=fingerprint,
+                        scan_id=scan_id,
+                    )
+                if progress_callback:
+                    try:
+                        progress_callback(dict(result))
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "历史补扫进度回调失败", exc_info=True
+                        )
+                if folder_fetched >= safe_scan_cap:
+                    break
+            if result["cancelled"]:
+                break
+            page_token = page.get("nextPageToken")
+            if not page_token:
+                break
+        if page_token and folder_fetched >= safe_scan_cap:
+            result["truncated"] = True
         if result["cancelled"]:
             break
-        page_token = page.get("nextPageToken")
-        if not page_token:
-            break
-    if page_token and result["fetched"] >= safe_scan_cap:
-        result["truncated"] = True
     retry_counts = count_receive_retries(cfg.db_path, account_id=account_id)
     result.update(
         pending_retries=retry_counts["pending"],
@@ -437,6 +546,7 @@ def _process_one_unified(
     result: dict[str, Any],
     *,
     apply_receive_rule: bool = True,
+    mailboxes: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """读取 Gmail 真实 raw bytes，再交给统一 RFC822 归档流程。"""
     msg = service.users().messages().get(
@@ -448,6 +558,11 @@ def _process_one_unified(
     raw_bytes = decode_base64url(str(encoded_raw))
     parsed_message = email.message_from_bytes(raw_bytes)
     received_dt = _raw_message_datetime(parsed_message, msg.get("internalDate"))
+    mailbox_rows = list(mailboxes or [])
+    primary_mailbox = mailbox_rows[0] if mailbox_rows else {
+        "external_ref": "gmail:INBOX",
+        "mailbox_role": "inbox",
+    }
     normalized = normalized_mail_from_raw(
         raw_bytes,
         backend="gmail_api",
@@ -457,12 +572,25 @@ def _process_one_unified(
         received_at=fmt_datetime(received_dt),
         saved_date=received_dt.strftime("%Y-%m-%d"),
         max_attachment_bytes=cfg.max_attachment_bytes,
-        mailbox_ref="gmail:me/inbox",
+        mailbox_ref=str(primary_mailbox["external_ref"]),
+        direction=mailbox_direction(primary_mailbox),
     )
     single = process_normalized_mail(
         cfg, normalized, apply_receive_rule=apply_receive_rule
     )
     single.setdefault("message_id", normalized.message_id)
+    package_id = str(single.get("package_id") or "")
+    account_id = current_receive_account_id(cfg)
+    for mailbox in mailbox_rows[1:] if package_id else []:
+        record_package_mailbox_mapping(
+            cfg.db_path,
+            package_id=package_id,
+            account_id=account_id,
+            mailbox_id=stable_mailbox_id(
+                account_id, str(mailbox["external_ref"])
+            ),
+            provider_message_id=gmail_message_id,
+        )
     status = single["status"]
     if status in {"saved", "partial"}:
         result["accepted"] += 1

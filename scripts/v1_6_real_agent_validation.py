@@ -527,7 +527,7 @@ def main() -> int:
         checks["seven_tool_connection"] = {
             "status": (
                 "PASS"
-                if connected.ok and connected.details.get("tool_count") == 7
+                if connected.ok and connected.details.get("tool_count") == 11
                 else "FAIL"
             ),
             "tool_count": int(connected.details.get("tool_count") or 0),

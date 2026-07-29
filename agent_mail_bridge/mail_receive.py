@@ -162,6 +162,7 @@ def historical_rescan_mails(
     scan_id: str | None = None,
     page_size: int = 100,
     scan_cap: int = 5000,
+    mailbox_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """按用户指定范围重扫历史邮件，完全独立于普通增量 lookback。"""
     from agent_mail_bridge.config import _effective_receive_backend
@@ -182,6 +183,7 @@ def historical_rescan_mails(
             scan_id=stable_scan_id,
             page_size=page_size,
             scan_cap=scan_cap,
+            mailbox_ids=mailbox_ids,
         )
     elif runtime_provider in {"qq", "163", "generic_imap_smtp"}:
         from agent_mail_bridge.imap_sync import rescan_imap_account
@@ -195,6 +197,7 @@ def historical_rescan_mails(
             progress_callback=progress_callback,
             page_size=page_size,
             scan_cap=scan_cap,
+            mailbox_ids=mailbox_ids,
         )
     else:
         result = _rescan_via_imap(

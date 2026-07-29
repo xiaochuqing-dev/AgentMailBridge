@@ -116,9 +116,16 @@ def _validate_outbound_id(value: str) -> str:
 class SmtpStageError(Exception):
     """标记 SMTP 连接、认证或发送阶段错误。"""
 
-    def __init__(self, stage: str, message: str):
+    def __init__(
+        self,
+        stage: str,
+        message: str,
+        *,
+        delivery_unknown: bool = False,
+    ):
         super().__init__(message)
         self.stage = stage
+        self.delivery_unknown = delivery_unknown
 
 
 def send_file_to_owner_gmail(
@@ -704,6 +711,45 @@ def _smtp_send(cfg: AppConfig, msg: EmailMessage) -> None:
 
 def _smtp_send_with_stage(cfg: AppConfig, msg: EmailMessage) -> None:
     """分阶段执行 SMTP，便于 GUI 给出准确错误。"""
+    _smtp_transport_with_stage(
+        cfg,
+        lambda server, outgoing: server.send_message(
+            msg,
+            from_addr=outgoing.username,
+            to_addrs=[str(msg.get("To") or "")],
+        ),
+    )
+    logger.info("SMTP 发送完成")
+
+
+def smtp_send_bytes_with_stage(
+    cfg: AppConfig,
+    raw_bytes: bytes,
+    *,
+    from_addr: str,
+    to_addrs: list[str],
+) -> None:
+    """发送已经固化的 MIME bytes；Bcc 只存在于 envelope recipients。"""
+    if not isinstance(raw_bytes, bytes) or not raw_bytes:
+        raise SmtpStageError("send", "邮件原文为空")
+    if not to_addrs:
+        raise SmtpStageError("send", "邮件没有收件人")
+    _smtp_transport_with_stage(
+        cfg,
+        lambda server, _outgoing: server.sendmail(
+            from_addr,
+            list(to_addrs),
+            raw_bytes,
+        ),
+    )
+    logger.info("SMTP MIME bytes 发送完成")
+
+
+def _smtp_transport_with_stage(
+    cfg: AppConfig,
+    send_action,
+) -> None:
+    """复用同一 TLS、认证和错误分段，只替换 SMTP DATA 动作。"""
     outgoing = effective_outgoing_runtime(cfg)
     if outgoing.security not in {"ssl", "starttls"}:
         raise SmtpStageError("tls", "SMTP 只允许 SSL/TLS 或 STARTTLS")
@@ -740,14 +786,23 @@ def _smtp_send_with_stage(cfg: AppConfig, msg: EmailMessage) -> None:
             stage = _classify_smtp_error(exc, default_stage="auth")
             raise SmtpStageError(stage, _smtp_error_message(stage)) from exc
         try:
-            server.send_message(
-                msg,
-                from_addr=outgoing.username,
-                to_addrs=[str(msg.get("To") or "")],
-            )
+            send_action(server, outgoing)
         except Exception as exc:  # noqa: BLE001
             stage = _classify_smtp_error(exc, default_stage="send")
-            raise SmtpStageError(stage, _smtp_error_message(stage)) from exc
+            delivery_unknown = stage == "send" and isinstance(
+                exc,
+                (
+                    smtplib.SMTPServerDisconnected,
+                    socket.timeout,
+                    TimeoutError,
+                    ConnectionError,
+                ),
+            )
+            raise SmtpStageError(
+                stage,
+                _smtp_error_message(stage),
+                delivery_unknown=delivery_unknown,
+            ) from exc
     finally:
         try:
             server.quit()
@@ -756,7 +811,6 @@ def _smtp_send_with_stage(cfg: AppConfig, msg: EmailMessage) -> None:
                 server.close()
             except Exception:
                 pass
-    logger.info("SMTP 发送完成")
 
 
 def _classify_smtp_error(exc: Exception, *, default_stage: str) -> str:

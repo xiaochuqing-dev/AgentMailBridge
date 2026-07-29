@@ -74,6 +74,10 @@ class NormalizedMail:
     mailbox_ref: str = ""
     outbound_origin: str = ""
     outbound_id: str = ""
+    direction: str = "inbound"
+    reply_to_package_id: str = ""
+    forward_from_package_id: str = ""
+    uidvalidity: int = 0
 
 
 def parse_mail_address_header(value: str | None) -> list[MailAddress]:
@@ -218,6 +222,8 @@ def normalized_mail_from_raw(
     saved_date: str,
     max_attachment_bytes: int,
     mailbox_ref: str,
+    direction: str = "inbound",
+    uidvalidity: int = 0,
 ) -> NormalizedMail:
     """把真实 RFC822 bytes 归一化；两个收件后端共用此入口。"""
     if not isinstance(raw_bytes, bytes) or not raw_bytes:
@@ -302,6 +308,8 @@ def normalized_mail_from_raw(
         mailbox_ref=mailbox_ref,
         outbound_origin=str(message.get("X-AgentMailBridge-Origin", "")).strip(),
         outbound_id=str(message.get("X-AgentMailBridge-Outbound-ID", "")).strip(),
+        direction=direction,
+        uidvalidity=max(0, int(uidvalidity)),
     )
 
 

@@ -466,7 +466,7 @@ def test_gui_service_connection_test_runs_real_stdio_tools_list(tmp_cfg, tmp_pat
     )
     result = service.test_agent_client_connection(client_id)
     assert result.ok
-    assert result.details["tool_count"] == 7
+    assert result.details["tool_count"] == 11
     assert set(result.details["tools"]) == {
         "submit_result",
         "search_mails",
@@ -475,6 +475,10 @@ def test_gui_service_connection_test_runs_real_stdio_tools_list(tmp_cfg, tmp_pat
         "prepare_mail_resources",
         "list_agent_workspaces",
         "get_mail_sync_status",
+        "list_mail_accounts",
+        "list_mailboxes",
+        "send_mail",
+        "get_send_request_status",
     }
 
 

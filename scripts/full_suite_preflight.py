@@ -15,13 +15,14 @@ if str(ROOT) not in sys.path:
 from agent_mail_bridge.database import (
     AGENT_INTEGRATION_SCHEMA_VERSION,
     MULTI_ACCOUNT_SCHEMA_VERSION,
+    V17_MAIL_FLOW_SCHEMA_VERSION,
 )
 from agent_mail_bridge.provider_adapters import get_provider_adapter
 from agent_mail_bridge.provider_foundation import PROVIDER_PROFILES
 from agent_mail_bridge.version import __version__
 
 
-TARGET_VERSION = "1.6.0"
+TARGET_VERSION = "1.7.0"
 TARGETED_TESTS = (
     "tests/test_v1_6_agent_ecosystem.py",
     "tests/test_v1_5_agent_integration.py",
@@ -137,6 +138,10 @@ def _check_schema_consistency() -> None:
     _require(
         AGENT_INTEGRATION_SCHEMA_VERSION == 2,
         "unexpected Agent Integration schema version",
+    )
+    _require(
+        V17_MAIL_FLOW_SCHEMA_VERSION == 1,
+        "unexpected v1.7 mail-flow schema version",
     )
     runtime_tests = _text("tests/test_v1_4_1_multi_account_runtime.py")
     _require(

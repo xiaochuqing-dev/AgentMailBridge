@@ -4,7 +4,7 @@
 
 邮箱密码、Gmail 应用专用密码、QQ/163 授权码和 Generic IMAP/SMTP secret 位于 Windows Credential Manager 的账号凭据槽。Gmail OAuth credentials 与 token 位于账号专属 OAuth 目录，scope 始终只有 `gmail.readonly`。这些内容不会写入 Agent 配置。
 
-每个 Agent Client 另有独立随机 scoped token。管理副本位于 Windows Credential Manager，SQLite 只保存 SHA-256 与不含秘密的 credential reference。它只能代表该 Client 在 AgentMailBridge 内获准的 capability、账号和资料目录，不能推导或读取邮箱凭据。
+每个 Agent Client 另有独立随机 scoped token。管理副本位于 Windows Credential Manager，SQLite 只保存 SHA-256 与不含秘密的 credential reference。它只代表该 Client 获准的读取账号/目录、发件账号、发送模式和本地附件目录，不能推导或读取邮箱凭据。
 
 stdio Client 启动时通过 `AGENT_MAIL_BRIDGE_CLIENT_ID` 和 `AGENT_MAIL_BRIDGE_CLIENT_TOKEN` 传递身份。若目标 Client 只能在本地配置中保存 env，配置文件会包含 scoped token；这属于同一 Windows 用户边界内的有限秘密，不应提交到 Git、共享给团队或写入日志。GUI 预览、列表、审计、诊断和报告隐藏完整 token。
 

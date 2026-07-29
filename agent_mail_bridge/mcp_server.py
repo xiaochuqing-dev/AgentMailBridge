@@ -179,9 +179,11 @@ class McpServer:
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
                 "instructions": (
-                    "邮件读取需启用总开关，并通过当前 Client 的能力、账号和资料目录权限；"
+                    "邮件读取需启用总开关，并通过当前 Client 的能力、账号、邮箱目录和资料目录权限；"
                     "可搜索和分页读取本地归档，可把单个资源或整封完整邮件资料受控准备到授权目录。"
-                    "submit_result 还会验证当前 Client 的目录范围，收件人固定。"
+                    "可先列出当前获准账号和目录，再新建、回复、回复全部或转发邮件。"
+                    "通用发件按 Client 设置进入发送前确认或 Agent 自主发送；确认动作只存在于 GUI。"
+                    "submit_result 继续验证当前 Client 的目录范围，收件人固定。"
                     "服务不能读取凭据、修改邮件或遍历任意文件系统路径。"
                 ),
             },
@@ -254,7 +256,7 @@ class McpServer:
                 tool_result["structuredContent"], called_at, started,
             )
             return _success_response(request_id, tool_result)
-        if tool_name == "submit_result" and not self.rate_limit.allow():
+        if tool_name in {"submit_result", "send_mail"} and not self.rate_limit.allow():
             tool_result = self._rejected_tool_result(
                 arguments,
                 "rate_limited",
@@ -339,6 +341,26 @@ class McpServer:
             return result
         if tool_name == "get_mail_sync_status":
             return self.service.get_mail_sync_status(**arguments)
+        if tool_name == "list_mail_accounts":
+            if self.identity is None:
+                raise AgentAccessError("unknown_client")
+            return self.service.list_authorized_mail_accounts(self.identity)
+        if tool_name == "list_mailboxes":
+            if self.identity is None:
+                raise AgentAccessError("unknown_client")
+            return self.service.list_authorized_mailboxes(
+                self.identity, account_id=arguments.get("account_id")
+            )
+        if tool_name == "send_mail":
+            if self.identity is None:
+                raise AgentAccessError("unknown_client")
+            return self.service.send_agent_mail(self.identity, **arguments)
+        if tool_name == "get_send_request_status":
+            if self.identity is None:
+                raise AgentAccessError("unknown_client")
+            return self.service.get_agent_send_request_status(
+                self.identity, arguments["send_request_id"]
+            )
         raise ValueError(f"未知工具：{tool_name}")
 
     def _audit_tool(
@@ -428,16 +450,37 @@ class McpServer:
             if account_id != "*":
                 arguments["account_id"] = account_id
                 self._audit_account_id = account_id
+            requested_mailbox = arguments.get("mailbox_id")
+            if requested_mailbox:
+                self.service.require_agent_mailbox(
+                    identity, str(requested_mailbox)
+                )
+                arguments["mailbox_ids"] = [str(requested_mailbox)]
+            else:
+                arguments["mailbox_ids"] = sorted(
+                    mailbox_id
+                    for mailbox_id in identity.mailbox_ids
+                    if (
+                        account_id == "*"
+                        or any(
+                            str(row.get("mailbox_id")) == mailbox_id
+                            and str(row.get("account_id")) == account_id
+                            for row in self.service.list_authorized_mailboxes(
+                                identity, account_id=account_id
+                            ).details.get("mailboxes", [])
+                        )
+                    )
+                )
         elif tool_name in {
             "get_mail",
             "read_mail_resource",
             "prepare_mail_resources",
         }:
-            account_id = self.service.agent_mail_account_id(
-                _mail_identifier(arguments)
+            mail = self.service.require_agent_mail_access(
+                identity, _mail_identifier(arguments)
             )
+            account_id = str(mail.get("account_id") or "")
             if account_id:
-                self.service.require_agent_account(identity, account_id)
                 self._audit_account_id = account_id
         elif tool_name == "get_mail_sync_status":
             account_id = self.service.require_agent_account(
@@ -454,9 +497,26 @@ class McpServer:
                 )
             )
             self._audit_workspace_id = workspace_id
+        elif tool_name == "list_mailboxes":
+            account_id = arguments.get("account_id")
+            if account_id:
+                account_id = self.service.require_agent_account(
+                    identity, account_id
+                )
+                arguments["account_id"] = account_id
+                self._audit_account_id = account_id
+        elif tool_name == "send_mail":
+            account_id = self.service.require_agent_send_account(
+                identity, arguments.get("sender_account_id")
+            )
+            arguments["sender_account_id"] = account_id
+            self._audit_account_id = account_id
         if tool_name == "prepare_mail_resources":
+            requested_workspace = arguments.pop("workspace_id", None)
+            if requested_workspace is None:
+                requested_workspace = arguments.get("target_workspace")
             workspace_id, workspace_path = self.service.require_agent_workspace(
-                identity, arguments.get("target_workspace")
+                identity, requested_workspace
             )
             arguments["target_workspace"] = workspace_path
             self._audit_workspace_id = workspace_id
@@ -559,8 +619,9 @@ def _validate_tool_arguments(tool_name: str, arguments: dict[str, Any]) -> str |
         "search_mails": {
             "query", "time_scope", "recent_days", "date_from", "date_to",
             "subject", "sender", "recipient", "has_attachments", "status",
-            "sort", "limit", "offset", "ensure_fresh", "allow_cached",
+            "direction", "sort", "limit", "offset", "ensure_fresh", "allow_cached",
             "account_id", "account_ref", "mailbox_ref",
+            "mailbox_id", "mailbox_ids",
         },
         "get_mail": {"mail_id", "package_id", "offset", "max_chars"},
         "read_mail_resource": {
@@ -569,10 +630,18 @@ def _validate_tool_arguments(tool_name: str, arguments: dict[str, Any]) -> str |
         },
         "prepare_mail_resources": {
             "mail_id", "package_id", "resource_ids", "target_workspace",
-            "target_subdir", "overwrite_policy", "mode",
+            "workspace_id", "target_subdir", "overwrite_policy", "mode",
         },
         "list_agent_workspaces": set(),
         "get_mail_sync_status": {"account_id"},
+        "list_mail_accounts": set(),
+        "list_mailboxes": {"account_id"},
+        "send_mail": {
+            "request_id", "operation", "sender_account_id", "to", "cc",
+            "bcc", "subject", "body_text", "body_html",
+            "links", "source_package_id", "attachments",
+        },
+        "get_send_request_status": {"send_request_id"},
     }
     extra = sorted(set(arguments) - allowed[tool_name])
     if extra:
@@ -582,6 +651,61 @@ def _validate_tool_arguments(tool_name: str, arguments: dict[str, Any]) -> str |
         or not arguments["account_id"].strip()
     ):
         return "account_id 必须是非空字符串"
+    if "mailbox_ids" in arguments and (
+        not isinstance(arguments["mailbox_ids"], list)
+        or not all(
+            isinstance(value, str) and value
+            for value in arguments["mailbox_ids"]
+        )
+    ):
+        return "mailbox_ids 必须是字符串数组"
+    if tool_name == "send_mail":
+        request_id = arguments.get("request_id")
+        if (
+            not isinstance(request_id, str)
+            or not request_id.strip()
+            or len(request_id) > 200
+            or any(ord(char) < 32 for char in request_id)
+        ):
+            return "request_id 必须是 1-200 字符的稳定幂等键"
+        operation = str(arguments.get("operation") or "").strip().casefold()
+        if operation not in {"new", "reply", "reply_all", "forward"}:
+            return "operation 仅支持 new、reply、reply_all 或 forward"
+        if operation != "new" and (
+            not isinstance(arguments.get("source_package_id"), str)
+            or not arguments["source_package_id"].strip()
+        ):
+            return "回复、回复全部或转发必须提供 source_package_id"
+        for field in ("to", "cc", "bcc"):
+            values = arguments.get(field, [])
+            if not isinstance(values, list) or len(values) > 100:
+                return f"{field} 必须是最多 100 项的数组"
+            if not all(
+                isinstance(value, (str, dict)) for value in values
+            ):
+                return f"{field} 仅支持地址字符串或地址对象"
+        for field in ("subject", "body_text", "body_html"):
+            if field in arguments and not isinstance(arguments[field], str):
+                return f"{field} 必须是字符串"
+        links = arguments.get("links", [])
+        if (
+            not isinstance(links, list)
+            or len(links) > 100
+            or not all(isinstance(item, (str, dict)) for item in links)
+        ):
+            return "links 必须是最多 100 项的链接字符串或对象数组"
+        attachments = arguments.get("attachments", [])
+        if (
+            not isinstance(attachments, list)
+            or len(attachments) > 100
+            or not all(isinstance(item, dict) for item in attachments)
+        ):
+            return "attachments 必须是最多 100 项的对象数组"
+    if tool_name == "get_send_request_status" and (
+        not isinstance(arguments.get("send_request_id"), str)
+        or not arguments["send_request_id"].strip()
+    ):
+        return "send_request_id 必须是非空字符串"
     if tool_name in {"get_mail", "read_mail_resource", "prepare_mail_resources"}:
         identifiers = [arguments.get("mail_id"), arguments.get("package_id")]
         if sum(isinstance(value, str) and bool(value.strip()) for value in identifiers) != 1:
@@ -590,6 +714,8 @@ def _validate_tool_arguments(tool_name: str, arguments: dict[str, Any]) -> str |
         if not isinstance(arguments.get("resource_id"), str) or not arguments["resource_id"].strip():
             return "resource_id 必须是非空字符串"
     if tool_name == "prepare_mail_resources":
+        if "workspace_id" in arguments and "target_workspace" in arguments:
+            return "workspace_id 与 target_workspace 只能提供一个"
         mode = str(arguments.get("mode") or "resources").strip().lower()
         if mode not in {"resources", "complete"}:
             return "mode 仅支持 resources 或 complete"
@@ -612,6 +738,7 @@ def _validate_tool_arguments(tool_name: str, arguments: dict[str, Any]) -> str |
             return "resource_ids 必须是最多 100 项的字符串数组"
         for field in (
             "mode",
+            "workspace_id",
             "target_workspace",
             "target_subdir",
             "overwrite_policy",
@@ -638,6 +765,10 @@ def _all_tools() -> list[dict[str, Any]]:
         _prepare_mail_resources_tool(),
         _list_agent_workspaces_tool(),
         _get_mail_sync_status_tool(),
+        _list_mail_accounts_tool(),
+        _list_mailboxes_tool(),
+        _send_mail_tool(),
+        _get_send_request_status_tool(),
     ]
 
 
@@ -690,7 +821,8 @@ def _search_mails_tool() -> dict[str, Any]:
         "description": (
             "按最新、今天、昨天、最近若干天或日期范围搜索已归档邮件。query 使用多词 AND，"
             "覆盖主题、发件人、收件人、抄送、完整可读正文、附件/图片名、链接文字、域名、URL 和自然状态。"
-            "默认搜索全部已归档账号，也可用稳定 account_id 限定账号。"
+            "默认搜索当前 Client 获准的全部账号和目录，也可用 list_mail_accounts/list_mailboxes "
+            "返回的稳定 account_id、mailbox_id 限定范围。"
             "可用 latest + newest + limit=1 读取最新邮件；ensure_fresh=true 会在需要时受控同步。"
         ),
         "annotations": _tool_annotations(
@@ -709,12 +841,18 @@ def _search_mails_tool() -> dict[str, Any]:
                 "recipient": {"type": "string"},
                 "has_attachments": {"type": "boolean"},
                 "status": {"type": "string"},
+                "direction": {
+                    "type": "string",
+                    "enum": ["inbound", "outbound"],
+                    "description": "仅搜索收到或发出的邮件事实",
+                },
                 "sort": {"type": "string", "enum": ["newest", "oldest"], "default": "newest"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                 "offset": {"type": "integer", "minimum": 0, "default": 0},
                 "ensure_fresh": {"type": "boolean", "default": False},
                 "allow_cached": {"type": "boolean", "default": True},
                 "account_id": {"type": "string", "description": "统一账号模型的稳定账号 ID"},
+                "mailbox_id": {"type": "string", "description": "list_mailboxes 返回的稳定目录 ID"},
                 "account_ref": {"type": "string", "description": "v1.3 兼容字段；新调用优先使用 account_id"},
                 "mailbox_ref": {"type": "string"},
             },
@@ -805,6 +943,7 @@ def _prepare_mail_resources_tool() -> dict[str, Any]:
                     "default": "resources",
                 },
                 "resource_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 100, "uniqueItems": True},
+                "workspace_id": {"type": "string", "description": "list_agent_workspaces 返回的工作区 ID"},
                 "target_workspace": {"type": "string", "description": "list_agent_workspaces 返回的目录 ID 或完整路径"},
                 "target_subdir": {"type": "string", "description": "邮件目录内的可选安全相对子目录"},
                 "overwrite_policy": {"type": "string", "enum": ["rename", "error", "overwrite"], "default": "rename"},
@@ -845,6 +984,199 @@ def _get_mail_sync_status_tool() -> dict[str, Any]:
                     "description": "可选的统一账号稳定 ID",
                 }
             },
+            "additionalProperties": False,
+        },
+        "outputSchema": _generic_output_schema(),
+    }
+
+
+def _list_mail_accounts_tool() -> dict[str, Any]:
+    return {
+        "name": "list_mail_accounts",
+        "title": "列出可用邮箱账号",
+        "description": (
+            "在邮件任务开始时列出当前 Client 获准读取或发件的账号，"
+            "返回显示名、邮箱地址、Provider、读写能力和发件模式，不返回任何凭据。"
+        ),
+        "annotations": _tool_annotations(
+            read_only=True, idempotent=True, open_world=False
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+        "outputSchema": _generic_output_schema(),
+    }
+
+
+def _list_mailboxes_tool() -> dict[str, Any]:
+    return {
+        "name": "list_mailboxes",
+        "title": "列出可读邮箱目录",
+        "description": (
+            "列出当前 Client 获准读取的 Inbox、Sent、Archive、Spam、Trash、"
+            "自定义目录或 Gmail Label；可按已列出的账号 ID 过滤。"
+        ),
+        "annotations": _tool_annotations(
+            read_only=True, idempotent=True, open_world=False
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "account_id": {
+                    "type": "string",
+                    "description": "list_mail_accounts 返回的可选账号 ID",
+                }
+            },
+            "additionalProperties": False,
+        },
+        "outputSchema": _generic_output_schema(),
+    }
+
+
+def _send_mail_tool() -> dict[str, Any]:
+    address_item = {
+        "oneOf": [
+            {"type": "string"},
+            {
+                "type": "object",
+                "properties": {
+                    "display_name": {"type": "string"},
+                    "email_address": {"type": "string"},
+                },
+                "required": ["email_address"],
+                "additionalProperties": False,
+            },
+        ]
+    }
+    return {
+        "name": "send_mail",
+        "title": "新建、回复或转发邮件",
+        "description": (
+            "统一创建 new、reply、reply_all 或 forward 发件请求。"
+            "confirm 模式只创建待确认请求且不连接 SMTP；autonomous 模式立即发送。"
+            "先用 list_mail_accounts 选择发件账号；回复或转发使用 get_mail 得到的 package_id。"
+            "request_id 是同一 Client 内稳定的幂等键，超时重试必须复用它。"
+        ),
+        "annotations": _tool_annotations(
+            read_only=False, idempotent=True, open_world=True
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "request_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200,
+                    "description": "当前用户任务的稳定幂等键",
+                },
+                "operation": {
+                    "type": "string",
+                    "enum": ["new", "reply", "reply_all", "forward"],
+                },
+                "sender_account_id": {
+                    "type": "string",
+                    "description": "可选；只有一个可发件账号时可省略",
+                },
+                "to": {
+                    "type": "array",
+                    "items": address_item,
+                    "maxItems": 100,
+                    "default": [],
+                    "description": (
+                        "new/forward 的 To；reply/reply_all 中 To/Cc/Bcc 全为空时"
+                        "自动按原邮件计算，任一非空时三组共同视为完整目标集合"
+                    ),
+                },
+                "cc": {
+                    "type": "array",
+                    "items": address_item,
+                    "maxItems": 100,
+                    "default": [],
+                },
+                "bcc": {
+                    "type": "array",
+                    "items": address_item,
+                    "maxItems": 100,
+                    "default": [],
+                },
+                "subject": {"type": "string", "maxLength": 998},
+                "body_text": {"type": "string"},
+                "body_html": {"type": "string"},
+                "links": {
+                    "type": "array",
+                    "maxItems": 100,
+                    "items": {
+                        "oneOf": [
+                            {"type": "string"},
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "url": {"type": "string"},
+                                    "display_text": {"type": "string"},
+                                },
+                                "required": ["url"],
+                                "additionalProperties": False,
+                            },
+                        ]
+                    },
+                    "default": [],
+                },
+                "source_package_id": {
+                    "type": "string",
+                    "description": "reply、reply_all、forward 的原邮件 package_id",
+                },
+                "attachments": {
+                    "type": "array",
+                    "maxItems": 100,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "获准本地资料目录中的文件",
+                            },
+                            "resource_id": {
+                                "type": "string",
+                                "description": "获准邮件中的资源 ID",
+                            },
+                            "source_package_id": {"type": "string"},
+                            "display_name": {"type": "string"},
+                            "mime_type": {"type": "string"},
+                        },
+                        "additionalProperties": False,
+                    },
+                    "default": [],
+                },
+            },
+            "required": ["request_id", "operation"],
+            "additionalProperties": False,
+        },
+        "outputSchema": _generic_output_schema(),
+    }
+
+
+def _get_send_request_status_tool() -> dict[str, Any]:
+    return {
+        "name": "get_send_request_status",
+        "title": "查询发件请求状态",
+        "description": (
+            "查询当前 Client 自己创建的待确认、已发送、取消、失败、"
+            "delivery_unknown 或归档恢复状态；不能确认发送。"
+        ),
+        "annotations": _tool_annotations(
+            read_only=True, idempotent=True, open_world=False
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "send_request_id": {
+                    "type": "string",
+                    "description": "send_mail 返回的请求 ID",
+                }
+            },
+            "required": ["send_request_id"],
             "additionalProperties": False,
         },
         "outputSchema": _generic_output_schema(),
@@ -932,6 +1264,10 @@ def _operation_type(tool_name: str) -> str:
         "list_agent_workspaces": "workspace",
         "get_mail_sync_status": "sync_status",
         "submit_result": "send",
+        "list_mail_accounts": "account_discovery",
+        "list_mailboxes": "mailbox_discovery",
+        "send_mail": "mail_send",
+        "get_send_request_status": "send_status",
     }[tool_name]
 
 
@@ -941,7 +1277,9 @@ def _query_summary(tool_name: str, arguments: dict[str, Any]) -> str | None:
     fields = []
     for key in (
         "time_scope", "recent_days", "date_from", "date_to", "query", "subject",
-        "sender", "recipient", "has_attachments", "status", "sort", "limit", "offset",
+        "sender", "recipient", "has_attachments", "status", "direction",
+        "sort", "limit", "offset",
+        "mailbox_id",
     ):
         value = arguments.get(key)
         if value not in {None, ""}:
@@ -981,6 +1319,17 @@ def _audit_target(
         target = "Agent 可用资料目录"
     elif tool_name == "get_mail_sync_status":
         target = "邮件同步状态"
+    elif tool_name == "list_mail_accounts":
+        target = "当前 Client 可用邮箱账号"
+    elif tool_name == "list_mailboxes":
+        target = "当前 Client 可读邮箱目录"
+    elif tool_name == "send_mail":
+        target = (
+            f"发件请求：{arguments.get('operation') or 'new'}，"
+            f"主题 {str(arguments.get('subject') or '无主题')[:80]}"
+        )
+    elif tool_name == "get_send_request_status":
+        target = f"发件请求：{arguments.get('send_request_id')}"
     else:
         source_path = str(arguments.get("file_path") or "") or None
         target = f"文件：{Path(source_path).name}" if source_path else "发送结果"
@@ -1015,6 +1364,18 @@ def _audit_details(tool_name: str, structured: dict[str, Any]) -> dict[str, Any]
             "source_sha256": structured.get("source_sha256"),
             "staged_sha256": structured.get("staged_sha256"),
             "sent_archive_sha256": structured.get("sent_archive_sha256"),
+        }
+    if tool_name in {"send_mail", "get_send_request_status"}:
+        request = structured.get("send_request") or {}
+        return {
+            "send_request_id": structured.get("send_request_id"),
+            "send_status": structured.get("send_status"),
+            "operation": request.get("operation"),
+            "sender_account_id": request.get("sender_account_id"),
+            "send_mode": request.get("send_mode"),
+            "smtp_attempt_count": request.get("smtp_attempt_count"),
+            "package_id": request.get("package_id"),
+            "raw_eml_sha256": request.get("raw_eml_sha256"),
         }
     return {}
 

@@ -1,6 +1,8 @@
 # Windows 安装、升级与卸载
 
-运行 `AgentMailBridge-1.6.0-Setup.exe`。默认安装到 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需管理员权限。开始菜单和可选桌面快捷方式只指向 `AgentMailBridge.exe`；内部 `AgentMailBridgeMCP.exe` 不创建快捷方式或开机启动项。
+运行 `AgentMailBridge-1.7.0-Setup.exe`。默认安装到 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需管理员权限。开始菜单和可选桌面快捷方式只指向 `AgentMailBridge.exe`；内部 `AgentMailBridgeMCP.exe` 不创建快捷方式或开机启动项。
+
+从 v1.6.0 升级到 v1.7.0 时，启动前创建正常升级备份，并在单一事务中增加邮箱目录、mailbox checkpoint、Client 发件/目录/附件范围、持久化 send request、outbound facts 和线程关系。旧 Client 保留身份与 token，但新 `mail.send` 默认关闭；历史 package、raw.eml、Hash 和业务记录不移动、不改写。
 
 从 v1.5.0 升级到 v1.6.0 时，首次启动在 Agent Integration schema v2 前创建 `before_v1_6_agent_ecosystem` SQLite 在线备份，然后在一个可回滚事务中增加权限模式、动态账号/资料目录范围和历史导入状态。旧 Client 的显式账号与目录保持 `selected`，不会自动扩大；原 Client、token Hash、配置备份、审计、邮件 package、raw.eml、资源 ID、account_id 和历史 Hash 均保留。
 

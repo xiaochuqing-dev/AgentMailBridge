@@ -60,6 +60,7 @@ from agent_mail_bridge.database import (
     legacy_archive_backfill_needed,
     multi_account_migration_needed,
     outbound_mail_migration_needed,
+    v17_mail_flow_migration_needed,
     v13_mail_migration_needed,
     log_event,
     get_outbound_message as query_outbound_message,
@@ -114,12 +115,26 @@ from agent_mail_bridge.mail_facts import (
     search_mail_facts as query_mail_facts,
 )
 from agent_mail_bridge.mail_send import send_file_with_request, send_outbound_mail
+from agent_mail_bridge.outbound_mail import (
+    OutboundMailError,
+    execute_agent_send,
+    prepare_agent_send,
+)
+from agent_mail_bridge.send_requests import (
+    SendRequestError,
+    cancel_send_request as cancel_pending_send_request,
+    expire_due_send_requests,
+    get_send_request as query_send_request,
+    list_send_requests as query_send_requests,
+    public_send_request,
+)
 from agent_mail_bridge.mail_accounts import (
     MailAccount,
     current_receive_account_id,
     legacy_accounts_from_config,
     normalize_email_address,
     stable_account_id,
+    stable_mailbox_id,
 )
 from agent_mail_bridge.provider_adapters import (
     get_provider_adapter,
@@ -145,6 +160,8 @@ from agent_mail_bridge.mail_resource_access import (
     read_mail_resource as read_archived_mail_resource,
     workspace_dtos,
 )
+from agent_mail_bridge.mailbox_sync import selected_sync_mailboxes
+from agent_mail_bridge.send_permissions import query_extended_scopes
 from agent_mail_bridge.process_lock import ProcessLock, is_lock_available
 from agent_mail_bridge.maintenance import (
     create_database_backup,
@@ -263,6 +280,9 @@ class ApplicationService:
                 outbound_migration_needed = outbound_mail_migration_needed(
                     self.cfg.db_path
                 )
+                v17_migration_needed = v17_mail_flow_migration_needed(
+                    self.cfg.db_path
+                )
                 v13_migration_needed = v13_mail_migration_needed(self.cfg.db_path)
                 if (
                     archive_migration_needed
@@ -270,12 +290,15 @@ class ApplicationService:
                     or v13_migration_needed
                     or account_migration_needed
                     or agent_migration_needed
+                    or v17_migration_needed
                 ):
                     create_database_backup(
                         self.cfg,
                         label=(
                             "before_v1_6_agent_ecosystem"
                             if agent_migration_needed
+                            else "before_v1_7_mail_flow"
+                            if v17_migration_needed
                             else "before_v1_4_multi_account"
                             if account_migration_needed
                             else "before_v1_3_models"
@@ -288,6 +311,8 @@ class ApplicationService:
                     legacy_accounts=legacy_accounts_from_config(self.cfg),
                 )
                 self._agent_integration.ensure_legacy_submit_scopes()
+                if v17_migration_needed:
+                    self._agent_integration.seed_v17_legacy_mailbox_scopes()
                 if archive_migration_needed:
                     migration = backfill_legacy_mail_packages(self.cfg)
                     if migration.get("failed"):
@@ -591,6 +616,7 @@ class ApplicationService:
         self,
         *,
         account_id: str | None = None,
+        mailbox_ids: list[str] | None = None,
         date_from: datetime | str,
         date_to: datetime | str,
         apply_receive_rule: bool = True,
@@ -705,6 +731,7 @@ class ApplicationService:
                     runtime_cfg,
                     date_from=start,
                     date_to=end,
+                    mailbox_ids=mailbox_ids,
                     apply_receive_rule=bool(apply_receive_rule),
                     cancel_check=(cancel_event.is_set if cancel_event else None),
                     progress_callback=progress_callback,
@@ -785,6 +812,7 @@ class ApplicationService:
         self,
         *,
         account_id: str | None = None,
+        mailbox_ids: list[str] | None = None,
         preset: str = "30d",
         date_from: datetime | str | None = None,
         date_to: datetime | str | None = None,
@@ -859,6 +887,25 @@ class ApplicationService:
                 error_code="account_not_found",
                 message="历史导入账号不存在、已停用或未启用收件",
             )
+        normalized_mailbox_ids = sorted(
+            {
+                str(mailbox_id).strip()
+                for mailbox_id in (mailbox_ids or ())
+                if str(mailbox_id).strip()
+            }
+        )
+        try:
+            selected_sync_mailboxes(
+                self.cfg.db_path,
+                target_account_id,
+                mailbox_ids=normalized_mailbox_ids or None,
+            )
+        except ValueError as exc:
+            return ReceiveResult(
+                OperationStatus.FAILED,
+                error_code="invalid_mailbox_scope",
+                message=str(exc),
+            )
         segments: list[tuple[datetime, datetime]] = []
         cursor = start
         while cursor <= end:
@@ -900,6 +947,7 @@ class ApplicationService:
             preset=storage_preset,
             date_from=start.isoformat(timespec="seconds"),
             date_to=end.isoformat(timespec="seconds"),
+            mailbox_ids=normalized_mailbox_ids,
             apply_receive_rule=apply_receive_rule,
             status="running",
             **aggregate,
@@ -940,6 +988,7 @@ class ApplicationService:
                     preset=storage_preset,
                     date_from=start.isoformat(timespec="seconds"),
                     date_to=end.isoformat(timespec="seconds"),
+                    mailbox_ids=normalized_mailbox_ids,
                     apply_receive_rule=apply_receive_rule,
                     status="running",
                     scanned=current["fetched"],
@@ -958,6 +1007,7 @@ class ApplicationService:
 
             result = self.historical_rescan(
                 account_id=target_account_id,
+                mailbox_ids=normalized_mailbox_ids or None,
                 date_from=segment_start,
                 date_to=segment_end,
                 apply_receive_rule=apply_receive_rule,
@@ -1055,6 +1105,7 @@ class ApplicationService:
             preset=storage_preset,
             date_from=start.isoformat(timespec="seconds"),
             date_to=end.isoformat(timespec="seconds"),
+            mailbox_ids=normalized_mailbox_ids,
             apply_receive_rule=apply_receive_rule,
             status=db_status,
             **aggregate,
@@ -1132,6 +1183,7 @@ class ApplicationService:
             )
         return self.import_historical_mails(
             account_id=str(row["account_id"]),
+            mailbox_ids=list(row.get("mailbox_ids") or []),
             preset="custom",
             date_from=str(row["date_from"]),
             date_to=str(row["date_to"]),
@@ -2636,9 +2688,16 @@ class ApplicationService:
         capabilities: list[str] | None = None,
         account_ids: list[str] | None = None,
         workspace_ids: list[str] | None = None,
+        mailbox_ids: list[str] | None = None,
+        send_account_ids: list[str] | None = None,
+        attachment_workspace_ids: list[str] | None = None,
         permission_mode: str = "custom",
         account_scope_mode: str = "selected",
+        mailbox_scope_mode: str = "selected",
+        send_account_scope_mode: str = "selected",
         workspace_scope_mode: str = "selected",
+        attachment_scope_mode: str = "selected",
+        send_mode: str = "confirm",
     ) -> ServiceResult:
         """创建默认拒绝的 Client；scoped token 只在本次结果中返回。"""
         self.initialize()
@@ -2650,16 +2709,46 @@ class ApplicationService:
                 config_scope=config_scope,
                 permission_mode=permission_mode,
                 account_scope_mode=account_scope_mode,
+                mailbox_scope_mode=mailbox_scope_mode,
+                send_account_scope_mode=send_account_scope_mode,
                 workspace_scope_mode=workspace_scope_mode,
+                attachment_scope_mode=attachment_scope_mode,
+                send_mode=send_mode,
+            )
+            selected_accounts = set(account_ids or [])
+            if account_scope_mode == "all":
+                selected_accounts = {
+                    str(row["account_id"])
+                    for row in query_mail_accounts(
+                        self.cfg.db_path, enabled_only=True
+                    )
+                }
+            selected_mailboxes = (
+                list(mailbox_ids)
+                if mailbox_ids is not None
+                else [
+                    str(row["mailbox_id"])
+                    for row in query_mailboxes(
+                        self.cfg.db_path, enabled_only=True
+                    )
+                    if str(row["account_id"]) in selected_accounts
+                ]
             )
             permissions = self._agent_integration.set_permissions(
                 str(client["client_id"]),
                 capabilities=capabilities or [],
                 account_ids=account_ids or [],
                 workspace_ids=workspace_ids or [],
+                mailbox_ids=selected_mailboxes,
+                send_account_ids=send_account_ids or [],
+                attachment_workspace_ids=attachment_workspace_ids or [],
                 permission_mode=permission_mode,
                 account_scope_mode=account_scope_mode,
+                mailbox_scope_mode=mailbox_scope_mode,
+                send_account_scope_mode=send_account_scope_mode,
                 workspace_scope_mode=workspace_scope_mode,
+                attachment_scope_mode=attachment_scope_mode,
+                send_mode=send_mode,
             )
         except (AgentAccessError, CredentialError, sqlite3.Error, ValueError) as exc:
             return ServiceResult(
@@ -2724,6 +2813,49 @@ class ApplicationService:
                 client["workspace_ids"] = sorted(
                     str(row["workspace_id"]) for row in workspace_dtos(self.cfg)
                 )
+            extended = query_extended_scopes(self.cfg.db_path, client_id)
+            client["mailbox_ids"] = sorted(extended["mailbox_ids"])
+            if str(client.get("mailbox_scope_mode") or "selected") == "all":
+                allowed_accounts = set(client["account_ids"])
+                client["mailbox_ids"] = sorted(
+                    str(row["mailbox_id"])
+                    for row in query_mailboxes(
+                        self.cfg.db_path, enabled_only=True
+                    )
+                    if str(row["account_id"]) in allowed_accounts
+                    and str(row["mailbox_id"])
+                    not in extended["denied_mailbox_ids"]
+                )
+            client["send_account_ids"] = sorted(
+                extended["send_account_ids"]
+            )
+            if (
+                str(client.get("send_account_scope_mode") or "selected")
+                == "all"
+            ):
+                client["send_account_ids"] = sorted(
+                    str(row["account_id"])
+                    for row in query_mail_accounts(
+                        self.cfg.db_path, enabled_only=True
+                    )
+                    if row.get("send_enabled")
+                    and "send" in set(row.get("capabilities") or ())
+                    and str(row["account_id"])
+                    not in extended["denied_send_account_ids"]
+                )
+            client["attachment_workspace_ids"] = sorted(
+                extended["attachment_workspace_ids"]
+            )
+            if (
+                str(client.get("attachment_scope_mode") or "selected")
+                == "all"
+            ):
+                denied = extended["denied_attachment_workspace_ids"]
+                client["attachment_workspace_ids"] = sorted(
+                    str(row["workspace_id"])
+                    for row in workspace_dtos(self.cfg)
+                    if str(row["workspace_id"]) not in denied
+                )
             try:
                 detection = detect_client(
                     str(client["client_type"]),
@@ -2748,26 +2880,69 @@ class ApplicationService:
         capabilities: list[str],
         account_ids: list[str],
         workspace_ids: list[str],
+        mailbox_ids: list[str] | None = None,
+        send_account_ids: list[str] | None = None,
+        attachment_workspace_ids: list[str] | None = None,
         denied_capabilities: list[str] | None = None,
         denied_account_ids: list[str] | None = None,
         denied_workspace_ids: list[str] | None = None,
+        denied_mailbox_ids: list[str] | None = None,
+        denied_send_account_ids: list[str] | None = None,
+        denied_attachment_workspace_ids: list[str] | None = None,
         permission_mode: str | None = None,
         account_scope_mode: str | None = None,
+        mailbox_scope_mode: str | None = None,
+        send_account_scope_mode: str | None = None,
         workspace_scope_mode: str | None = None,
+        attachment_scope_mode: str | None = None,
+        send_mode: str | None = None,
     ) -> ServiceResult:
         self.initialize()
         try:
             client = self._agent_integration.get_client(client_id)
             if client is None:
                 raise AgentAccessError("unknown_client")
+            extended = query_extended_scopes(self.cfg.db_path, client_id)
             rows = self._agent_integration.set_permissions(
                 client_id,
                 capabilities=capabilities,
                 account_ids=account_ids,
                 workspace_ids=workspace_ids,
+                mailbox_ids=(
+                    mailbox_ids
+                    if mailbox_ids is not None
+                    else sorted(extended["mailbox_ids"])
+                ),
+                send_account_ids=(
+                    send_account_ids
+                    if send_account_ids is not None
+                    else sorted(extended["send_account_ids"])
+                ),
+                attachment_workspace_ids=(
+                    attachment_workspace_ids
+                    if attachment_workspace_ids is not None
+                    else sorted(extended["attachment_workspace_ids"])
+                ),
                 denied_capabilities=denied_capabilities or [],
                 denied_account_ids=denied_account_ids or [],
                 denied_workspace_ids=denied_workspace_ids or [],
+                denied_mailbox_ids=(
+                    denied_mailbox_ids
+                    if denied_mailbox_ids is not None
+                    else sorted(extended["denied_mailbox_ids"])
+                ),
+                denied_send_account_ids=(
+                    denied_send_account_ids
+                    if denied_send_account_ids is not None
+                    else sorted(extended["denied_send_account_ids"])
+                ),
+                denied_attachment_workspace_ids=(
+                    denied_attachment_workspace_ids
+                    if denied_attachment_workspace_ids is not None
+                    else sorted(
+                        extended["denied_attachment_workspace_ids"]
+                    )
+                ),
                 permission_mode=(
                     permission_mode
                     or str(client.get("permission_mode") or "custom")
@@ -2776,9 +2951,28 @@ class ApplicationService:
                     account_scope_mode
                     or str(client.get("account_scope_mode") or "selected")
                 ),
+                mailbox_scope_mode=(
+                    mailbox_scope_mode
+                    or str(client.get("mailbox_scope_mode") or "selected")
+                ),
+                send_account_scope_mode=(
+                    send_account_scope_mode
+                    or str(
+                        client.get("send_account_scope_mode") or "selected"
+                    )
+                ),
                 workspace_scope_mode=(
                     workspace_scope_mode
                     or str(client.get("workspace_scope_mode") or "selected")
+                ),
+                attachment_scope_mode=(
+                    attachment_scope_mode
+                    or str(
+                        client.get("attachment_scope_mode") or "selected"
+                    )
+                ),
+                send_mode=(
+                    send_mode or str(client.get("send_mode") or "confirm")
                 ),
             )
         except (AgentAccessError, sqlite3.Error, ValueError) as exc:
@@ -2969,6 +3163,496 @@ class ApplicationService:
         return self._agent_integration.require_path_workspace(
             identity, file_path
         )
+
+    def require_agent_mailbox(
+        self, identity: AgentIdentity, mailbox_id: str | None
+    ) -> str:
+        return self._agent_integration.require_mailbox(identity, mailbox_id)
+
+    def require_agent_send_account(
+        self, identity: AgentIdentity, account_id: str | None
+    ) -> str:
+        return self._agent_integration.require_send_account(
+            identity, account_id
+        )
+
+    def require_agent_attachment_path(
+        self, identity: AgentIdentity, file_path: str
+    ) -> tuple[str, str]:
+        return self._agent_integration.require_attachment_path(
+            identity, file_path
+        )
+
+    def require_agent_mail_access(
+        self, identity: AgentIdentity, package_id: str
+    ) -> dict[str, Any]:
+        return self._authorized_source_message(identity, package_id)
+
+    def list_authorized_mail_accounts(
+        self, identity: AgentIdentity
+    ) -> ServiceResult:
+        """返回当前 Client 可读或可发件账号，不返回 Provider secret。"""
+        self.initialize()
+        accounts = []
+        for row in query_mail_accounts(self.cfg.db_path, enabled_only=True):
+            account_id = str(row["account_id"])
+            can_read = account_id in identity.account_ids
+            can_send = account_id in identity.send_account_ids
+            if not can_read and not can_send:
+                continue
+            accounts.append(
+                {
+                    "account_id": account_id,
+                    "display_name": str(row.get("display_name") or ""),
+                    "email_address": str(row.get("email_address") or ""),
+                    "provider": str(row.get("provider") or ""),
+                    "can_read": can_read,
+                    "can_send": can_send,
+                    "send_mode": identity.send_mode if can_send else None,
+                }
+            )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            details={
+                "accounts": accounts,
+                "send_mode": identity.send_mode,
+            },
+        )
+
+    def list_authorized_mailboxes(
+        self,
+        identity: AgentIdentity,
+        *,
+        account_id: str | None = None,
+    ) -> ServiceResult:
+        """返回当前 Client 实际生效的目录范围。"""
+        self.initialize()
+        if account_id:
+            self._agent_integration.require_account(identity, account_id)
+        rows = [
+            {
+                "mailbox_id": str(row["mailbox_id"]),
+                "account_id": str(row["account_id"]),
+                "display_name": str(row.get("display_name") or ""),
+                "raw_name": str(row.get("raw_name") or ""),
+                "external_ref": str(row.get("external_ref") or ""),
+                "parent_mailbox_id": row.get("parent_mailbox_id"),
+                "delimiter": str(row.get("delimiter") or ""),
+                "mailbox_role": str(row.get("mailbox_role") or "other"),
+                "role_source": str(row.get("role_source") or "unknown"),
+                "sync_enabled": bool(row.get("sync_enabled")),
+            }
+            for row in query_mailboxes(
+                self.cfg.db_path,
+                account_id=account_id,
+                enabled_only=True,
+            )
+            if str(row["mailbox_id"]) in identity.mailbox_ids
+        ]
+        return ServiceResult(
+            OperationStatus.SUCCESS, details={"mailboxes": rows}
+        )
+
+    def send_agent_mail(
+        self,
+        identity: AgentIdentity,
+        *,
+        request_id: str,
+        operation: str,
+        sender_account_id: str | None = None,
+        to: list[Any] | None = None,
+        cc: list[Any] | None = None,
+        bcc: list[Any] | None = None,
+        subject: str = "",
+        body_text: str = "",
+        body_html: str = "",
+        links: list[dict[str, Any] | str] | None = None,
+        source_package_id: str | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> ServiceResult:
+        """创建通用发件请求；confirm 只持久化，autonomous 才立即发送。"""
+        self.initialize()
+        try:
+            self._agent_integration.require_capability(
+                identity, "mail.send"
+            )
+            account_id = self._agent_integration.require_send_account(
+                identity, sender_account_id
+            )
+            context = self._account_router.context(
+                account_id, capability="send"
+            )
+            source_message = None
+            if str(operation or "").casefold() != "new":
+                if not source_package_id:
+                    raise OutboundMailError(
+                        "source_mail_required",
+                        "回复、回复全部或转发必须指定原邮件",
+                    )
+                source_message = self._authorized_source_message(
+                    identity, source_package_id
+                )
+            prepared_attachments = self._authorize_agent_attachments(
+                identity,
+                attachments or [],
+                default_source_package_id=source_package_id,
+            )
+            request, created = prepare_agent_send(
+                self.cfg,
+                client_id=identity.client_id,
+                send_mode=identity.send_mode,
+                sender_account_id=account_id,
+                sender_address=str(context.account["email_address"]),
+                sender_display_name=str(
+                    context.account.get("display_name") or ""
+                ),
+                idempotency_key=request_id,
+                operation=operation,
+                to=to or [],
+                cc=cc or [],
+                bcc=bcc or [],
+                subject=subject,
+                body_text=body_text,
+                body_html=body_html,
+                links=links or [],
+                source_message=source_message,
+                attachments=prepared_attachments,
+            )
+            if (
+                created
+                and identity.send_mode == "autonomous"
+                and request.get("status") == "ready_to_send"
+            ):
+                request = self._execute_send_request(
+                    str(request["send_request_id"])
+                )
+        except (
+            AgentAccessError,
+            AccountRuntimeError,
+            OutboundMailError,
+            SendRequestError,
+            OSError,
+            ValueError,
+        ) as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code=getattr(
+                    exc,
+                    "code",
+                    getattr(exc, "error_code", "send_request_failed"),
+                ),
+                message=str(exc),
+            )
+        status = str(request.get("status") or "")
+        operation_status = (
+            OperationStatus.PARTIAL
+            if status in {"delivery_unknown", "sent_archive_failed"}
+            else OperationStatus.FAILED
+            if status in {"failed", "cancelled", "expired"}
+            else OperationStatus.DUPLICATE
+            if not created
+            else OperationStatus.SUCCESS
+        )
+        return ServiceResult(
+            operation_status,
+            error_code=str(request.get("error_code") or "") or None,
+            message=(
+                "发件请求待用户在 AgentMailBridge 中确认"
+                if status == "pending_confirmation"
+                else "已返回原幂等发件请求"
+                if not created
+                else "邮件已发送"
+                if status == "sent"
+                else "发件请求已处理"
+            ),
+            details={
+                "send_request": request,
+                "send_request_id": request.get("send_request_id"),
+                "send_status": status,
+                "created": created,
+            },
+        )
+
+    def get_agent_send_request_status(
+        self, identity: AgentIdentity, send_request_id: str
+    ) -> ServiceResult:
+        self.initialize()
+        expire_due_send_requests(self.cfg.db_path)
+        request = query_send_request(self.cfg.db_path, send_request_id)
+        if request is None or str(request.get("client_id") or "") != identity.client_id:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="send_request_not_found",
+                message="发件请求不存在",
+            )
+        public = public_send_request(request)
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            details={
+                "send_request": public,
+                "send_request_id": send_request_id,
+                "send_status": public.get("status"),
+            },
+        )
+
+    def list_pending_send_requests(self, limit: int = 100) -> ServiceResult:
+        """GUI 使用的持久化待确认列表。"""
+        self.initialize()
+        expire_due_send_requests(self.cfg.db_path)
+        rows = query_send_requests(
+            self.cfg.db_path,
+            statuses={"pending_confirmation"},
+            limit=limit,
+        )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            details={
+                "requests": [
+                    self._pending_send_preview(row) for row in rows
+                ]
+            },
+        )
+
+    def confirm_agent_send_request(
+        self, send_request_id: str
+    ) -> ServiceResult:
+        """仅供 GUI 用户动作调用，不暴露为 MCP 工具。"""
+        self.initialize()
+        try:
+            request = self._execute_send_request(
+                send_request_id, confirmed_by="gui"
+            )
+        except (
+            AgentAccessError,
+            AccountRuntimeError,
+            OutboundMailError,
+            SendRequestError,
+            CredentialError,
+            OSError,
+            ValueError,
+        ) as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code=getattr(
+                    exc,
+                    "code",
+                    getattr(exc, "error_code", "send_confirmation_failed"),
+                ),
+                message=str(exc),
+            )
+        status = str(request.get("status") or "")
+        return ServiceResult(
+            OperationStatus.SUCCESS
+            if status == "sent"
+            else OperationStatus.PARTIAL
+            if status in {"delivery_unknown", "sent_archive_failed"}
+            else OperationStatus.FAILED,
+            error_code=str(request.get("error_code") or "") or None,
+            message=(
+                "邮件已确认并发送"
+                if status == "sent"
+                else str(request.get("error_message") or "确认发送未完成")
+            ),
+            details={
+                "send_request": request,
+                "send_request_id": send_request_id,
+                "send_status": status,
+            },
+        )
+
+    def cancel_agent_send_request(
+        self, send_request_id: str
+    ) -> ServiceResult:
+        self.initialize()
+        try:
+            expire_due_send_requests(self.cfg.db_path)
+            request = cancel_pending_send_request(
+                self.cfg.db_path, send_request_id
+            )
+        except (SendRequestError, sqlite3.Error) as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code=getattr(exc, "code", "send_cancel_failed"),
+                message=str(exc),
+            )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            message="待确认发件请求已取消，不会发送",
+            details={
+                "send_request": public_send_request(request),
+                "send_request_id": send_request_id,
+                "send_status": "cancelled",
+            },
+        )
+
+    def _execute_send_request(
+        self,
+        send_request_id: str,
+        *,
+        confirmed_by: str | None = None,
+    ) -> dict[str, Any]:
+        request = query_send_request(self.cfg.db_path, send_request_id)
+        if request is None:
+            raise SendRequestError(
+                "send_request_not_found", "发件请求不存在"
+            )
+        client_id = str(request["client_id"])
+        token = self._agent_integration.get_scoped_token(client_id)
+        identity = self._agent_integration.resolve_identity(client_id, token)
+        self._authorize_persisted_send(identity, request)
+        context = self._account_router.context(
+            str(request["sender_account_id"]), capability="send"
+        )
+        return execute_agent_send(
+            self.cfg,
+            runtime_cfg=context.config,
+            send_request_id=send_request_id,
+            sender_address=str(context.account["email_address"]),
+            sender_display_name=str(
+                context.account.get("display_name") or ""
+            ),
+            authorize=lambda current: self._authorize_persisted_send(
+                self._current_send_identity(client_id), current
+            ),
+            confirmed_by=confirmed_by,
+        )
+
+    def _current_send_identity(self, client_id: str) -> AgentIdentity:
+        token = self._agent_integration.get_scoped_token(client_id)
+        return self._agent_integration.resolve_identity(client_id, token)
+
+    def _authorize_persisted_send(
+        self, identity: AgentIdentity, request: dict[str, Any]
+    ) -> None:
+        self._agent_integration.require_capability(identity, "mail.send")
+        self._agent_integration.require_send_account(
+            identity, str(request["sender_account_id"])
+        )
+        source_package_id = str(
+            request.get("source_package_id") or ""
+        )
+        if source_package_id:
+            self._authorized_source_message(identity, source_package_id)
+        for item in request.get("attachments") or []:
+            if str(item.get("source_kind") or "") == "mail_resource":
+                package_id = str(item.get("source_package_id") or "")
+                self._authorized_source_message(identity, package_id)
+            else:
+                self._agent_integration.require_attachment_path(
+                    identity, str(item.get("source_path") or "")
+                )
+
+    def _authorized_source_message(
+        self, identity: AgentIdentity, package_id: str
+    ) -> dict[str, Any]:
+        message = query_mail_message(self.cfg.db_path, package_id)
+        if message is None:
+            raise AgentAccessError("account_denied")
+        self._agent_integration.require_account(
+            identity, str(message.get("account_id") or "")
+        )
+        mailbox_ids = {
+            str(item.get("mailbox_id") or "")
+            for item in message.get("mailboxes") or []
+            if item.get("mailbox_id")
+        }
+        if message.get("mailbox_id"):
+            mailbox_ids.add(str(message["mailbox_id"]))
+        if (
+            not mailbox_ids
+            and message.get("mailbox_ref")
+            and message.get("account_id")
+        ):
+            mailbox_ids.add(
+                stable_mailbox_id(
+                    str(message["account_id"]),
+                    str(message["mailbox_ref"]),
+                )
+            )
+        if not mailbox_ids or mailbox_ids.isdisjoint(identity.mailbox_ids):
+            raise AgentAccessError("mailbox_denied")
+        return message
+
+    def _authorize_agent_attachments(
+        self,
+        identity: AgentIdentity,
+        attachments: list[dict[str, Any]],
+        *,
+        default_source_package_id: str | None,
+    ) -> list[dict[str, Any]]:
+        result = []
+        for raw in attachments:
+            item = dict(raw)
+            resource_id = str(item.get("resource_id") or "")
+            if resource_id:
+                package_id = str(
+                    item.get("source_package_id")
+                    or default_source_package_id
+                    or ""
+                )
+                if not package_id:
+                    raise OutboundMailError(
+                        "attachment_source_required",
+                        "邮件资源附件必须指定所属邮件",
+                    )
+                self._authorized_source_message(identity, package_id)
+                resource = next(
+                    (
+                        row
+                        for row in query_mail_resources(
+                            self.cfg.db_path, package_id
+                        )
+                        if str(row.get("resource_id") or "") == resource_id
+                    ),
+                    None,
+                )
+                if resource is None or not resource.get("absolute_path"):
+                    raise OutboundMailError(
+                        "attachment_not_found", "邮件资源附件不可用"
+                    )
+                result.append(
+                    {
+                        **item,
+                        "path": str(resource["absolute_path"]),
+                        "display_name": str(
+                            item.get("display_name")
+                            or resource.get("display_name")
+                            or resource.get("original_name")
+                            or resource_id
+                        ),
+                        "source_kind": "mail_resource",
+                        "source_package_id": package_id,
+                        "source_resource_id": resource_id,
+                        "mime_type": str(
+                            item.get("mime_type")
+                            or resource.get("mime_type")
+                            or "application/octet-stream"
+                        ),
+                    }
+                )
+                continue
+            path = str(item.get("path") or "")
+            self._agent_integration.require_attachment_path(identity, path)
+            result.append({**item, "source_kind": "local"})
+        return result
+
+    def _pending_send_preview(
+        self, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        public = public_send_request(request)
+        client = self._agent_integration.get_client(
+            str(request.get("client_id") or "")
+        ) or {}
+        account = query_mail_account(
+            self.cfg.db_path, str(request.get("sender_account_id") or "")
+        ) or {}
+        return {
+            **public,
+            "client_display_name": str(client.get("display_name") or ""),
+            "client_type": str(client.get("client_type") or ""),
+            "sender_display_name": str(account.get("display_name") or ""),
+            "sender_address": str(account.get("email_address") or ""),
+        }
 
     def preview_agent_client_config(
         self,
@@ -3317,9 +4001,13 @@ class ApplicationService:
                 "prepare_mail_resources",
                 "list_agent_workspaces",
                 "get_mail_sync_status",
+                "list_mail_accounts",
+                "list_mailboxes",
+                "send_mail",
+                "get_send_request_status",
             }
             if completed.returncode != 0 or names != expected:
-                raise ValueError("tools/list 未返回预期七工具")
+                raise ValueError("tools/list 未返回预期十一工具")
         except (
             OSError,
             subprocess.SubprocessError,
@@ -3341,7 +4029,7 @@ class ApplicationService:
         return ServiceResult(
             OperationStatus.SUCCESS,
             message="连接测试通过：身份有效且七工具可见",
-            details={"tool_count": 7, "tools": sorted(names)},
+            details={"tool_count": len(names), "tools": sorted(names)},
         )
 
     def record_mcp_rejection(
@@ -3900,6 +4588,7 @@ class ApplicationService:
         recipient: str | None = None,
         has_attachments: bool | None = None,
         status: str | None = None,
+        direction: str | None = None,
         sort: str = "newest",
         limit: int | None = None,
         offset: int = 0,
@@ -3907,7 +4596,9 @@ class ApplicationService:
         allow_cached: bool = True,
         account_id: str | None = None,
         account_ref: str | None = None,
+        mailbox_id: str | None = None,
         mailbox_ref: str | None = None,
+        mailbox_ids: list[str] | None = None,
     ) -> ServiceResult:
         """按明确结构搜索本地邮件；可先执行受控同步新鲜度检查。"""
         disabled = self._mail_read_disabled()
@@ -3921,6 +4612,10 @@ class ApplicationService:
             safe_limit = 1 if limit is None and time_scope == "latest" else int(limit or 20)
             if safe_limit <= 0 or safe_limit > 100 or int(offset) < 0:
                 raise ValueError("limit 必须在 1 到 100 之间，offset 必须为非负整数")
+            if direction is not None:
+                direction = str(direction).strip().casefold()
+                if direction not in {"inbound", "outbound"}:
+                    raise ValueError("direction 仅支持 inbound 或 outbound")
             if account_id and account_id not in {
                 str(item["account_id"])
                 for item in query_mail_accounts(self.cfg.db_path, enabled_only=True)
@@ -3986,6 +4681,8 @@ class ApplicationService:
                 query,
                 account_id=account_id,
                 account_ref=account_ref,
+                mailbox_id=mailbox_id,
+                mailbox_ids=mailbox_ids,
                 mailbox_ref=mailbox_ref,
                 date_from=start,
                 date_to=end,
@@ -3994,6 +4691,7 @@ class ApplicationService:
                 recipient=recipient,
                 has_attachments=has_attachments,
                 status=status,
+                mail_direction=direction,
                 sort=sort,
                 limit=safe_limit,
                 offset=int(offset),
