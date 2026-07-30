@@ -1,6 +1,8 @@
 # Windows 安装、升级与卸载
 
-运行 `AgentMailBridge-1.7.0-Setup.exe`。默认安装到 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需管理员权限。开始菜单和可选桌面快捷方式只指向 `AgentMailBridge.exe`；内部 `AgentMailBridgeMCP.exe` 不创建快捷方式或开机启动项。
+运行 `AgentMailBridge-1.7.1-Setup.exe`。默认安装到 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需管理员权限。开始菜单和可选桌面快捷方式只指向 `AgentMailBridge.exe`；内部 `AgentMailBridgeMCP.exe` 不创建快捷方式或开机启动项。
+
+从 v1.7.0 升级到 v1.7.1 时，首次启动在一致性迁移前创建 `before_v1_7_1_consistency` SQLite 在线备份，并在单一可回滚事务中增加 membership/direction/server presence、发件 lease 与 attempt、Sent reconciliation、目录 checkpoint、cleanup、health、scan 与 repair audit 结构。迁移不移动旧 package、不改写 raw.eml、不重算历史 Hash，也不改变 package_id/account_id/resource_id；pending、delivery_unknown 和历史 outbound 继续保留。
 
 从 v1.6.0 升级到 v1.7.0 时，启动前创建正常升级备份，并在单一事务中增加邮箱目录、mailbox checkpoint、Client 发件/目录/附件范围、持久化 send request、outbound facts 和线程关系。旧 Client 保留身份与 token，但新 `mail.send` 默认关闭；历史 package、raw.eml、Hash 和业务记录不移动、不改写。
 
@@ -34,7 +36,7 @@
 
 从 Windows“已安装的应用”卸载时，程序、Qt、快捷方式、安装记录和失效开机启动值会删除；配置、OAuth、凭据和用户数据默认保留。重新安装后可继续识别。
 
-v1.6.0 发布前先运行 `python scripts\full_suite_preflight.py`，再覆盖最终完整 pytest、clean build `-SkipTests`、主 EXE packaged self-test、七工具 MCP packaged smoke、Codex/Claude Code/Hermes 真实 E2E、2024 历史导入、完整邮件资料、secret scan、Defender 和 Authenticode。安装生命周期使用 v1.5.0 基线安装器、随机 AppId 和隔离用户目录，覆盖升级、卸载保留与重装恢复，不直接试验生产安装或真实 Agent 配置。
+v1.7.1 发布前先运行 `python scripts\full_suite_preflight.py`，再覆盖最终完整 pytest、clean build `-SkipTests`、主 EXE packaged self-test、11 工具 MCP packaged smoke、Codex/Claude Code/Hermes 真实 E2E、QQ/163 Inbox/Sent、故障恢复、secret scan、Defender 和 Authenticode。安装生命周期使用 v1.7.0 基线安装器、随机 AppId 和隔离用户目录，覆盖升级、卸载保留与重装恢复，不直接试验生产安装或真实 Agent 配置。
 
 MCP packaged smoke 还必须以 UTF-8 向 `AgentMailBridgeMCP.exe` 写入 initialize、tools/list、每个 tools/call、malformed JSON、未知 method 和 EOF；验证读取开关关闭/开启、中文正文、附件、prepare Hash 和兼容 submit_result。不得通过修改控制台 code page 或手工 Copy-Item 规避问题。安装后桌面快捷方式仍只能指向 `AgentMailBridge.exe`，MCP EXE 不创建快捷方式。
 

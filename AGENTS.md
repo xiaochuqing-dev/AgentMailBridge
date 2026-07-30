@@ -161,7 +161,7 @@ Use `runtime_paths.py`. Frozen program files are read-only under the install dir
 - Normal automatic no-change checks must not create permanent `app_events` noise; scheduler health belongs in `auto_receive_state`.
 - `app_events` retention may delete only technical events. It must never delete business history, outbound records, MCP audit, retry state, mail packages, resources, raw mail or attachments.
 - File-log rotation and SQLite event retention are separate mechanisms and must both remain bounded.
-- AgentMailBridge v1.7.0 is the current product version. It covers arbitrary authorized history and mailboxes, Client-scoped read/send permissions, confirm and autonomous send, outbound facts, Sent synchronization, deterministic threads and real Codex Desktop closure.
+- AgentMailBridge v1.7.1 is the current product version. It hardens v1.7.0 with durable mail facts and multi-mailbox membership, send leases and crash recovery, conservative Sent reconciliation, protected checkpoints, bounded temporary data, consistency repair and long-running health visibility.
 - QQ and 163 remain formally supported for real receive/send. Gmail remains receive-only with exactly `gmail.readonly`. Generic remains implementation ready / E2E required until an independent provider E2E passes. Outlook/Microsoft, Gmail send and ordinary Claude Desktop remain outside this release scope.
 
 ## Agent integration invariants
@@ -201,4 +201,4 @@ powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
 
 The installer source is `packaging/windows/AgentMailBridge.iss`. The single version source is `agent_mail_bridge/version.py`; Python metadata, GUI, MCP, EXE metadata and installer must match it. Do not claim a test passed unless it was actually executed. Before release, run pytest, packaged smoke, secret scan, install/upgrade/uninstall checks, hashes, Defender where available and signature inspection. Never publish a GitHub Release without explicit user approval.
 
-For v1.7.0, develop directly on `master`. Do not create a branch, force-push, rewrite history, create a Tag or publish a GitHub Release. Commit the completed implementation, tests, migrations, GUI, documentation and final report normally, then push to `origin/master`.
+For v1.7.1, develop directly on `master`. Do not create a branch, force-push, rewrite history, create a Tag or publish a GitHub Release. Commit the completed implementation, tests, migrations, GUI, documentation and final report normally, then push to `origin/master`.

@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## 1.7.1 Mail Fact Consistency, Crash Recovery & Long-Run Reliability - 2026-07-30
+
+- 邮件事实与邮箱目录归属拆分为多对多 membership；Inbox、Sent、Archive、Gmail Label 和自定义目录可共同指向同一 package，目录移动或服务器删除只更新 presence，不删除本地永久事实。
+- direction 改由本地发件、SMTP 接受、服务器 Sent、收件和迁移证据独立判定，不再从当前目录名推断；同一 Message-ID 不再单独充当事实唯一键。
+- 发件增加跨进程 lease、heartbeat、固定 Message-ID/MIME Hash、分阶段事件和启动恢复。SMTP DATA 前中断可判定未发送；DATA 后未知进入 `delivery_unknown`，绝不自动重发；SMTP 已接受后的归档失败只恢复本地事实。
+- Sent 回流增加保守对账和 external outbound：账号、Message-ID、Header、raw Hash、附件指纹与时间窗口共同决定；多候选进入 ambiguous，禁止静默合并。
+- 每个 account/mailbox 独立保存 checkpoint、尝试事实和 UIDVALIDITY 变化；单目录失败不清零成功进度，也不阻断其他目录。
+- 发件快照增加保留期、dry-run、两阶段清理与崩溃恢复；永久 package、结果不确定请求和工作副本不进入自动清理。
+- 一致性扫描覆盖数据库、package、manifest、raw、资源、membership、发件关联、Sent mapping 和工作副本；修复采用最近扫描预览、分类、单项选择、修复前在线备份、白名单动作和持久审计，不删除永久事实、不发送邮件、不自动合并 ambiguous。
+- 新增邮件运行状态 GUI、磁盘容量预检、Windows 文件锁有界重试、原子写入统一路径及系统时间回拨保护；Gmail scope 继续严格保持 `gmail.readonly`。
+
 ## 1.7.0 Full Agent Mail Read, Send, Reply & Desktop Closure - 2026-07-29
 
 - 新增 Provider-neutral 邮箱目录、独立 checkpoint、任意历史范围与多目录导入；Inbox、Sent、Archive、Spam/Trash、Gmail Label 和自定义目录均作为稳定事实，`all` 动态扩展而 `selected` 不扩张。

@@ -1,6 +1,6 @@
 # Agent 邮件读取与资源交付设计
 
-v1.7.0 将读取范围扩展到用户授权的任意账号、邮箱目录和历史时间，并增加独立的通用 Agent 发件权限。QQ、163 与 Gmail 继续共用统一 account_id、mailbox_id、package、resource、raw.eml 和 Hash 事实；没有 Provider 专用或智能判断工具。兼容 `submit_result` 的固定收件人语义不扩张到通用 `send_mail`。
+v1.7.1 允许读取用户授权的任意账号、邮箱目录和历史时间，并保持独立的通用 Agent 发件权限。QQ、163 与 Gmail 继续共用统一 account_id、mailbox membership、package、resource、raw.eml 和 Hash 事实；同一邮件属于多个目录时仍只返回一个正式 package。没有 Provider 专用或智能判断工具。兼容 `submit_result` 的固定收件人语义不扩张到通用 `send_mail`。
 
 ## 产品边界
 

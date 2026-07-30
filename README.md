@@ -1,6 +1,6 @@
 # AgentMailBridge
 
-AgentMailBridge v1.7.0 是面向个人用户的本地优先 Windows 邮箱桥接工具，也是 Codex、Claude Code 和 Hermes 共用的确定性邮件事实与收发后端。邮箱只需接入一次；用户可授权 Agent 读取任何已同步账号、目录和历史邮件，也可授权任意已接通的发件账号，用于新建、回复、回复全部和转发。Agent 永远不会获得邮箱密码、授权码、OAuth Token 或 Client token。普通 Claude Desktop 聊天客户端仅保留兼容接入。
+AgentMailBridge v1.7.1 是面向个人用户的本地优先 Windows 邮箱桥接工具，也是 Codex、Claude Code 和 Hermes 共用的确定性邮件事实与收发后端。邮箱只需接入一次；用户可授权 Agent 读取任何已同步账号、目录和历史邮件，也可授权任意已接通的发件账号，用于新建、回复、回复全部和转发。Agent 永远不会获得邮箱密码、授权码、OAuth Token 或 Client token。普通 Claude Desktop 聊天客户端仅保留兼容接入。
 
 每封邮件形成一个包含真实 `raw.eml`、可读正文、附件、邮件内图片、受控下载和来源 Hash 的本地事实包。用户可导入接入前的历史邮件，也可把整封邮件的完整资料原子复制到允许目录供 Agent 处理，内部归档保持不变。
 
@@ -30,6 +30,20 @@ Account Runtime Router 由 `account_id` 解析 Provider Adapter、运行配置�
 
 旧邮件会在升级时无损映射到统一归档，但不会伪造历史上没有保留的原始邮件。manifest v2 和数据库同时保存 `account_id`、`mailbox_id` 及 v1.3 兼容引用。邮件、资源和会话事实由只读查询层按账号、邮箱目录、时间、发件人、主题、附件和状态检索，并直接驱动收件箱、邮件详情、会话和关联文件界面。
 
+## 邮件事实一致性与故障恢复
+
+本地 Mail Package 是永久事实，不会因为服务器上的邮件移动目录、移除 Label 或被删除而静默消失。一封逻辑邮件可以同时属于多个目录或 Gmail Label；目录 membership 与 `currently_present` 单独记录，重复扫描只更新归属，不创建第二个正式 package。收件或发件 direction 来自可审计证据，与当前所在 Inbox、Sent 或自定义目录分开。
+
+每个账号和邮箱目录独立保存 checkpoint、UIDVALIDITY、最近成功与最近尝试。网络失败、损坏邮件或单目录失败不会清零已经提交的进度，也不会阻断其他目录。UIDVALIDITY 变化只使受影响目录进入重新扫描和对账，历史 package_id、raw.eml 和 Hash 不改变。
+
+通用发件先取得跨进程 lease，并持续记录 heartbeat、固定 Message-ID、固定 MIME Hash 和 SMTP 阶段。SMTP DATA 前中断可安全判定为未发送；DATA 开始后的不确定结果进入 `delivery_unknown`，绝不会自动重发。SMTP 已接受但本地归档失败时进入 `sent_archive_failed`，恢复只发布原固定 MIME 的本地事实，不再次联系 SMTP。
+
+服务器 Sent 负责对账。只有账号一致且 raw Hash 精确一致，或唯一 Message-ID 加 From、To/Cc、Subject 等复合证据一致时才自动关联；多候选保持 ambiguous，留给用户处理。网页、手机或其他客户端发送的邮件会作为 external outbound 进入同一事实体系。
+
+发件快照按状态和保留期管理。安全清理先 dry-run，再按单项事务移动到隔离区并提交；结果不确定、归档待恢复和唯一恢复资料永不自动删除。邮件工作副本不属于永久归档，用户修改后不会被静默覆盖。
+
+“文件与数据 > 邮件运行状态与数据维护”展示目录同步、发件恢复、Sent 对账、事实问题和存储占用。一致性扫描默认只报告；白名单修复必须基于最近扫描、一次选择一项、先创建并校验数据库备份并写入审计。修复不会发送邮件、删除永久事实或静默合并模糊候选。
+
 ## 正式版界面
 
 - 顶部主工作区只有“收件”和“发件”。
@@ -49,7 +63,7 @@ Account Runtime Router 由 `account_id` 解析 Provider Adapter、运行配置�
 
 ## Windows 安装
 
-运行 `AgentMailBridge-1.7.0-Setup.exe`。默认安装到 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需 Python、Git 或管理员权限。桌面和开始菜单只指向 `AgentMailBridge.exe`；内部 `AgentMailBridgeMCP.exe` 不创建快捷方式、托盘或开机启动项。
+运行 `AgentMailBridge-1.7.1-Setup.exe`。默认安装到 `%LOCALAPPDATA%\Programs\AgentMailBridge`，无需 Python、Git 或管理员权限。桌面和开始菜单只指向 `AgentMailBridge.exe`；内部 `AgentMailBridgeMCP.exe` 不创建快捷方式、托盘或开机启动项。
 
 安装版数据位置：
 
@@ -159,8 +173,8 @@ python scripts\provider_mime_receive_validation.py --from-account-id <account_id
 
 构建流程会先执行 Preflight，再运行完整 pytest、构建 GUI 与内部 MCP、执行 packaged smoke 和秘密排除扫描，并生成：
 
-- `release\AgentMailBridge-1.7.0-Setup.exe`
-- `release\AgentMailBridge-1.7.0-Windows-x64.zip`
+- `release\AgentMailBridge-1.7.1-Setup.exe`
+- `release\AgentMailBridge-1.7.1-Windows-x64.zip`
 - `release\checksums.sha256`
 
-详细说明见 `docs/GUI使用说明.md`、`docs/MCP使用说明.md`、`docs/Agent Client身份与权限设计.md`、`docs/Credential与Client Token说明.md`、四类 Client 接入指南、`docs/安全与诊断说明.md`、`docs/Windows安装与升级说明.md` 和最终专项报告。
+详细说明见 `docs/GUI使用说明.md`、`docs/MCP使用说明.md`、`docs/Agent Client身份与权限设计.md`、`docs/邮件事实与目录归属设计.md`、`docs/发件状态机与崩溃恢复.md`、`docs/Sent对账与重复识别.md`、`docs/同步Checkpoint与UIDVALIDITY恢复.md`、`docs/临时资料生命周期.md`、`docs/运行健康与一致性修复.md`、`docs/长期运行验证计划.md`、四类 Client 接入指南、`docs/安全与诊断说明.md`、`docs/Windows安装与升级说明.md` 和最终专项报告。

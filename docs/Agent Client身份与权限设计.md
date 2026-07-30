@@ -2,7 +2,7 @@
 
 ## 产品边界
 
-v1.7.0 正式重点支持 Codex、Claude Code 和 Hermes。普通 Claude Desktop 只保留兼容代码。AgentMailBridge 提供 11 个确定性工具，不内置模型、不理解自然语言、不自动挑选邮件，也不建立通用 IAM、团队角色或远程认证系统。
+v1.7.1 正式重点支持 Codex、Claude Code 和 Hermes。普通 Claude Desktop 只保留兼容代码。AgentMailBridge 提供 11 个确定性工具，不内置模型、不理解自然语言、不自动挑选邮件、不自动重发未知结果，也不建立通用 IAM、团队角色或远程认证系统。
 
 权限以 Client 为边界并默认拒绝。读取、发件和兼容结果提交互相独立；读取账号、邮箱目录、发件账号、完整资料输出目录和本地附件目录分别支持动态 `all` 与显式 `selected`。旧 Client 迁移后保持 selected 且默认没有 `mail.send`。通用发件只有 `confirm` 和 `autonomous` 两种模式。
 
@@ -16,6 +16,7 @@ v1.7.0 正式重点支持 Codex、Claude Code 和 Hermes。普通 Claude Desktop
 - OpenAI Codex 官方文档确认 CLI、IDE 和桌面形态共享 `config.toml`；用户级默认位于 `~/.codex/config.toml`，可信项目可使用 `.codex/config.toml`，stdio 使用 `mcp_servers.<id>` 的 command、args、env。
 - Hermes 官方文档和当前 0.19.0 安装确认 Windows 配置位于 `%LOCALAPPDATA%\hermes\config.yaml`，`mcp_servers` 支持 command、args、env；CLI 提供 `hermes mcp add/list/test`，交互会话提供 `/reload-mcp`。
 - CC-Switch 的公开文档、发布记录和关键配置管理实现用于验证“先备份、保留无关配置、按 server id 合并、原子写入、恢复”的工程方向。其 License 为 MIT；本项目只借鉴架构策略，没有复制源码。
+- Claude Code 官方仓库问题 #80065 记录了带连字符 MCP server 名在工具暴露与路由之间不一致的 NotFound 故障；本项目仅对 Claude Code 使用 `agent_mail_bridge` 键，并在受管写入时迁移旧键。其他 Client 继续使用 `agent-mail-bridge`。
 
 官方来源：
 
@@ -29,6 +30,7 @@ v1.7.0 正式重点支持 Codex、Claude Code 和 Hermes。普通 Claude Desktop
 - https://hermes-agent.nousresearch.com/docs/user-guide/windows-native
 - https://github.com/NousResearch/hermes-agent
 - https://github.com/farion1231/cc-switch
+- https://github.com/anthropics/claude-code/issues/80065
 
 ## 身份模型
 
@@ -62,7 +64,7 @@ capability 固定为 `mail.search`、`mail.get`、`resource.read`、`resource.pr
 
 ## 配置安全
 
-Managed Setup 先解析现有配置，但预览只展示 AgentMailBridge 项的 command、args、env 名称、隐藏值、脱敏目标、备份和重启说明，不回显整个配置或其他 MCP Server 的秘密。应用前同时核对原文件 SHA-256 与 mtime；格式损坏或并发变化时拒绝写入。原文件先复制到产品数据目录下的 Client 专属备份；新内容使用同目录临时文件、flush、fsync 和原子替换，写后复核 Hash，失败时恢复原内容。重复应用不产生第二个 server 项；撤销只移除 `agent-mail-bridge` 项；恢复同样拒绝覆盖已被外部再次修改的配置。
+Managed Setup 先解析现有配置，但预览只展示 AgentMailBridge 项的 command、args、env 名称、隐藏值、脱敏目标、备份和重启说明，不回显整个配置或其他 MCP Server 的秘密。应用前同时核对原文件 SHA-256 与 mtime；格式损坏或并发变化时拒绝写入。原文件先复制到产品数据目录下的 Client 专属备份；新内容使用同目录临时文件、flush、fsync 和原子替换，写后复核 Hash，失败时恢复原内容。重复应用不产生第二个 server 项；Claude Code 使用 `agent_mail_bridge` 并迁移旧的 `agent-mail-bridge`，撤销时同时移除这两个受管别名；其他 Client 只管理 `agent-mail-bridge`。恢复同样拒绝覆盖已被外部再次修改的配置。
 
 JSON 合并保留未知字段和其他 MCP Server，但标准库序列化会统一缩进，这是已明确的格式库限制。Codex TOML 只替换自身 table，保留其他 section 和文本布局。Hermes 使用 round-trip YAML 合并，保留注释、未知设置和其他 server。备份最多保留 20 份和 90 天，至少保留最近一个有效副本；备份可能包含第三方 Client 原有秘密，只位于当前用户数据目录并收紧文件权限。未验证的新 Client 版本退化为 Assisted，不盲目写入。
 
