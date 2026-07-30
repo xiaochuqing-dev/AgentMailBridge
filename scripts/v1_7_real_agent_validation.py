@@ -177,12 +177,14 @@ def _command(client_type: str, prompt: str, workspace: Path) -> list[str]:
         if not executable:
             raise FileNotFoundError("claude")
         allowed = ",".join(
-            f"mcp__agent-mail-bridge__{name}" for name in MCP_TOOL_NAMES
+            f"mcp__agent_mail_bridge__{name}" for name in MCP_TOOL_NAMES
         )
         return [
             _native_claude(executable),
             "-p",
             prompt,
+            "--model",
+            "sonnet",
             "--permission-mode",
             "dontAsk",
             "--allowedTools",
@@ -472,15 +474,7 @@ def _read_audit_facts(
         mailbox_roles.get(mailbox_id, "")
         for mailbox_id in searched_mailbox_ids
     }
-    history_all = any(
-        row.get("tool_name") == "search_mails"
-        and row.get("status") == "success"
-        and (
-            "time_scope=all" in str(row.get("query_summary") or "")
-            or "date_from=" in str(row.get("query_summary") or "")
-        )
-        for row in rows
-    )
+    history_all = any(_audit_search_uses_historical_scope(row) for row in rows)
     complete = False
     source_unchanged = False
     prepared_resource_count = 0
@@ -512,6 +506,23 @@ def _read_audit_facts(
         "prepared_resource_count": prepared_resource_count,
         "successful_tool_count": len(successful & READ_TOOL_NAMES),
     }
+
+
+def _audit_search_uses_historical_scope(row: dict[str, Any]) -> bool:
+    if row.get("tool_name") != "search_mails" or row.get("status") != "success":
+        return False
+    fields = str(row.get("query_summary") or "").split("; ")
+    scope = next(
+        (
+            field.partition("=")[2]
+            for field in fields
+            if field.startswith("time_scope=")
+        ),
+        None,
+    )
+    return scope in {None, "all"} or any(
+        field.startswith("date_from=") for field in fields
+    )
 
 
 def _new_send_requests(

@@ -28,6 +28,8 @@ from agent_mail_bridge.database import (
     AGENT_INTEGRATION_MIGRATION_KEY,
     V17_MAIL_FLOW_MIGRATION_KEY,
     V17_MAIL_FLOW_SCHEMA_VERSION,
+    V171_CONSISTENCY_MIGRATION_KEY,
+    V171_CONSISTENCY_SCHEMA_VERSION,
     close_connection,
     create_outbound_message,
     save_auto_receive_state,
@@ -111,6 +113,7 @@ def _packaged_probe(
     *,
     cfg: AppConfig | None = None,
     client_auth_env: dict[str, str] | None = None,
+    migration_backup_label: str | None = None,
 ) -> dict[str, bool]:
     gui = install_dir / "AgentMailBridge.exe"
     mcp = install_dir / "AgentMailBridgeMCP.exe"
@@ -126,7 +129,7 @@ def _packaged_probe(
     ):
         raise RuntimeError("packaged probe 缺少隔离 Client 身份")
     probe_env.update(client_auth_env)
-    if expected_version == "1.7.0" and cfg is None:
+    if cfg is None:
         raise RuntimeError(f"v{expected_version} packaged probe 缺少隔离配置")
     requests = [
         {
@@ -173,17 +176,15 @@ def _packaged_probe(
         .get("serverInfo", {})
         .get("version")
     )
-    migration_backup_created = (
-        bool(
+    migration_backup_created = True
+    if migration_backup_label:
+        migration_backup_created = bool(
             list(
                 (cfg.data_root_path / "backups").glob(
-                    "*before_v1_7_mail_flow*.db"
+                    f"*{migration_backup_label}*.db"
                 )
             )
         )
-        if expected_version == "1.7.0" and cfg is not None
-        else True
-    )
     return {
         "version": version == expected_version,
         "gui_packaged_self_test": True,
@@ -192,7 +193,7 @@ def _packaged_probe(
         "mcp_sync_status": not bool(by_id.get(3, {}).get("result", {}).get("isError")),
         "mcp_stdout_purity": "Traceback" not in completed.stderr,
         "mcp_eof_exit": completed.returncode == 0,
-        "agent_migration_backup": migration_backup_created,
+        "migration_backup": migration_backup_created,
     }
 
 
@@ -391,10 +392,11 @@ def _seed_baseline_from_source(
     home: Path,
     suffix: str,
     env: dict[str, str],
+    expected_version: str,
 ) -> tuple[AppConfig, dict[str, str]]:
     source_root = source_root.resolve()
     if not (source_root / "agent_mail_bridge" / "version.py").is_file():
-        raise RuntimeError("v1.6.0 基线源码目录无效")
+        raise RuntimeError(f"v{expected_version} 基线源码目录无效")
     code = """
 import json
 import sys
@@ -406,12 +408,14 @@ from scripts.release_lifecycle_validation import (
     _provision_lifecycle_client,
     _seed_baseline,
 )
+from agent_mail_bridge.version import __version__
 try:
     cfg, _gmail_id = _seed_baseline(Path(home), suffix=suffix)
     client_auth = _provision_lifecycle_client(cfg)
 finally:
     _close_runtime_handles()
 print("BASELINE_SEEDED")
+print("SOURCE_VERSION=" + __version__)
 print("CLIENT_AUTH=" + json.dumps(client_auth, separators=(",", ":")))
 """
     completed = _run(
@@ -420,7 +424,19 @@ print("CLIENT_AUTH=" + json.dumps(client_auth, separators=(",", ":")))
         timeout=300,
     )
     if "BASELINE_SEEDED" not in completed.stdout:
-        raise RuntimeError("v1.6.0 基线数据创建未完成")
+        raise RuntimeError(f"v{expected_version} 基线数据创建未完成")
+    source_version = next(
+        (
+            line.removeprefix("SOURCE_VERSION=")
+            for line in completed.stdout.splitlines()
+            if line.startswith("SOURCE_VERSION=")
+        ),
+        "",
+    )
+    if source_version != expected_version:
+        raise RuntimeError(
+            f"基线源码版本不匹配：期望 {expected_version}，实际 {source_version}"
+        )
     auth_line = next(
         (
             line.removeprefix("CLIENT_AUTH=")
@@ -432,9 +448,9 @@ print("CLIENT_AUTH=" + json.dumps(client_auth, separators=(",", ":")))
     try:
         client_auth = json.loads(auth_line)
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise RuntimeError("v1.6.0 隔离 Client 创建未完成") from exc
+        raise RuntimeError(f"v{expected_version} 隔离 Client 创建未完成") from exc
     if not isinstance(client_auth, dict):
-        raise RuntimeError("v1.6.0 隔离 Client 身份格式无效")
+        raise RuntimeError(f"v{expected_version} 隔离 Client 身份格式无效")
     return _baseline_config(home, suffix), {
         str(key): str(value) for key, value in client_auth.items()
     }
@@ -498,6 +514,11 @@ def _snapshot(home: Path, cfg: AppConfig, credential_exists: bool) -> dict[str, 
             "SELECT schema_version FROM migration_metadata "
             "WHERE migration_key = ?",
             (V17_MAIL_FLOW_MIGRATION_KEY,),
+        ).fetchone()
+        v171_schema_row = connection.execute(
+            "SELECT schema_version FROM migration_metadata "
+            "WHERE migration_key = ?",
+            (V171_CONSISTENCY_MIGRATION_KEY,),
         ).fetchone()
         table_names = {
             str(row[0])
@@ -626,6 +647,15 @@ def _snapshot(home: Path, cfg: AppConfig, credential_exists: bool) -> dict[str, 
             "sent_server_mappings",
             "mail_thread_relations",
         }
+        v171_tables = {
+            "send_execution_leases",
+            "send_attempt_events",
+            "reconciliation_records",
+            "cleanup_records",
+            "health_issues",
+            "consistency_scan_runs",
+            "consistency_repair_runs",
+        }
     package_files: dict[str, str] = {}
     mail_root = cfg.received_dir / "mail"
     if mail_root.exists():
@@ -649,6 +679,9 @@ def _snapshot(home: Path, cfg: AppConfig, credential_exists: bool) -> dict[str, 
             agent_schema_row[0] if agent_schema_row else 0
         ),
         "v17_schema_version": int(v17_schema_row[0] if v17_schema_row else 0),
+        "v171_schema_version": int(
+            v171_schema_row[0] if v171_schema_row else 0
+        ),
         "counts": counts,
         "agent_counts": agent_counts,
         "account_ids": account_ids,
@@ -656,6 +689,7 @@ def _snapshot(home: Path, cfg: AppConfig, credential_exists: bool) -> dict[str, 
         "agent_client_scope_modes": agent_client_scope_modes,
         "agent_client_capabilities": agent_client_capabilities,
         "v17_tables_present": sorted(v17_tables & table_names),
+        "v171_tables_present": sorted(v171_tables & table_names),
         "raw_eml_count": sum(
             1 for path in package_files if path.endswith("/raw.eml")
         ),
@@ -678,6 +712,13 @@ def _snapshot(home: Path, cfg: AppConfig, credential_exists: bool) -> dict[str, 
             list(
                 (cfg.data_root_path / "backups").glob(
                     "*before_v1_7_mail_flow*.db"
+                )
+            )
+        ),
+        "v171_migration_backup_count": len(
+            list(
+                (cfg.data_root_path / "backups").glob(
+                    "*before_v1_7_1_consistency*.db"
                 )
             )
         ),
@@ -718,6 +759,8 @@ def main() -> int:
     parser.add_argument("--new-installer", required=True, type=Path)
     parser.add_argument("--old-source-dir", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--old-version", default="1.7.0")
+    parser.add_argument("--new-version", default="1.7.1")
     parser.add_argument("--confirm-isolated-install", action="store_true")
     args = parser.parse_args()
     if not args.confirm_isolated_install:
@@ -735,8 +778,8 @@ def main() -> int:
         "schema_version": 1,
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "environment": "current Windows user, randomized AppId, isolated app/home paths",
-        "old_version": "1.6.0",
-        "new_version": "1.7.0",
+        "old_version": args.old_version,
+        "new_version": args.new_version,
         "production_install_untouched": True,
         "checks": {},
     }
@@ -775,13 +818,14 @@ def main() -> int:
                     home,
                     baseline_suffix,
                     env,
+                    args.old_version,
                 )
             finally:
                 _close_runtime_handles()
             old_probe = _packaged_probe(
                 install_dir,
                 env,
-                "1.6.0",
+                args.old_version,
                 cfg=cfg,
                 client_auth_env=lifecycle_client_auth,
             )
@@ -795,9 +839,10 @@ def main() -> int:
             upgraded_probe = _packaged_probe(
                 install_dir,
                 env,
-                "1.7.0",
+                args.new_version,
                 cfg=cfg,
                 client_auth_env=lifecycle_client_auth,
+                migration_backup_label="before_v1_7_1_consistency",
             )
             after_upgrade = _snapshot(
                 home,
@@ -819,9 +864,10 @@ def main() -> int:
             reinstall_probe = _packaged_probe(
                 install_dir,
                 env,
-                "1.7.0",
+                args.new_version,
                 cfg=cfg,
                 client_auth_env=lifecycle_client_auth,
+                migration_backup_label="before_v1_7_1_consistency",
             )
             after_reinstall = _snapshot(
                 home,
@@ -834,15 +880,22 @@ def main() -> int:
                 "old_install": all(old_probe.values()),
                 "upgrade_install": all(upgraded_probe.values()),
                 "db_integrity": after_upgrade["db_integrity"] == "ok",
-                "v17_migration_backup_created": (
-                    after_upgrade["v17_migration_backup_count"] > 0
+                "v171_migration_backup_created": (
+                    after_upgrade["v171_migration_backup_count"] > 0
                 ),
-                "v17_schema_v1": (
+                "v17_schema_preserved": (
                     after_upgrade["v17_schema_version"]
                     == V17_MAIL_FLOW_SCHEMA_VERSION
                 ),
-                "v17_tables_created": (
+                "v17_tables_preserved": (
                     len(after_upgrade["v17_tables_present"]) == 10
+                ),
+                "v171_schema_v3": (
+                    after_upgrade["v171_schema_version"]
+                    == V171_CONSISTENCY_SCHEMA_VERSION
+                ),
+                "v171_tables_created": (
+                    len(after_upgrade["v171_tables_present"]) == 7
                 ),
                 "legacy_client_scope_not_expanded": all(
                     after_upgrade["agent_client_scope_modes"].get(

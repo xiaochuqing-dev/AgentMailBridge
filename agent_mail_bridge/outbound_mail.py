@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import html
+import inspect
 import logging
 import mimetypes
 import os
@@ -19,8 +20,16 @@ from urllib.parse import urlsplit, urlunsplit
 
 from email_validator import EmailNotValidError, validate_email
 
-from agent_mail_bridge.config import AppConfig, effective_incoming_runtime
-from agent_mail_bridge.database import query_mailboxes
+from agent_mail_bridge.config import (
+    AppConfig,
+    effective_incoming_runtime,
+    effective_outgoing_runtime,
+)
+from agent_mail_bridge.database import (
+    get_mail_package,
+    get_outbound_message,
+    query_mailboxes,
+)
 from agent_mail_bridge.mail_archive import archive_normalized_mail, stable_account_ref
 from agent_mail_bridge.mail_common import normalized_mail_from_raw
 from agent_mail_bridge.mail_send import (
@@ -52,8 +61,10 @@ from agent_mail_bridge.send_requests import (
     public_send_request,
     record_outbound_fact,
     record_send_mime,
+    record_send_stage,
+    send_lease_is_active,
 )
-from agent_mail_bridge.storage import atomic_copy_file
+from agent_mail_bridge.storage import atomic_copy_file, atomic_write_bytes
 from agent_mail_bridge.utils import (
     fmt_datetime,
     now_local,
@@ -82,6 +93,7 @@ def prepare_agent_send(
     sender_account_id: str,
     sender_address: str,
     sender_display_name: str,
+    own_addresses: Iterable[str] = (),
     idempotency_key: str,
     operation: str,
     to: Iterable[Any] = (),
@@ -130,6 +142,7 @@ def prepare_agent_send(
         cc=cc,
         bcc=bcc,
         sender_address=sender["email_address"],
+        own_addresses=own_addresses,
         source_message=source_message,
     )
     if action in {"reply", "reply_all"}:
@@ -232,14 +245,28 @@ def execute_agent_send(
     sender_display_name: str,
     authorize: Callable[[dict[str, Any]], None],
     confirmed_by: str | None = None,
+    fault_hook: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """取得唯一发送权、复核权限和附件、发送 exact bytes、归档事实。"""
+    _run_fault_hook(fault_hook, "before_lease")
+    lease_owner = f"send_{uuid.uuid4().hex}"
     request, claimed = claim_for_send(
-        cfg.db_path, send_request_id, confirmed_by=confirmed_by
+        cfg.db_path,
+        send_request_id,
+        confirmed_by=confirmed_by,
+        lease_owner=lease_owner,
     )
     if not claimed:
         return public_send_request(request)
+    _run_fault_hook(fault_hook, "after_lease")
     try:
+        sender_address = str(
+            _validated_address(
+                sender_address,
+                error_code="invalid_sender",
+                label="发件人",
+            )["email_address"]
+        )
         authorize(request)
         _verify_request_attachments(cfg, request)
         raw_bytes, envelope_recipients = _build_request_mime(
@@ -255,7 +282,15 @@ def execute_agent_send(
             send_request_id,
             raw_eml_path=str(raw_path),
             raw_eml_sha256=raw_sha,
+            lease_owner=lease_owner,
         )
+        record_send_stage(
+            cfg.db_path,
+            send_request_id,
+            lease_owner=lease_owner,
+            stage="mime_built",
+        )
+        _run_fault_hook(fault_hook, "after_mime")
     except Exception as exc:
         failed = complete_send_request(
             cfg.db_path,
@@ -263,33 +298,126 @@ def execute_agent_send(
             status="failed",
             error_code=getattr(exc, "code", "send_validation_failed"),
             error_message=str(exc),
+            lease_owner=lease_owner,
         )
         return public_send_request(failed)
 
     try:
-        smtp_send_bytes_with_stage(
-            runtime_cfg,
-            raw_bytes,
-            from_addr=sender_address,
-            to_addrs=envelope_recipients,
+        record_send_stage(
+            cfg.db_path,
+            send_request_id,
+            lease_owner=lease_owner,
+            stage="smtp_starting",
+        )
+        _run_fault_hook(fault_hook, "before_smtp")
+
+        def smtp_stage(stage: str) -> None:
+            record_send_stage(
+                cfg.db_path,
+                send_request_id,
+                lease_owner=lease_owner,
+                stage=stage,
+            )
+            _run_fault_hook(fault_hook, stage)
+
+        smtp_parameters = inspect.signature(
+            smtp_send_bytes_with_stage
+        ).parameters.values()
+        supports_stage_callback = any(
+            parameter.name == "stage_callback"
+            or parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in smtp_parameters
+        )
+        smtp_kwargs: dict[str, Any] = {
+            "from_addr": sender_address,
+            "to_addrs": envelope_recipients,
+        }
+        if supports_stage_callback:
+            smtp_kwargs["stage_callback"] = smtp_stage
+        smtp_send_bytes_with_stage(runtime_cfg, raw_bytes, **smtp_kwargs)
+        # 测试适配器可能不触发 callback；幂等补记接受边界。
+        current_after_smtp = get_send_request(cfg.db_path, send_request_id) or {}
+        if int(current_after_smtp.get("smtp_attempt_count") or 0) == int(
+            request.get("smtp_attempt_count") or 0
+        ):
+            record_send_stage(
+                cfg.db_path,
+                send_request_id,
+                lease_owner=lease_owner,
+                stage="smtp_data_started",
+            )
+        record_send_stage(
+            cfg.db_path,
+            send_request_id,
+            lease_owner=lease_owner,
+            stage="smtp_accepted",
         )
     except SmtpStageError as exc:
-        status = "delivery_unknown" if exc.delivery_unknown else "failed"
+        current = get_send_request(cfg.db_path, send_request_id) or request
+        stage = str(current.get("current_stage") or "")
+        accepted = bool(current.get("smtp_accepted_at"))
+        uncertain = exc.delivery_unknown or stage in {
+            "smtp_data_started",
+            "smtp_accepted",
+        }
+        status = (
+            "sent_archive_failed"
+            if accepted
+            else "delivery_unknown"
+            if uncertain
+            else "failed"
+        )
         failed = complete_send_request(
             cfg.db_path,
             send_request_id,
             status=status,
-            delivery_status=status,
+            delivery_status=(
+                "sent"
+                if accepted
+                else "delivery_unknown"
+                if uncertain
+                else "not_sent"
+            ),
             error_code=(
-                "delivery_unknown"
-                if exc.delivery_unknown
+                "sent_archive_failed"
+                if accepted
+                else "delivery_unknown"
+                if uncertain
                 else f"smtp_{exc.stage}_failed"
             ),
-            error_message=str(exc),
+            error_message=(
+                "SMTP 已接受，正在等待本地归档恢复"
+                if accepted
+                else str(exc)
+            ),
+            lease_owner=lease_owner,
+        )
+        return public_send_request(failed)
+    except Exception as exc:  # noqa: BLE001 - 阶段持久化失败必须保守收口
+        current = get_send_request(cfg.db_path, send_request_id) or request
+        stage = str(current.get("current_stage") or "")
+        accepted = bool(current.get("smtp_accepted_at"))
+        uncertain = accepted or stage in {
+            "smtp_data_started",
+            "smtp_accepted",
+        }
+        failed = complete_send_request(
+            cfg.db_path,
+            send_request_id,
+            status="sent_archive_failed" if accepted else "delivery_unknown"
+            if uncertain
+            else "failed",
+            delivery_status="sent" if accepted else "delivery_unknown"
+            if uncertain
+            else "not_sent",
+            error_code="send_stage_interrupted",
+            error_message="发送执行被中断，已保守进入恢复状态",
+            lease_owner=lease_owner,
         )
         return public_send_request(failed)
 
     accepted_at = now_local()
+    _run_fault_hook(fault_hook, "after_smtp_accepted")
     sent_at = fmt_datetime(accepted_at)
     sent_copy = _append_provider_sent_copy(
         runtime_cfg,
@@ -320,6 +448,12 @@ def execute_agent_send(
         package_id=None,
         status="sent_archive_pending",
         sent_at=sent_at,
+    )
+    record_send_stage(
+        cfg.db_path,
+        send_request_id,
+        lease_owner=lease_owner,
+        stage="archive_pending",
     )
 
     package_id: str | None = None
@@ -367,6 +501,7 @@ def execute_agent_send(
                 str(request.get("forward_from_package_id") or "") or None
             ),
         )
+        _run_fault_hook(fault_hook, "after_archive_before_completion")
     except Exception as exc:
         record_outbound_fact(
             cfg.db_path,
@@ -393,6 +528,7 @@ def execute_agent_send(
             error_message="邮件已发送，但正式归档需要恢复",
             outbound_id=outbound_id,
             package_id=package_id,
+            lease_owner=lease_owner,
         )
         return public_send_request(result)
 
@@ -418,8 +554,138 @@ def execute_agent_send(
         provider_result=provider_result,
         outbound_id=outbound_id,
         package_id=package_id,
+        lease_owner=lease_owner,
     )
     return public_send_request(result)
+
+
+def recover_agent_send_archive(
+    cfg: AppConfig,
+    *,
+    runtime_cfg: AppConfig,
+    send_request_id: str,
+) -> dict[str, Any]:
+    """SMTP 已接受后的纯本地归档恢复；此函数绝不调用 SMTP。"""
+    request = get_send_request(cfg.db_path, send_request_id)
+    if request is None:
+        raise OutboundMailError("send_request_not_found", "发件请求不存在")
+    if str(request.get("status") or "") not in {
+        "smtp_accepted",
+        "sent_archive_pending",
+        "sent_archive_failed",
+        "recovery_required",
+    }:
+        return public_send_request(request)
+    if send_lease_is_active(request):
+        raise OutboundMailError(
+            "send_still_active", "当前发送执行仍在运行，不能并发恢复归档"
+        )
+    if not request.get("smtp_accepted_at") and str(
+        request.get("delivery_status") or ""
+    ) not in {"sent", "smtp_accepted"}:
+        raise OutboundMailError(
+            "smtp_acceptance_not_proven",
+            "没有 SMTP 已接受证据，不能按已发送邮件恢复归档",
+        )
+    raw_path_value = str(request.get("raw_eml_path") or "")
+    if not raw_path_value:
+        raise OutboundMailError(
+            "recovery_mime_missing", "恢复所需的固定 MIME 不存在"
+        )
+    raw_path = Path(raw_path_value).resolve(strict=True)
+    assert_within_root(raw_path, _request_root(cfg, send_request_id))
+    assert_within_root(raw_path, cfg.data_root_path)
+    raw_bytes = raw_path.read_bytes()
+    raw_sha = hashlib.sha256(raw_bytes).hexdigest()
+    if raw_sha.casefold() != str(request.get("raw_eml_sha256") or "").casefold():
+        raise OutboundMailError(
+            "recovery_mime_hash_mismatch", "固定 MIME Hash 校验失败"
+        )
+
+    outbound_id = _outbound_id(send_request_id)
+    outbound = get_outbound_message(cfg.db_path, outbound_id) or {}
+    package_id = str(
+        request.get("package_id") or outbound.get("package_id") or ""
+    )
+    package = get_mail_package(cfg.db_path, package_id) if package_id else None
+    sender_address = effective_outgoing_runtime(runtime_cfg).username
+    grouped = _group_recipients(request)
+    sent_at = str(
+        request.get("smtp_accepted_at")
+        or outbound.get("sent_at")
+        or fmt_datetime(now_local())
+    )
+    if not package or str(package.get("archive_status") or "") not in {
+        "ready",
+        "legacy",
+    }:
+        normalized = normalized_mail_from_raw(
+            raw_bytes,
+            backend="smtp",
+            backend_message_id=outbound_id,
+            thread_id="",
+            uid="",
+            received_at=sent_at,
+            saved_date=sent_at[:10],
+            max_attachment_bytes=max(
+                cfg.max_attachment_bytes, cfg.max_send_file_bytes
+            ),
+            mailbox_ref=_local_sent_mailbox_ref(cfg, request),
+            direction="outbound",
+        )
+        normalized.bcc_raw = ", ".join(grouped["bcc"])
+        normalized.reply_to_package_id = str(
+            request.get("reply_to_package_id") or ""
+        )
+        normalized.forward_from_package_id = str(
+            request.get("forward_from_package_id") or ""
+        )
+        archived = archive_normalized_mail(
+            runtime_cfg, normalized, str(request["message_id"])
+        )
+        package_id = archived.package_id
+        if archived.status not in {"ready", "duplicate"}:
+            raise OutboundMailError(
+                "sent_archive_failed",
+                archived.error or "发件事实归档未完整完成",
+            )
+        record_thread_relations(
+            cfg.db_path,
+            account_id=str(request["sender_account_id"]),
+            package_id=package_id,
+            in_reply_to_raw=normalized.in_reply_to_raw,
+            references_raw=normalized.references_raw,
+            reply_to_package_id=(
+                str(request.get("reply_to_package_id") or "") or None
+            ),
+            forward_from_package_id=(
+                str(request.get("forward_from_package_id") or "") or None
+            ),
+        )
+    record_outbound_fact(
+        cfg.db_path,
+        outbound_id=outbound_id,
+        request=request,
+        sender_ref=sender_address,
+        account_ref=stable_account_ref(runtime_cfg),
+        to_emails=grouped["to"],
+        cc_emails=grouped["cc"],
+        bcc_emails=grouped["bcc"],
+        raw_eml_sha256=raw_sha,
+        package_id=package_id,
+        status="sent",
+        sent_at=sent_at,
+    )
+    recovered = complete_send_request(
+        cfg.db_path,
+        send_request_id,
+        status="sent",
+        delivery_status="sent",
+        provider_result=str(request.get("provider_result") or "accepted"),
+        outbound_id=outbound_id,
+        package_id=package_id,
+    )
+    return public_send_request(recovered)
 
 
 def _append_provider_sent_copy(
@@ -484,6 +750,7 @@ def _resolve_recipients(
     cc: Iterable[Any],
     bcc: Iterable[Any],
     sender_address: str,
+    own_addresses: Iterable[str],
     source_message: dict[str, Any] | None,
 ) -> dict[str, list[dict[str, Any]]]:
     explicit = {
@@ -513,13 +780,21 @@ def _resolve_recipients(
             )
         if any(explicit.values()):
             result = explicit
-    own = sender_address.casefold()
+    excluded_addresses: set[str] = set()
+    if operation == "reply":
+        excluded_addresses.add(sender_address.casefold())
+    elif operation == "reply_all":
+        excluded_addresses = {
+            str(address).strip().casefold()
+            for address in (sender_address, *tuple(own_addresses))
+            if str(address).strip()
+        }
     seen: set[str] = set()
     for kind in ("to", "cc", "bcc"):
         deduped: list[dict[str, Any]] = []
         for item in result[kind]:
             address = str(item["email_address"]).casefold()
-            if address == own or address in seen:
+            if address in excluded_addresses or address in seen:
                 continue
             seen.add(address)
             deduped.append({**item, "recipient_type": kind})
@@ -556,18 +831,28 @@ def _validated_addresses(
     return result
 
 
-def _validated_address(address: str, display_name: str = "") -> dict[str, str]:
+def _validated_address(
+    address: str,
+    display_name: str = "",
+    *,
+    error_code: str = "invalid_recipient",
+    label: str = "邮箱地址",
+) -> dict[str, str]:
     raw = str(address or "").strip()
     if "\r" in raw or "\n" in raw:
         raise OutboundMailError("header_injection", "邮箱地址包含非法换行")
     try:
-        info = validate_email(raw, check_deliverability=False)
+        info = validate_email(
+            raw,
+            check_deliverability=False,
+            allow_smtputf8=False,
+        )
     except EmailNotValidError as exc:
-        raise OutboundMailError("invalid_recipient", "邮箱地址格式无效") from exc
+        raise OutboundMailError(error_code, f"{label}格式无效") from exc
     display = _clean_header(display_name, "显示名", allow_empty=True)
     return {
         "display_name": display,
-        "email_address": info.normalized,
+        "email_address": info.ascii_email or info.normalized,
     }
 
 
@@ -775,13 +1060,7 @@ def _remove_request_stage(cfg: AppConfig, request_id: str) -> None:
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.parent / f".amb-{uuid.uuid4().hex}.tmp"
-    try:
-        temporary.write_bytes(data)
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_write_bytes(path, data)
 
 
 def _unique_name(value: str, used: set[str]) -> str:
@@ -928,3 +1207,10 @@ def _local_sent_mailbox_ref(
     _cfg: AppConfig, request: dict[str, Any]
 ) -> str:
     return f"local:sent:{str(request['sender_account_id'])}"
+
+
+def _run_fault_hook(
+    hook: Callable[[str], None] | None, stage: str
+) -> None:
+    if hook is not None:
+        hook(stage)

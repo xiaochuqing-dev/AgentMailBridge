@@ -42,16 +42,16 @@ def find_package_by_message_id(
     normalized = normalize_message_id(message_id)
     if not normalized:
         return None
-    row = get_connection(db_path).execute(
+    rows = get_connection(db_path).execute(
         """
         SELECT * FROM mail_packages
         WHERE account_id = ? AND message_id = ? COLLATE NOCASE
         ORDER BY local_outbound DESC, id ASC
-        LIMIT 1
+        LIMIT 2
         """,
         (account_id, normalized),
-    ).fetchone()
-    return dict(row) if row else None
+    ).fetchall()
+    return dict(rows[0]) if len(rows) == 1 else None
 
 
 def record_sent_mapping(
@@ -65,6 +65,8 @@ def record_sent_mapping(
     provider_uid: str | None,
     message_id: str,
     matched_by: str,
+    confidence: str = "high",
+    reconciliation_status: str = "matched",
     details: dict[str, Any] | None = None,
 ) -> str:
     material = (
@@ -81,8 +83,9 @@ def record_sent_mapping(
         INSERT INTO sent_server_mappings
             (mapping_id, account_id, package_id, mailbox_id,
              provider_message_id, uidvalidity, provider_uid, message_id,
-             matched_by, matched_at, details_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             matched_by, confidence, reconciliation_status, matched_at,
+             details_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(mapping_id) DO UPDATE SET
             package_id=excluded.package_id,
             provider_message_id=COALESCE(excluded.provider_message_id,
@@ -92,6 +95,8 @@ def record_sent_mapping(
             provider_uid=COALESCE(excluded.provider_uid,
                                   sent_server_mappings.provider_uid),
             matched_by=excluded.matched_by,
+            confidence=excluded.confidence,
+            reconciliation_status=excluded.reconciliation_status,
             matched_at=excluded.matched_at,
             details_json=excluded.details_json
         """,
@@ -105,6 +110,8 @@ def record_sent_mapping(
             provider_uid,
             normalize_message_id(message_id),
             matched_by,
+            confidence,
+            reconciliation_status,
             now,
             json.dumps(
                 details or {},

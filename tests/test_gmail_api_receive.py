@@ -26,6 +26,7 @@ import pytest
 from agent_mail_bridge.config import AppConfig
 from agent_mail_bridge.database import (
     close_connection,
+    get_connection,
     init_db,
     message_id_exists,
     query_mailboxes,
@@ -243,7 +244,12 @@ class TestEmptyList:
 
 
 class TestSingleMessage:
-    def test_text_plain_body(self, tmp_cfg):
+    def test_text_plain_body(self, tmp_cfg, monkeypatch):
+        observed = datetime(2030, 1, 2, 3, 4, 5)
+        monkeypatch.setattr(
+            "agent_mail_bridge.gmail_api_receive.now_local",
+            lambda: observed,
+        )
         msg = _make_message(gmail_id="m1", body_text="Hello World")
         service = _make_service(
             messages_list_resp={"messages": [{"id": "m1", "threadId": "t1"}]},
@@ -264,6 +270,13 @@ class TestSingleMessage:
         assert rows[0]["backend"] == "gmail_api"
         facts = ApplicationService(tmp_cfg).list_mail_messages().details["messages"][0]
         assert (Path(facts["package_root"]) / "raw.eml").read_bytes() == decode_raw(msg["raw"])
+        timeline = get_connection(tmp_cfg.db_path).execute(
+            "SELECT declared_at, observed_at FROM mail_packages "
+            "WHERE package_id=?",
+            (facts["package_id"],),
+        ).fetchone()
+        assert timeline["declared_at"] != "2030-01-02 03:04:05"
+        assert timeline["observed_at"] == "2030-01-02 03:04:05"
         assert any(call.kwargs.get("format") == "raw" for call in service.users().messages().get.call_args_list)
 
     def test_dedup_rfc_message_id(self, tmp_cfg):
@@ -294,6 +307,141 @@ class TestSingleMessage:
         r2 = receive_gmail_api_messages(tmp_cfg, service=service)
         assert r2["saved"] == 0
         assert r2["skipped"] == 1
+
+    def test_multi_label_snapshot_updates_memberships_without_new_fact(
+        self, tmp_cfg
+    ):
+        msg = _make_message(
+            gmail_id="multi-label-1",
+            rfc_message_id="<multi-label-1@gmail.com>",
+            from_header="sender@example.com",
+        )
+        msg["labelIds"] = ["INBOX", "Label_42"]
+        service = _make_service(
+            messages_list_resp={
+                "messages": [{"id": "multi-label-1", "threadId": "t1"}]
+            },
+            messages_get_map={"multi-label-1": msg},
+            labels_list_resp={
+                "labels": [
+                    {"id": "INBOX", "name": "Inbox", "type": "system"},
+                    {"id": "SENT", "name": "Sent", "type": "system"},
+                    {"id": "Label_42", "name": "项目资料", "type": "user"},
+                ]
+            },
+        )
+
+        first = receive_gmail_api_messages(tmp_cfg, service=service)
+        assert first["saved"] == 1
+        connection = get_connection(tmp_cfg.db_path)
+        assert connection.execute("SELECT COUNT(*) FROM mail_packages").fetchone()[0] == 1
+        present = connection.execute(
+            """
+            SELECT m.external_ref, mm.currently_present
+            FROM mail_package_mailboxes mm
+            JOIN mailboxes m ON m.mailbox_id=mm.mailbox_id
+            ORDER BY m.external_ref
+            """
+        ).fetchall()
+        assert {
+            str(row["external_ref"]): bool(row["currently_present"])
+            for row in present
+        } == {"gmail:INBOX": True, "gmail:Label_42": True}
+
+        msg["labelIds"] = ["Label_42"]
+        second = receive_gmail_api_messages(tmp_cfg, service=service)
+
+        assert second["saved"] == 0
+        assert second["skipped"] == 1
+        assert connection.execute("SELECT COUNT(*) FROM mail_packages").fetchone()[0] == 1
+        updated = connection.execute(
+            """
+            SELECT m.external_ref, mm.currently_present, mm.removed_at
+            FROM mail_package_mailboxes mm
+            JOIN mailboxes m ON m.mailbox_id=mm.mailbox_id
+            ORDER BY m.external_ref
+            """
+        ).fetchall()
+        by_ref = {str(row["external_ref"]): row for row in updated}
+        assert bool(by_ref["gmail:INBOX"]["currently_present"]) is False
+        assert by_ref["gmail:INBOX"]["removed_at"]
+        assert bool(by_ref["gmail:Label_42"]["currently_present"]) is True
+
+    def test_message_snapshot_persists_label_created_after_discovery(self, tmp_cfg):
+        msg = _make_message(
+            gmail_id="late-label-1",
+            rfc_message_id="<late-label-1@gmail.com>",
+            from_header="sender@example.com",
+        )
+        msg["labelIds"] = ["INBOX", "Label_late"]
+        service = _make_service(
+            messages_list_resp={
+                "messages": [{"id": "late-label-1", "threadId": "t1"}]
+            },
+            messages_get_map={"late-label-1": msg},
+            labels_list_resp={
+                "labels": [
+                    {"id": "INBOX", "name": "Inbox", "type": "system"},
+                    {"id": "SENT", "name": "Sent", "type": "system"},
+                ]
+            },
+        )
+
+        result = receive_gmail_api_messages(tmp_cfg, service=service)
+
+        assert result["saved"] == 1
+        connection = get_connection(tmp_cfg.db_path)
+        late = connection.execute(
+            "SELECT mailbox_id, sync_enabled FROM mailboxes "
+            "WHERE external_ref='gmail:Label_late'"
+        ).fetchone()
+        assert late is not None
+        assert bool(late["sync_enabled"]) is False
+        memberships = connection.execute(
+            "SELECT m.external_ref, mm.currently_present "
+            "FROM mail_package_mailboxes mm "
+            "JOIN mailboxes m ON m.mailbox_id=mm.mailbox_id"
+        ).fetchall()
+        assert {
+            str(row["external_ref"]): bool(row["currently_present"])
+            for row in memberships
+        } == {"gmail:INBOX": True, "gmail:Label_late": True}
+
+    def test_explicit_empty_label_snapshot_does_not_restore_list_source(
+        self, tmp_cfg
+    ):
+        msg = _make_message(
+            gmail_id="empty-labels-1",
+            rfc_message_id="<empty-labels-1@gmail.com>",
+            from_header="sender@example.com",
+        )
+        msg["labelIds"] = []
+        service = _make_service(
+            messages_list_resp={
+                "messages": [{"id": "empty-labels-1", "threadId": "t1"}]
+            },
+            messages_get_map={"empty-labels-1": msg},
+            labels_list_resp={
+                "labels": [
+                    {"id": "INBOX", "name": "Inbox", "type": "system"},
+                    {"id": "SENT", "name": "Sent", "type": "system"},
+                ]
+            },
+        )
+
+        result = receive_gmail_api_messages(tmp_cfg, service=service)
+
+        assert result["saved"] == 1
+        membership = get_connection(tmp_cfg.db_path).execute(
+            "SELECT mm.currently_present, mm.removed_at, "
+            "mm.reconciliation_status FROM mail_package_mailboxes mm "
+            "JOIN mailboxes m ON m.mailbox_id=mm.mailbox_id "
+            "WHERE m.external_ref='gmail:INBOX'"
+        ).fetchone()
+        assert membership is not None
+        assert bool(membership["currently_present"]) is False
+        assert membership["removed_at"]
+        assert membership["reconciliation_status"] == "server_absent"
 
 
 class TestMultipleMessages:

@@ -62,6 +62,17 @@ def _status(ok: bool, **facts: Any) -> dict[str, Any]:
     return {"status": "PASS" if ok else "FAIL", **facts}
 
 
+def _gmail_validation_alias(address: str, suffix: str) -> str:
+    local, separator, domain = str(address or "").strip().partition("@")
+    if (
+        not separator
+        or not local
+        or domain.casefold() not in {"gmail.com", "googlemail.com"}
+    ):
+        return ""
+    return f"{local}+amb-v171-{suffix[:12]}@{domain}"
+
+
 def _wait_for_mail(
     service: ApplicationService,
     *,
@@ -268,6 +279,19 @@ def main() -> int:
         recipient = accounts.get(args.to_account_id)
         if sender is None or recipient is None:
             raise RuntimeError("account_not_found")
+        gmail_account = next(
+            (
+                row
+                for row in accounts.values()
+                if str(row.get("provider") or "") == "gmail"
+                and str(row.get("email_address") or "").casefold()
+                == str(cfg.owner_gmail or "").strip().casefold()
+            ),
+            None,
+        )
+        if gmail_account is None:
+            raise RuntimeError("gmail_validation_account_not_found")
+        gmail_account_id = str(gmail_account["account_id"])
         providers = [
             str(sender.get("provider") or ""),
             str(recipient.get("provider") or ""),
@@ -305,9 +329,18 @@ def main() -> int:
         for row in mailbox_rows:
             if (
                 str(row.get("account_id") or "")
-                in {args.from_account_id, args.to_account_id}
+                in {
+                    args.from_account_id,
+                    args.to_account_id,
+                    gmail_account_id,
+                }
                 and str(row.get("mailbox_role") or "")
-                in {"inbox", "sent"}
+                in (
+                    {"inbox", "sent"}
+                    if str(row.get("account_id") or "")
+                    in {args.from_account_id, args.to_account_id}
+                    else {"inbox"}
+                )
                 and not str(row.get("external_ref") or "").startswith(
                     "local:sent:"
                 )
@@ -387,7 +420,11 @@ def main() -> int:
                 )
                 for path in attachments
             }
-            public_cc = str(cfg.owner_gmail or "").strip()
+            public_cc = _gmail_validation_alias(
+                str(cfg.owner_gmail or ""), suffix
+            )
+            if not public_cc:
+                raise RuntimeError("gmail_validation_alias_unavailable")
             sender_address = str(sender.get("email_address") or "")
             recipient_address = str(recipient.get("email_address") or "")
             cc = (
@@ -434,8 +471,16 @@ def main() -> int:
                     pending_row.get("smtp_attempt_count") or 0
                 ),
                 delivery_observed=False,
+                request_status=str(pending_row.get("status") or ""),
+                error_code=str(pending.error_code or ""),
             )
-            send_request_id = str(pending_row["send_request_id"])
+            send_request_id = str(
+                pending_row.get("send_request_id") or ""
+            )
+            if not pending.ok or not send_request_id:
+                raise RuntimeError(
+                    str(pending.error_code or "confirm_request_not_created")
+                )
             confirmed = service.confirm_agent_send_request(send_request_id)
             confirmed_again = service.confirm_agent_send_request(
                 send_request_id
@@ -507,7 +552,7 @@ def main() -> int:
                 (
                     "reply_all",
                     args.to_account_id,
-                    args.from_account_id,
+                    gmail_account_id,
                     [],
                 ),
             ]
@@ -549,6 +594,19 @@ def main() -> int:
                         source_package_id,
                         "reply",
                     )
+                    and (
+                        operation != "reply_all"
+                        or sum(
+                            len(values)
+                            for values in dict(
+                                row.get("recipients") or {}
+                            ).values()
+                        )
+                        == 1
+                    ),
+                    configured_self_addresses_excluded=(
+                        operation == "reply_all"
+                    ),
                 )
 
             source_attachments = _attachment_facts(

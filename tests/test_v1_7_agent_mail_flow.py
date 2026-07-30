@@ -30,6 +30,10 @@ from agent_mail_bridge.models import OperationStatus, ReceiveResult
 from agent_mail_bridge.outbound_mail import _append_provider_sent_copy
 from agent_mail_bridge.provider_foundation import append_imap_message
 from agent_mail_bridge.send_requests import get_send_request
+from scripts.v1_7_real_agent_validation import (
+    _audit_search_uses_historical_scope,
+    _command as real_agent_command,
+)
 
 
 def test_search_audit_summary_records_mailbox_scope_without_message_content():
@@ -46,6 +50,40 @@ def test_search_audit_summary_records_mailbox_scope_without_message_content():
     assert summary == (
         "time_scope=all; query=AgentMailBridge; direction=inbound; "
         "mailbox_id=mailbox-sent-1"
+    )
+
+
+def test_real_claude_validation_uses_normalized_mcp_tool_prefix(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        "scripts.v1_7_real_agent_validation.shutil.which",
+        lambda _name: "claude.exe",
+    )
+    command = real_agent_command("claude_code", "validation", tmp_path)
+    allowed = command[command.index("--allowedTools") + 1]
+
+    assert "mcp__agent_mail_bridge__search_mails" in allowed
+    assert "mcp__agent-mail-bridge__" not in allowed
+
+
+def test_real_agent_historical_scope_accepts_server_default_all():
+    base = {"tool_name": "search_mails", "status": "success"}
+
+    assert _audit_search_uses_historical_scope(
+        {**base, "query_summary": "query=AgentMailBridge; mailbox_id=inbox"}
+    )
+    assert _audit_search_uses_historical_scope(
+        {**base, "query_summary": "time_scope=all; mailbox_id=sent"}
+    )
+    assert _audit_search_uses_historical_scope(
+        {**base, "query_summary": "time_scope=date_range; date_from=2024-01-01"}
+    )
+    assert not _audit_search_uses_historical_scope(
+        {**base, "query_summary": "time_scope=latest; mailbox_id=inbox"}
+    )
+    assert not _audit_search_uses_historical_scope(
+        {**base, "status": "denied", "query_summary": "time_scope=all"}
     )
 
 
@@ -86,15 +124,15 @@ def test_atomic_replace_retries_transient_windows_access_denied(
             raise error
 
     monkeypatch.setattr(
-        "agent_mail_bridge.mail_archive.os.replace",
+        "agent_mail_bridge.storage.os.replace",
         transient_then_success,
     )
     monkeypatch.setattr(
-        "agent_mail_bridge.mail_archive.time.sleep",
+        "agent_mail_bridge.storage.time.sleep",
         lambda _seconds: None,
     )
     monkeypatch.setattr(
-        "agent_mail_bridge.mail_archive.sys.platform",
+        "agent_mail_bridge.storage.sys.platform",
         "win32",
     )
 
@@ -315,7 +353,11 @@ def test_autonomous_send_uses_exact_mime_without_public_bcc(
         subject="不得再次发送",
         body_text="幂等重试",
     )
-    assert retry.details["send_request"]["status"] == "sent"
+    assert retry.details["send_request"]["status"] == "sent_reconciled"
+    assert (
+        retry.details["send_request"]["sent_reconciliation_status"]
+        == "matched"
+    )
     assert len(smtp_calls) == 1
 
 
@@ -418,7 +460,8 @@ def _archive_reply_source(service, tmp_cfg, account_id):
     message["From"] = "Origin <origin@example.com>"
     message["Reply-To"] = "Reply Desk <reply@example.com>"
     message["To"] = (
-        f"{tmp_cfg.qq_email}, Teammate <team@example.com>"
+        f"{tmp_cfg.qq_email}, {tmp_cfg.gmail_address}, "
+        "Teammate <team@example.com>"
     )
     message["Cc"] = (
         "Reply Desk <reply@example.com>, Other <other@example.com>"

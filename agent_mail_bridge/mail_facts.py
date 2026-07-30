@@ -379,6 +379,13 @@ def _package_dto(row: dict[str, Any]) -> dict[str, Any]:
         "sent_at": row.get("sent_at"),
         "received_at": row.get("received_at"),
         "saved_at": row.get("saved_at"),
+        "timeline": {
+            "date_header_raw": str(row.get("date_header_raw") or ""),
+            "declared_at": row.get("declared_at"),
+            "observed_at": row.get("observed_at"),
+            "first_seen_at": row.get("first_seen_at"),
+            "last_verified_at": row.get("last_verified_at"),
+        },
         "body_summary": body[:800],
         "body": {
             "plain_path": row.get("body_plain_path"),

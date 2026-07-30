@@ -24,7 +24,7 @@ import uuid
 from email.message import EmailMessage
 from email.utils import formatdate
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit, urlunsplit
 
 from agent_mail_bridge.config import (
@@ -728,6 +728,7 @@ def smtp_send_bytes_with_stage(
     *,
     from_addr: str,
     to_addrs: list[str],
+    stage_callback: Callable[[str], None] | None = None,
 ) -> None:
     """发送已经固化的 MIME bytes；Bcc 只存在于 envelope recipients。"""
     if not isinstance(raw_bytes, bytes) or not raw_bytes:
@@ -741,6 +742,7 @@ def smtp_send_bytes_with_stage(
             list(to_addrs),
             raw_bytes,
         ),
+        stage_callback=stage_callback,
     )
     logger.info("SMTP MIME bytes 发送完成")
 
@@ -748,12 +750,15 @@ def smtp_send_bytes_with_stage(
 def _smtp_transport_with_stage(
     cfg: AppConfig,
     send_action,
+    *,
+    stage_callback: Callable[[str], None] | None = None,
 ) -> None:
     """复用同一 TLS、认证和错误分段，只替换 SMTP DATA 动作。"""
     outgoing = effective_outgoing_runtime(cfg)
     if outgoing.security not in {"ssl", "starttls"}:
         raise SmtpStageError("tls", "SMTP 只允许 SSL/TLS 或 STARTTLS")
     context = ssl.create_default_context()
+    _notify_smtp_stage(stage_callback, "smtp_connecting")
     try:
         if outgoing.security == "ssl":
             server = smtplib.SMTP_SSL(
@@ -771,22 +776,28 @@ def _smtp_transport_with_stage(
     except Exception as exc:  # noqa: BLE001
         stage = _classify_smtp_error(exc, default_stage="connect")
         raise SmtpStageError(stage, _smtp_error_message(stage)) from exc
+    _notify_smtp_stage(stage_callback, "smtp_connected")
     try:
         try:
             server.ehlo()
             if outgoing.security == "starttls":
                 server.starttls(context=context)
                 server.ehlo()
+            _notify_smtp_stage(stage_callback, "smtp_tls_ready")
         except Exception as exc:  # noqa: BLE001
             stage = _classify_smtp_error(exc, default_stage="tls")
             raise SmtpStageError(stage, _smtp_error_message(stage)) from exc
         try:
             server.login(outgoing.username, outgoing.secret)
+            _notify_smtp_stage(stage_callback, "smtp_authenticated")
         except Exception as exc:  # noqa: BLE001
             stage = _classify_smtp_error(exc, default_stage="auth")
             raise SmtpStageError(stage, _smtp_error_message(stage)) from exc
         try:
+            _notify_smtp_stage(stage_callback, "smtp_data_started")
             send_action(server, outgoing)
+        except SmtpStageError:
+            raise
         except Exception as exc:  # noqa: BLE001
             stage = _classify_smtp_error(exc, default_stage="send")
             delivery_unknown = stage == "send" and isinstance(
@@ -803,6 +814,14 @@ def _smtp_transport_with_stage(
                 _smtp_error_message(stage),
                 delivery_unknown=delivery_unknown,
             ) from exc
+        try:
+            _notify_smtp_stage(stage_callback, "smtp_accepted")
+        except Exception as exc:  # noqa: BLE001
+            raise SmtpStageError(
+                "send",
+                "SMTP 已接受，但本地状态持久化未完成",
+                delivery_unknown=True,
+            ) from exc
     finally:
         try:
             server.quit()
@@ -811,6 +830,13 @@ def _smtp_transport_with_stage(
                 server.close()
             except Exception:
                 pass
+
+
+def _notify_smtp_stage(
+    callback: Callable[[str], None] | None, stage: str
+) -> None:
+    if callback is not None:
+        callback(stage)
 
 
 def _classify_smtp_error(exc: Exception, *, default_stage: str) -> str:

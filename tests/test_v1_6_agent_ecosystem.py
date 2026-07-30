@@ -4,6 +4,7 @@ import json
 import shutil
 import sqlite3
 import threading
+import tomllib
 from datetime import datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
@@ -425,6 +426,39 @@ def test_unknown_future_client_version_falls_back_to_assisted(monkeypatch):
     assert detection.status == "version_unverified"
 
 
+def test_current_codex_version_is_managed_supported(monkeypatch):
+    monkeypatch.setattr(
+        "agent_mail_bridge.mcp_client_config._detect_executable_version",
+        lambda _client_type: ("codex.exe", "codex-cli 0.146.0"),
+    )
+
+    detection = detect_client("codex")
+
+    assert detection.installed is True
+    assert detection.config_mode == "managed"
+    assert detection.status == "managed_supported"
+
+
+def test_managed_config_forwards_explicit_runtime_config_without_previewing_value(
+    tmp_path, monkeypatch
+):
+    runtime_config = tmp_path / "private-runtime" / ".env"
+    monkeypatch.setenv("AGENT_MAIL_BRIDGE_CONFIG", str(runtime_config))
+    target = tmp_path / "config.toml"
+    plan = preview_client_config(
+        client_id="client_" + "c" * 24,
+        client_type="codex",
+        client_token="ambc_runtime_override",
+        target_path=target,
+    )
+
+    parsed = tomllib.loads(plan.planned_bytes.decode("utf-8"))
+    env = parsed["mcp_servers"]["agent-mail-bridge"]["env"]
+    assert env["AGENT_MAIL_BRIDGE_CONFIG"] == str(runtime_config)
+    assert str(runtime_config) not in plan.preview
+    assert "AGENT_MAIL_BRIDGE_CONFIG" in plan.preview
+
+
 def test_hermes_assisted_command_uses_one_env_group_before_args():
     command = mcp_client_command(
         "hermes",
@@ -447,7 +481,8 @@ def test_claude_assisted_command_separates_env_from_server_name():
     assert command.startswith("claude ")
     assert "--env" in command
     assert command.index("--env") < command.index("--transport")
-    assert command.index("--scope") < command.index("agent-mail-bridge")
+    assert command.index("--scope") < command.index("agent_mail_bridge")
+    assert "agent-mail-bridge" not in command
 
 
 def test_token_rotation_database_failure_restores_previous_token(

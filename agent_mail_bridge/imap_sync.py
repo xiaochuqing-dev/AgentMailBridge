@@ -6,6 +6,7 @@ QRESYNC 保留为后续能力，避免在 Provider 真实兼容性验证前扩�
 
 from __future__ import annotations
 
+import hashlib
 import json
 import ssl
 from email import message_from_bytes
@@ -35,6 +36,13 @@ from agent_mail_bridge.mailbox_sync import (
     selected_sync_mailboxes,
     update_mailbox_checkpoint,
 )
+from agent_mail_bridge.mailbox_checkpoint import (
+    begin_mailbox_attempt,
+    get_mailbox_checkpoint_state,
+)
+from agent_mail_bridge.mail_fact_membership import (
+    reconcile_mailbox_uid_snapshot,
+)
 from agent_mail_bridge.provider_foundation import (
     _mailbox_role,
     classify_protocol_error,
@@ -46,6 +54,7 @@ from agent_mail_bridge.utils import fmt_datetime, now_local
 
 logger = get_logger("imap_sync")
 DEFAULT_BATCH_SIZE = 25
+MEMBERSHIP_SNAPSHOT_INTERVAL = timedelta(hours=24)
 
 
 class ImapSyncError(RuntimeError):
@@ -140,21 +149,41 @@ def _sync_imap_mailbox(
         for key in ("fetched", "saved", "failed")
     }
     try:
+        begin_mailbox_attempt(
+            cfg.db_path,
+            mailbox_id=mailbox_id,
+            account_id=account_id,
+            attempt={"stage": "selecting", "mailbox_id": mailbox_id},
+        )
         selected = client.select_folder(mailbox_name, readonly=True)
         uidvalidity = _response_int(selected, b"UIDVALIDITY")
         uidnext = _response_int(selected, b"UIDNEXT")
         highestmodseq = _response_int(selected, b"HIGHESTMODSEQ")
-        checkpoint = _load_mailbox_checkpoint(
-            cfg, account_id, mailbox_name
+        checkpoint_state = get_mailbox_checkpoint_state(
+            cfg.db_path, mailbox_id
+        ) or {}
+        checkpoint = _load_authoritative_mailbox_checkpoint(
+            cfg,
+            account_id=account_id,
+            mailbox=mailbox_name,
+            mailbox_id=mailbox_id,
+            checkpoint_state=checkpoint_state,
+        )
+        previous_server_snapshot = dict(
+            checkpoint_state.get("server_snapshot") or {}
         )
         previous_validity = int(checkpoint.get("uidvalidity") or 0)
         last_uid = int(checkpoint.get("last_uid") or 0)
+        reconciliation_pending = bool(
+            checkpoint.get("uidvalidity_reconciliation_pending")
+        )
         validity_changed = bool(
             previous_validity
             and uidvalidity
             and previous_validity != uidvalidity
         )
         if validity_changed:
+            reconciliation_pending = True
             last_uid = 0
             checkpoint["uidvalidity_reset_count"] = (
                 int(checkpoint.get("uidvalidity_reset_count") or 0) + 1
@@ -171,7 +200,15 @@ def _sync_imap_mailbox(
             if last_uid
             else 1
         )
-        searched = _search_uids(client, overlap_start)
+        full_membership_snapshot = validity_changed or _membership_snapshot_due(
+            previous_server_snapshot
+        )
+        all_server_uids: list[int] | None = None
+        if full_membership_snapshot:
+            all_server_uids = _search_uids(client, 1)
+            searched = [uid for uid in all_server_uids if uid >= overlap_start]
+        else:
+            searched = _search_uids(client, overlap_start)
         overlap_uids = [uid for uid in searched if uid <= last_uid]
         new_uids = [uid for uid in searched if uid > last_uid]
         recent_overlap = (
@@ -266,9 +303,6 @@ def _sync_imap_mailbox(
                 "strategy": "polling_uid_checkpoint",
             }
         )
-        _save_mailbox_checkpoint(
-            cfg, account_id, mailbox_name, checkpoint
-        )
         state = (
             "partial"
             if int(result.get("failed") or 0) > before["failed"]
@@ -276,6 +310,55 @@ def _sync_imap_mailbox(
             if int(result.get("saved") or 0) == before["saved"]
             else "success"
         )
+        remaining_new = any(uid > new_last_uid for uid in new_uids)
+        current_generation_retry = any(
+            _parse_retry_resource_id(
+                str(retry.get("resource_id") or ""),
+                mailbox_name,
+                uidvalidity=uidvalidity,
+                accept_legacy=False,
+            )
+            is not None
+            for retry in query_receive_retries(
+                cfg.db_path, "imap", account_id=account_id
+            )
+        )
+        reconciliation_completed = bool(
+            reconciliation_pending
+            and not remaining_new
+            and not current_generation_retry
+            and state != "partial"
+        )
+        if reconciliation_completed:
+            checkpoint.pop("uidvalidity_reconciliation_pending", None)
+        elif reconciliation_pending:
+            checkpoint["uidvalidity_reconciliation_pending"] = True
+        server_snapshot = {
+            **previous_server_snapshot,
+            "uidvalidity": uidvalidity,
+            "uidnext": uidnext,
+            "highestmodseq": highestmodseq,
+        }
+        if all_server_uids is not None:
+            reconcile_mailbox_uid_snapshot(
+                cfg.db_path,
+                account_id=account_id,
+                mailbox_id=mailbox_id,
+                uidvalidity=uidvalidity,
+                observed_provider_uids=all_server_uids,
+            )
+            snapshot_material = ",".join(str(uid) for uid in all_server_uids)
+            server_snapshot.update(
+                {
+                    "full_membership_scanned_at": datetime.now().strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    ),
+                    "uid_count": len(all_server_uids),
+                    "uid_set_sha256": hashlib.sha256(
+                        snapshot_material.encode("ascii")
+                    ).hexdigest(),
+                }
+            )
         update_mailbox_checkpoint(
             cfg.db_path,
             mailbox_id,
@@ -285,6 +368,20 @@ def _sync_imap_mailbox(
             last_uid=new_last_uid,
             checkpoint=checkpoint,
             result=state,
+            server_snapshot=server_snapshot,
+            reconciliation_required=(
+                reconciliation_pending and not reconciliation_completed
+            ),
+            reconciliation_completed=reconciliation_completed,
+            uidvalidity_changed=validity_changed,
+            full_rescan_cursor=(
+                str(new_last_uid)
+                if reconciliation_pending and not reconciliation_completed
+                else None
+            ),
+        )
+        _save_mailbox_checkpoint(
+            cfg, account_id, mailbox_name, checkpoint
         )
         folder_result["status"] = state
     except Exception as exc:  # noqa: BLE001
@@ -308,6 +405,11 @@ def _sync_imap_mailbox(
                 checkpoint={},
                 result="failed",
                 error=code,
+                current_attempt={
+                    "stage": "failed",
+                    "error_code": code,
+                    "mailbox_id": mailbox_id,
+                },
             )
         except Exception:  # noqa: BLE001
             pass
@@ -580,6 +682,16 @@ def _search_uids(client: Any, lower_bound: int) -> list[int]:
     return sorted({int(value) for value in values if int(value) >= lower_bound})
 
 
+def _membership_snapshot_due(snapshot: dict[str, Any]) -> bool:
+    value = str(snapshot.get("full_membership_scanned_at") or "")
+    try:
+        previous = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return True
+    elapsed = datetime.now() - previous
+    return elapsed.total_seconds() < 0 or elapsed >= MEMBERSHIP_SNAPSHOT_INTERVAL
+
+
 def _fetch_with_isolation(
     client: Any, uids: Iterable[int]
 ) -> dict[int, bytes | Exception | None]:
@@ -664,6 +776,7 @@ def _process_raw(
         mailbox_ref=mailbox,
         direction=direction,
         uidvalidity=uidvalidity,
+        observed_at=fmt_datetime(now_local()),
     )
     if date_from is not None or date_to is not None:
         normalized_at = datetime.fromisoformat(normalized.received_at)
@@ -877,6 +990,24 @@ def _load_mailbox_checkpoint(
         return {}
     item = mailboxes.get(mailbox)
     return dict(item) if isinstance(item, dict) else {}
+
+
+def _load_authoritative_mailbox_checkpoint(
+    cfg: AppConfig,
+    *,
+    account_id: str,
+    mailbox: str,
+    mailbox_id: str,
+    checkpoint_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """目录级状态优先；旧账号聚合状态仅用于升级兼容回退。"""
+    state = checkpoint_state
+    if state is None:
+        state = get_mailbox_checkpoint_state(cfg.db_path, mailbox_id) or {}
+    authoritative = state.get("checkpoint") if isinstance(state, dict) else None
+    if isinstance(authoritative, dict) and authoritative:
+        return dict(authoritative)
+    return _load_mailbox_checkpoint(cfg, account_id, mailbox)
 
 
 def _save_mailbox_checkpoint(

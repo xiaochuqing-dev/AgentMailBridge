@@ -18,6 +18,9 @@ from __future__ import annotations
 
 import shutil
 import os
+import errno
+import sys
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -146,28 +149,18 @@ def build_sent_copy_path(
 # ============================================================
 
 def write_text(path: Path, content: str, *, encoding: str = "utf-8") -> None:
-    """写入文本文件，自动创建父目录。"""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding=encoding)
+    """原子写入文本文件，自动创建父目录。"""
+    atomic_write_text(path, content, encoding=encoding)
 
 
 def write_bytes(path: Path, data: bytes) -> None:
-    """写入二进制文件，自动创建父目录。"""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(data)
+    """原子写入二进制文件，自动创建父目录。"""
+    atomic_write_bytes(path, data)
 
 
 def copy_file(src: Path | str, dst: Path | str) -> Path:
-    """复制文件（覆盖目标）。返回目标路径。"""
-    src = Path(src)
-    dst = Path(dst)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    # 校验目标位于数据根目录内（防御性）
-    # 注：这里不做强校验，因为调用方已控制路径；越权校验在 security 层
-    shutil.copy2(src, dst)
-    return dst
+    """原子复制文件（覆盖目标）。返回目标路径。"""
+    return atomic_copy_file(src, dst)
 
 
 def atomic_copy_file(src: Path | str, dst: Path | str) -> Path:
@@ -175,18 +168,90 @@ def atomic_copy_file(src: Path | str, dst: Path | str) -> Path:
     source = Path(src)
     target = Path(dst)
     target.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_disk_space(target, source.stat().st_size)
     # 临时名与用户文件名解耦，避免长 Unicode 文件名叠加 UUID 后触发
     # 未启用 Win32 长路径策略的 MAX_PATH 限制。
-    temporary = target.parent / f".amb-{uuid.uuid4().hex}.tmp"
+    temporary = target.parent / f".{uuid.uuid4().hex[:8]}.tmp"
     try:
         shutil.copy2(source, temporary)
-        os.replace(temporary, target)
+        with temporary.open("r+b") as handle:
+            handle.flush()
+            os.fsync(handle.fileno())
+        replace_atomically(temporary, target)
     finally:
         try:
             temporary.unlink(missing_ok=True)
         except OSError:
             pass
     return target
+
+
+def atomic_write_bytes(path: Path | str, data: bytes) -> Path:
+    """Write exact bytes durably, then publish with a bounded Windows retry."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_disk_space(target, len(data))
+    temporary = target.parent / f".{uuid.uuid4().hex[:8]}.tmp"
+    try:
+        with temporary.open("wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        replace_atomically(temporary, target)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return target
+
+
+def atomic_write_text(
+    path: Path | str,
+    content: str,
+    *,
+    encoding: str = "utf-8",
+    errors: str = "strict",
+) -> Path:
+    return atomic_write_bytes(
+        path,
+        str(content).encode(encoding, errors=errors),
+    )
+
+
+def replace_atomically(source: Path | str, target: Path | str) -> Path:
+    """Retry only transient Windows replace races while preserving atomicity."""
+    source_path = Path(source)
+    target_path = Path(target)
+    delay = 0.001
+    for attempt in range(10):
+        try:
+            os.replace(source_path, target_path)
+            return target_path
+        except PermissionError as exc:
+            retryable = (
+                sys.platform == "win32"
+                and getattr(exc, "winerror", None) in {5, 32}
+            )
+            if not retryable or attempt == 9:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 0.05)
+    raise OSError("原子替换未完成")
+
+
+def _ensure_disk_space(target: Path, required_bytes: int) -> None:
+    """Fail before staging when the destination volume cannot hold the bytes."""
+    try:
+        free_bytes = int(shutil.disk_usage(target.parent).free)
+    except OSError:
+        return
+    if free_bytes < max(0, int(required_bytes)):
+        raise OSError(
+            errno.ENOSPC,
+            "目标磁盘可用空间不足",
+            str(target),
+        )
 
 
 # ============================================================

@@ -610,6 +610,7 @@ def _process_one_unified(
         saved_date=received_dt.strftime("%Y-%m-%d"),
         max_attachment_bytes=cfg.max_attachment_bytes,
         mailbox_ref="imap:INBOX",
+        observed_at=fmt_datetime(now_local()),
     )
     if date_from is not None or date_to is not None:
         normalized_at = datetime.fromisoformat(normalized.received_at)

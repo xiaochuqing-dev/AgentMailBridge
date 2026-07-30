@@ -29,6 +29,7 @@ maintenance-report*.md
 AgentMailBridgeData/backups/
 AgentMailBridgeData/send/staging/
 artifacts/gui-qa*/
+artifacts/lifecycle*/
 diagnostic-report*.md
 *.diagnostic.md
 screenshots/

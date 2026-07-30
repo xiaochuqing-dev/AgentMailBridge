@@ -16,14 +16,18 @@ from agent_mail_bridge.database import (
     AGENT_INTEGRATION_SCHEMA_VERSION,
     MULTI_ACCOUNT_SCHEMA_VERSION,
     V17_MAIL_FLOW_SCHEMA_VERSION,
+    V171_CONSISTENCY_SCHEMA_VERSION,
 )
 from agent_mail_bridge.provider_adapters import get_provider_adapter
 from agent_mail_bridge.provider_foundation import PROVIDER_PROFILES
 from agent_mail_bridge.version import __version__
 
 
-TARGET_VERSION = "1.7.0"
+TARGET_VERSION = "1.7.1"
 TARGETED_TESTS = (
+    "tests/test_v1_7_1_consistency_recovery.py",
+    "tests/test_v1_7_1_fault_injection.py",
+    "tests/test_v1_7_agent_mail_flow.py",
     "tests/test_v1_6_agent_ecosystem.py",
     "tests/test_v1_5_agent_integration.py",
     "tests/test_v1_4_5_release_lifecycle.py",
@@ -142,6 +146,10 @@ def _check_schema_consistency() -> None:
     _require(
         V17_MAIL_FLOW_SCHEMA_VERSION == 1,
         "unexpected v1.7 mail-flow schema version",
+    )
+    _require(
+        V171_CONSISTENCY_SCHEMA_VERSION == 3,
+        "unexpected v1.7.1 consistency schema version",
     )
     runtime_tests = _text("tests/test_v1_4_1_multi_account_runtime.py")
     _require(

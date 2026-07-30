@@ -13,7 +13,6 @@ import subprocess
 import sys
 import threading
 import uuid
-import shutil
 import json
 import time
 from datetime import datetime, timedelta
@@ -61,6 +60,7 @@ from agent_mail_bridge.database import (
     multi_account_migration_needed,
     outbound_mail_migration_needed,
     v17_mail_flow_migration_needed,
+    v171_consistency_migration_needed,
     v13_mail_migration_needed,
     log_event,
     get_outbound_message as query_outbound_message,
@@ -119,14 +119,23 @@ from agent_mail_bridge.outbound_mail import (
     OutboundMailError,
     execute_agent_send,
     prepare_agent_send,
+    recover_agent_send_archive,
 )
 from agent_mail_bridge.send_requests import (
     SendRequestError,
     cancel_send_request as cancel_pending_send_request,
     expire_due_send_requests,
+    expire_send_request_if_due,
     get_send_request as query_send_request,
     list_send_requests as query_send_requests,
     public_send_request,
+)
+from agent_mail_bridge.send_recovery import (
+    list_recovery_requests as query_recovery_requests,
+    mark_send_request_resolution,
+    reconcile_send_request_locally,
+    recover_incomplete_send_request,
+    recover_incomplete_send_requests,
 )
 from agent_mail_bridge.mail_accounts import (
     MailAccount,
@@ -183,7 +192,11 @@ from agent_mail_bridge.security import (
     is_dangerous,
     validate_agent_workspace_root,
 )
-from agent_mail_bridge.storage import atomic_copy_file, ensure_data_dirs
+from agent_mail_bridge.storage import (
+    atomic_copy_file,
+    atomic_write_text,
+    ensure_data_dirs,
+)
 from agent_mail_bridge.trusted_downloads import normalize_trusted_domain
 from agent_mail_bridge.utils import fmt_date, sanitize_filename, sha256_of_bytes, sha256_of_file
 from agent_mail_bridge.mcp_client_config import (
@@ -199,6 +212,19 @@ from agent_mail_bridge.mcp_client_config import (
     mcp_launch,
     preview_client_config,
     restore_client_config,
+)
+from agent_mail_bridge.health_service import get_mail_health
+from agent_mail_bridge.consistency_repair import (
+    ConsistencyRepairError,
+    begin_consistency_repair,
+    finish_consistency_repair,
+    list_consistency_repair_candidates,
+    mark_consistency_repair_backup,
+)
+from agent_mail_bridge.retention_cleanup import (
+    cleanup_send_snapshots,
+    preview_send_snapshot_cleanup,
+    recover_snapshot_cleanup_transactions,
 )
 
 
@@ -236,6 +262,8 @@ class ApplicationService:
         self._event_maintenance_lock = threading.Lock()
         self._last_event_maintenance_at: datetime | None = None
         self._last_event_maintenance_result: dict[str, int] = {}
+        self._startup_recovery_done = False
+        self._startup_recovery_result: dict[str, Any] = {}
         self._ready = False
         if os.getenv("AGENT_MAIL_BRIDGE_DISABLE_CREDENTIAL_STORE") == "1":
             self._credentials = CredentialService(
@@ -283,6 +311,9 @@ class ApplicationService:
                 v17_migration_needed = v17_mail_flow_migration_needed(
                     self.cfg.db_path
                 )
+                v171_migration_needed = v171_consistency_migration_needed(
+                    self.cfg.db_path
+                )
                 v13_migration_needed = v13_mail_migration_needed(self.cfg.db_path)
                 if (
                     archive_migration_needed
@@ -291,11 +322,14 @@ class ApplicationService:
                     or account_migration_needed
                     or agent_migration_needed
                     or v17_migration_needed
+                    or v171_migration_needed
                 ):
                     create_database_backup(
                         self.cfg,
                         label=(
-                            "before_v1_6_agent_ecosystem"
+                            "before_v1_7_1_consistency"
+                            if v171_migration_needed
+                            else "before_v1_6_agent_ecosystem"
                             if agent_migration_needed
                             else "before_v1_7_mail_flow"
                             if v17_migration_needed
@@ -344,6 +378,15 @@ class ApplicationService:
                         "收件规则迁移标记保存失败，旧配置文件已保留",
                     )
         if initialized_now:
+            cleanup_recovery = recover_snapshot_cleanup_transactions(self.cfg)
+            if cleanup_recovery.get("unresolved"):
+                log_event(
+                    self.cfg.db_path,
+                    "WARNING",
+                    "snapshot_cleanup_recovery",
+                    "发件快照清理恢复仍有待处理项；未删除永久邮件事实",
+                )
+            self._run_startup_send_recovery()
             self.schedule_event_maintenance(force=True)
         return ServiceResult(
             OperationStatus.PARTIAL if receive_rule_migration_error else OperationStatus.SUCCESS,
@@ -358,6 +401,43 @@ class ApplicationService:
                 else "初始化完成"
             ),
         )
+
+    def _run_startup_send_recovery(self) -> None:
+        """一次性执行轻量恢复；只恢复归档和对账，绝不调用 SMTP。"""
+        if self._startup_recovery_done:
+            return
+        self._startup_recovery_done = True
+        result = recover_incomplete_send_requests(self.cfg.db_path)
+        recovered = 0
+        failed = 0
+        for request_id in result.get("archive_requests", []):
+            request = query_send_request(self.cfg.db_path, str(request_id))
+            if request is None:
+                continue
+            try:
+                context = self._account_router.context(
+                    str(request["sender_account_id"]), capability="send"
+                )
+                recover_agent_send_archive(
+                    self.cfg,
+                    runtime_cfg=context.config,
+                    send_request_id=str(request_id),
+                )
+                recovered += 1
+            except Exception as exc:  # noqa: BLE001 - 保留材料并等待用户处理
+                failed += 1
+                log_event(
+                    self.cfg.db_path,
+                    "WARNING",
+                    "send_recovery",
+                    "发件归档启动恢复未完成；恢复材料已保留，"
+                    f"错误类型={type(exc).__name__}",
+                )
+        self._startup_recovery_result = {
+            **result,
+            "archive_recovered": recovered,
+            "archive_failed": failed,
+        }
 
     def get_credential_status(self) -> ServiceResult:
         """只返回已配置状态，不返回任何秘密值。"""
@@ -2385,7 +2465,7 @@ class ApplicationService:
             if snapshot.exists() and sha256_of_file(snapshot) != source_sha:
                 raise OSError("同一请求的受控快照内容不一致")
             if not snapshot.exists():
-                shutil.copy2(source, snapshot)
+                atomic_copy_file(source, snapshot)
             if snapshot.stat().st_size != size_bytes or sha256_of_file(snapshot) != source_sha:
                 raise OSError("受控快照与源文件校验不一致")
         except (OSError, ValueError) as exc:
@@ -3306,6 +3386,12 @@ class ApplicationService:
                 sender_display_name=str(
                     context.account.get("display_name") or ""
                 ),
+                own_addresses=[
+                    str(row.get("email_address") or "")
+                    for row in query_mail_accounts(
+                        self.cfg.db_path, enabled_only=True
+                    )
+                ],
                 idempotency_key=request_id,
                 operation=operation,
                 to=to or [],
@@ -3483,6 +3569,234 @@ class ApplicationService:
                 "send_request_id": send_request_id,
                 "send_status": "cancelled",
             },
+        )
+
+    def list_send_recovery_requests(self, limit: int = 100) -> ServiceResult:
+        """GUI 读取待恢复请求；DTO 不包含本机原始路径。"""
+        self.initialize()
+        rows = query_recovery_requests(self.cfg.db_path, limit=limit)
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            details={
+                "requests": [public_send_request(row) for row in rows],
+                "startup_recovery": dict(self._startup_recovery_result),
+            },
+        )
+
+    def reconcile_agent_send_request(
+        self, send_request_id: str
+    ) -> ServiceResult:
+        """手动重跑本地确定性对账；不会调用 SMTP。"""
+        self.initialize()
+        try:
+            request = query_send_request(self.cfg.db_path, send_request_id)
+            if request is None:
+                raise SendRequestError(
+                    "send_request_not_found", "发件请求不存在"
+                )
+            if str(request.get("status") or "") in {
+                "smtp_accepted",
+                "sent_archive_pending",
+                "sent_archive_failed",
+                "recovery_required",
+            } and (
+                request.get("smtp_accepted_at")
+                or str(request.get("delivery_status") or "")
+                in {"sent", "smtp_accepted"}
+            ):
+                context = self._account_router.context(
+                    str(request["sender_account_id"]), capability="send"
+                )
+                recovered = recover_agent_send_archive(
+                    self.cfg,
+                    runtime_cfg=context.config,
+                    send_request_id=send_request_id,
+                )
+                changed = True
+                status = str(recovered.get("status") or "")
+            else:
+                result = reconcile_send_request_locally(
+                    self.cfg.db_path, send_request_id
+                )
+                changed = bool(result.get("changed"))
+                status = str(result.get("status") or "")
+        except (SendRequestError, OutboundMailError, AccountRuntimeError, OSError, ValueError) as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code=getattr(
+                    exc,
+                    "code",
+                    getattr(exc, "error_code", "send_reconciliation_failed"),
+                ),
+                message=str(exc),
+            )
+        current = query_send_request(self.cfg.db_path, send_request_id)
+        return ServiceResult(
+            OperationStatus.SUCCESS if changed else OperationStatus.PARTIAL,
+            message="发件结果已完成对账" if changed else "暂未发现新的确定性证据",
+            details={
+                "changed": changed,
+                "send_status": status,
+                "send_request": public_send_request(current or {}),
+            },
+        )
+
+    def mark_agent_send_resolution(
+        self, send_request_id: str, *, resolution: str
+    ) -> ServiceResult:
+        """仅供 GUI 用户把未知结果标记为已发送或确定未发送。"""
+        self.initialize()
+        recovery_error = ""
+        try:
+            request = mark_send_request_resolution(
+                self.cfg.db_path,
+                send_request_id,
+                resolution=resolution,
+            )
+            if (
+                resolution == "sent"
+                and str(request.get("status") or "") == "sent_archive_failed"
+            ):
+                context = self._account_router.context(
+                    str(request["sender_account_id"]), capability="send"
+                )
+                recover_agent_send_archive(
+                    self.cfg,
+                    runtime_cfg=context.config,
+                    send_request_id=send_request_id,
+                )
+                request = query_send_request(
+                    self.cfg.db_path, send_request_id
+                ) or request
+        except (
+            ValueError,
+            sqlite3.Error,
+            OSError,
+            OutboundMailError,
+            AccountRuntimeError,
+            CredentialError,
+        ) as exc:
+            current = query_send_request(self.cfg.db_path, send_request_id)
+            if (
+                resolution == "sent"
+                and current is not None
+                and str(current.get("status") or "") == "sent_archive_failed"
+            ):
+                recovery_error = type(exc).__name__
+                request = current
+            else:
+                return ServiceResult(
+                    OperationStatus.FAILED,
+                    error_code="invalid_send_resolution",
+                    message=str(exc),
+                )
+        if recovery_error:
+            return ServiceResult(
+                OperationStatus.PARTIAL,
+                error_code="manual_sent_archive_pending",
+                message="已记录邮件确认发送；本地归档仍需恢复",
+                details={"send_request": public_send_request(request)},
+            )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            message=(
+                "已记录用户确认：邮件已发送"
+                if resolution == "sent"
+                else "已记录用户确认：邮件确定未发送"
+            ),
+            details={"send_request": public_send_request(request)},
+        )
+
+    def clone_agent_send_request(
+        self, send_request_id: str
+    ) -> ServiceResult:
+        """基于原固定内容创建新的 confirm 请求和全新幂等键。"""
+        self.initialize()
+        try:
+            original = query_send_request(self.cfg.db_path, send_request_id)
+            if original is None:
+                raise SendRequestError(
+                    "send_request_not_found", "发件请求不存在"
+                )
+            if str(original.get("status") or "") not in {
+                "definitely_not_sent",
+                "failed",
+                "delivery_unknown",
+            }:
+                raise OutboundMailError(
+                    "invalid_send_state", "当前状态不能创建新的发送请求"
+                )
+            client_id = str(original["client_id"])
+            identity = self._current_send_identity(client_id)
+            self._authorize_persisted_send(identity, original)
+            context = self._account_router.context(
+                str(original["sender_account_id"]), capability="send"
+            )
+            source_message = None
+            source_package_id = str(original.get("source_package_id") or "")
+            if str(original.get("operation") or "new") != "new":
+                source_message = self._authorized_source_message(
+                    identity, source_package_id
+                )
+            grouped: dict[str, list[str]] = {"to": [], "cc": [], "bcc": []}
+            for item in original.get("recipients") or []:
+                kind = str(item.get("recipient_type") or "")
+                if kind in grouped:
+                    grouped[kind].append(str(item.get("email_address") or ""))
+            attachments = [
+                {
+                    "path": str(item.get("snapshot_path") or ""),
+                    "display_name": str(item.get("display_name") or ""),
+                    "mime_type": str(item.get("mime_type") or ""),
+                    "source_kind": "recovery_clone",
+                }
+                for item in original.get("attachments") or []
+            ]
+            created, _ = prepare_agent_send(
+                self.cfg,
+                client_id=client_id,
+                send_mode="confirm",
+                sender_account_id=str(original["sender_account_id"]),
+                sender_address=str(context.account["email_address"]),
+                sender_display_name=str(context.account.get("display_name") or ""),
+                own_addresses=[
+                    str(row.get("email_address") or "")
+                    for row in query_mail_accounts(
+                        self.cfg.db_path, enabled_only=True
+                    )
+                ],
+                idempotency_key=f"recovery-{uuid.uuid4().hex}",
+                operation=str(original.get("operation") or "new"),
+                to=grouped["to"],
+                cc=grouped["cc"],
+                bcc=grouped["bcc"],
+                subject=str(original.get("subject") or ""),
+                body_text=str(original.get("body_text") or ""),
+                body_html=str(original.get("body_html") or ""),
+                source_message=source_message,
+                attachments=attachments,
+            )
+        except (
+            AgentAccessError,
+            AccountRuntimeError,
+            OutboundMailError,
+            SendRequestError,
+            OSError,
+            ValueError,
+        ) as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code=getattr(
+                    exc,
+                    "code",
+                    getattr(exc, "error_code", "send_clone_failed"),
+                ),
+                message=str(exc),
+            )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            message="已创建新的待确认发件请求，旧请求保持不变",
+            details={"send_request": created},
         )
 
     def _execute_send_request(
@@ -5244,6 +5558,71 @@ class ApplicationService:
                 message=f"读取维护状态失败：{exc}",
             )
 
+    def get_mail_health_status(self) -> ServiceResult:
+        self.initialize()
+        try:
+            health = get_mail_health(self.cfg)
+        except (OSError, sqlite3.Error) as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="mail_health_failed",
+                message=f"邮件运行状态读取失败：{type(exc).__name__}",
+            )
+        return ServiceResult(OperationStatus.SUCCESS, details=health)
+
+    def preview_safe_cleanup(self) -> ServiceResult:
+        self.initialize()
+        try:
+            details = preview_send_snapshot_cleanup(self.cfg)
+        except (OSError, sqlite3.Error, SecurityError) as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="cleanup_preview_failed",
+                message=f"安全清理预览失败：{type(exc).__name__}",
+            )
+        return ServiceResult(
+            OperationStatus.SUCCESS,
+            message="已生成安全清理预览，尚未删除任何文件",
+            details=details,
+        )
+
+    def execute_safe_cleanup(
+        self,
+        *,
+        confirmed: bool = False,
+        request_ids: list[str] | None = None,
+    ) -> ServiceResult:
+        self.initialize()
+        if not confirmed:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="cleanup_confirmation_required",
+                message="执行安全清理前必须由用户明确确认",
+            )
+        try:
+            details = cleanup_send_snapshots(
+                self.cfg,
+                dry_run=False,
+                request_ids=request_ids,
+            )
+        except (OSError, sqlite3.Error, SecurityError) as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="safe_cleanup_failed",
+                message=f"安全清理失败：{type(exc).__name__}",
+            )
+        return ServiceResult(
+            OperationStatus.PARTIAL
+            if details.get("failed_count")
+            else OperationStatus.SUCCESS,
+            message=(
+                "安全清理部分完成"
+                if details.get("failed_count")
+                else "安全清理完成"
+            ),
+            details=details,
+        )
+
     def create_backup(self) -> ServiceResult:
         self.initialize()
         if not self._maintenance_lock.acquire(blocking=False):
@@ -5324,6 +5703,9 @@ class ApplicationService:
         self.initialize()
         try:
             details = scan_consistency(self.cfg)
+            details["repair_preview"] = list_consistency_repair_candidates(
+                self.cfg, scan_id=str(details["scan_id"])
+            )
             return ServiceResult(
                 OperationStatus.SUCCESS,
                 message=f"一致性扫描完成，发现 {len(details['issues'])} 项",
@@ -5334,6 +5716,171 @@ class ApplicationService:
                 OperationStatus.FAILED, error_code="consistency_scan_failed",
                 message=f"一致性扫描失败：{exc}",
             )
+
+    def apply_consistency_repair(
+        self,
+        *,
+        scan_id: str,
+        issue_id: str,
+        confirmed: bool = False,
+    ) -> ServiceResult:
+        """备份后只执行一个白名单修复动作，且任何动作都不会发送邮件。"""
+        self.initialize()
+        if not confirmed:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="consistency_repair_confirmation_required",
+                message="一致性修复前必须由用户明确确认",
+            )
+        if not self._maintenance_lock.acquire(blocking=False):
+            return ServiceResult(
+                OperationStatus.CANCELLED,
+                error_code="maintenance_busy",
+                message="已有维护任务正在运行",
+            )
+        repair: dict[str, str] | None = None
+        try:
+            repair = begin_consistency_repair(
+                self.cfg, scan_id=scan_id, issue_id=issue_id
+            )
+            try:
+                backup = create_database_backup(
+                    self.cfg, label="before_consistency_repair"
+                )
+                mark_consistency_repair_backup(
+                    self.cfg,
+                    repair_id=repair["repair_id"],
+                    backup_name=str(backup["database_file"]),
+                )
+            except Exception as exc:  # noqa: BLE001
+                finish_consistency_repair(
+                    self.cfg,
+                    repair_id=repair["repair_id"],
+                    status="failed",
+                    changed=False,
+                    result_code=f"backup_{type(exc).__name__}",
+                )
+                return ServiceResult(
+                    OperationStatus.FAILED,
+                    error_code="consistency_repair_backup_failed",
+                    message="修复前数据库备份失败，未执行任何修复",
+                )
+            try:
+                changed, result_code = self._execute_consistency_repair_action(
+                    repair
+                )
+            except Exception as exc:  # noqa: BLE001
+                error_code = getattr(
+                    exc, "code", f"repair_{type(exc).__name__}"
+                )
+                finish_consistency_repair(
+                    self.cfg,
+                    repair_id=repair["repair_id"],
+                    status="failed",
+                    changed=False,
+                    result_code=str(error_code),
+                )
+                return ServiceResult(
+                    OperationStatus.FAILED,
+                    error_code=str(error_code),
+                    message="所选一致性问题未能安全修复，原数据已保留",
+                )
+            finish_consistency_repair(
+                self.cfg,
+                repair_id=repair["repair_id"],
+                status="completed" if changed else "no_change",
+                changed=changed,
+                result_code=result_code,
+            )
+            current = scan_consistency(self.cfg)
+            current["repair_preview"] = list_consistency_repair_candidates(
+                self.cfg, scan_id=str(current["scan_id"])
+            )
+            return ServiceResult(
+                OperationStatus.SUCCESS if changed else OperationStatus.PARTIAL,
+                message=(
+                    "所选一致性问题已修复并完成审计"
+                    if changed
+                    else "未发现足够的确定性证据，问题保持不变"
+                ),
+                details={
+                    "repair_id": repair["repair_id"],
+                    "action": repair["action"],
+                    "changed": changed,
+                    "result_code": result_code,
+                    "backup_name": str(backup["database_file"]),
+                    "scan": current,
+                },
+            )
+        except ConsistencyRepairError as exc:
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code=exc.code,
+                message=str(exc),
+            )
+        except Exception as exc:  # noqa: BLE001
+            if repair is not None:
+                try:
+                    finish_consistency_repair(
+                        self.cfg,
+                        repair_id=repair["repair_id"],
+                        status="failed",
+                        changed=False,
+                        result_code=f"unexpected_{type(exc).__name__}",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            return ServiceResult(
+                OperationStatus.FAILED,
+                error_code="consistency_repair_failed",
+                message=f"一致性修复失败：{type(exc).__name__}",
+            )
+        finally:
+            self._maintenance_lock.release()
+
+    def _execute_consistency_repair_action(
+        self, repair: dict[str, str]
+    ) -> tuple[bool, str]:
+        action = repair["action"]
+        request_id = repair["entity_id"]
+        if action == "expire_pending_request":
+            result = expire_send_request_if_due(
+                self.cfg.db_path, request_id
+            )
+            return bool(result["changed"]), (
+                "expired" if result["changed"] else "state_changed"
+            )
+        if action in {"recover_stale_send_lease", "recover_send_state"}:
+            recovery = recover_incomplete_send_request(
+                self.cfg.db_path, request_id
+            )
+            changed = bool(recovery.get("changed"))
+            result_code = str(recovery.get("outcome") or "unchanged")
+            if recovery.get("archive_required"):
+                archived = self.reconcile_agent_send_request(request_id)
+                if archived.status == OperationStatus.FAILED:
+                    raise ConsistencyRepairError(
+                        archived.error_code or "send_archive_recovery_failed",
+                        "发件归档恢复失败",
+                    )
+                changed = changed or bool(archived.details.get("changed"))
+                result_code = str(
+                    archived.details.get("send_status") or result_code
+                )
+            return changed, result_code
+        if action in {"recover_sent_archive", "reconcile_send_locally"}:
+            result = self.reconcile_agent_send_request(request_id)
+            if result.status == OperationStatus.FAILED:
+                raise ConsistencyRepairError(
+                    result.error_code or "send_reconciliation_failed",
+                    "发件恢复失败",
+                )
+            return bool(result.details.get("changed")), str(
+                result.details.get("send_status") or "unchanged"
+            )
+        raise ConsistencyRepairError(
+            "consistency_repair_not_allowed", "所选修复动作不在安全白名单中"
+        )
 
     def export_maintenance_report(self, destination: str | Path) -> ServiceResult:
         self.initialize()
@@ -5505,8 +6052,11 @@ class ApplicationService:
                     "",
                 ]
             )
-            report_path.parent.mkdir(parents=True, exist_ok=True)
-            report_path.write_text("\n".join(report_lines), encoding="utf-8", errors="strict")
+            atomic_write_text(
+                report_path,
+                "\n".join(report_lines),
+                errors="strict",
+            )
         except OSError as exc:
             return ServiceResult(
                 OperationStatus.FAILED,

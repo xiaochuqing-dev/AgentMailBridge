@@ -116,8 +116,7 @@ CREATE TABLE IF NOT EXISTS received_messages (
     gmail_thread_id TEXT,
     backend TEXT,
     package_id TEXT,
-    account_id TEXT,
-    UNIQUE(account_id, message_id COLLATE NOCASE)
+    account_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS received_files (
@@ -348,7 +347,7 @@ CREATE TABLE IF NOT EXISTS history_import_runs (
 
 CREATE TABLE IF NOT EXISTS mail_packages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    package_id TEXT NOT NULL UNIQUE,
+    package_id TEXT NOT NULL,
     account_ref TEXT NOT NULL,
     account_id TEXT,
     mailbox_ref TEXT NOT NULL,
@@ -358,6 +357,15 @@ CREATE TABLE IF NOT EXISTS mail_packages (
     provider_message_id TEXT,
     thread_ref TEXT,
     direction TEXT NOT NULL DEFAULT 'inbound',
+    identity_fingerprint TEXT,
+    direction_evidence_json TEXT NOT NULL DEFAULT '[]',
+    direction_conflict INTEGER NOT NULL DEFAULT 0,
+    source_type TEXT NOT NULL DEFAULT 'provider_sync',
+    first_seen_at TEXT,
+    last_verified_at TEXT,
+    date_header_raw TEXT,
+    declared_at TEXT,
+    observed_at TEXT,
     in_reply_to_raw TEXT,
     references_raw TEXT,
     reply_to_package_id TEXT,
@@ -399,8 +407,7 @@ CREATE TABLE IF NOT EXISTS mail_packages (
     last_error TEXT,
     legacy INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE (account_ref, message_id COLLATE NOCASE)
+    updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS mail_resources (
@@ -456,7 +463,8 @@ CREATE TABLE IF NOT EXISTS outbound_messages (
     legacy_sent_file_id INTEGER UNIQUE,
     created_at TEXT NOT NULL,
     sent_at TEXT,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    reconciliation_status TEXT NOT NULL DEFAULT 'waiting'
 );
 
 CREATE TABLE IF NOT EXISTS outbound_resources (
@@ -500,8 +508,16 @@ CREATE TABLE IF NOT EXISTS mailbox_sync_states (
     highestmodseq INTEGER,
     last_uid INTEGER NOT NULL DEFAULT 0,
     checkpoint_json TEXT NOT NULL DEFAULT '{}',
+    current_attempt_json TEXT NOT NULL DEFAULT '{}',
     last_check_at TEXT,
+    last_attempt_at TEXT,
     last_success_at TEXT,
+    last_error_at TEXT,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    reconciliation_required INTEGER NOT NULL DEFAULT 0,
+    full_rescan_cursor TEXT,
+    server_snapshot_json TEXT NOT NULL DEFAULT '{}',
+    uidvalidity_changed_at TEXT,
     last_result TEXT,
     last_error TEXT,
     updated_at TEXT NOT NULL,
@@ -519,6 +535,10 @@ CREATE TABLE IF NOT EXISTS mail_package_mailboxes (
     provider_uid TEXT,
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL,
+    currently_present INTEGER NOT NULL DEFAULT 1,
+    removed_at TEXT,
+    source TEXT NOT NULL DEFAULT 'sync_observed',
+    reconciliation_status TEXT NOT NULL DEFAULT 'observed',
     FOREIGN KEY(package_id) REFERENCES mail_packages(package_id) ON DELETE CASCADE,
     FOREIGN KEY(mailbox_id) REFERENCES mailboxes(mailbox_id),
     UNIQUE(package_id, mailbox_id)
@@ -543,6 +563,12 @@ CREATE TABLE IF NOT EXISTS send_requests (
     confirmed_by TEXT,
     cancelled_at TEXT,
     smtp_attempt_count INTEGER NOT NULL DEFAULT 0,
+    current_stage TEXT NOT NULL DEFAULT 'created',
+    recovery_required INTEGER NOT NULL DEFAULT 0,
+    smtp_accepted_at TEXT,
+    sent_reconciliation_status TEXT NOT NULL DEFAULT 'not_started',
+    last_reconciled_at TEXT,
+    snapshot_cleaned_at TEXT,
     delivery_status TEXT,
     provider_result TEXT,
     error_code TEXT,
@@ -605,10 +631,111 @@ CREATE TABLE IF NOT EXISTS sent_server_mappings (
     provider_uid TEXT,
     message_id TEXT,
     matched_by TEXT NOT NULL,
+    confidence TEXT NOT NULL DEFAULT 'high',
+    reconciliation_status TEXT NOT NULL DEFAULT 'matched',
     matched_at TEXT NOT NULL,
     details_json TEXT NOT NULL DEFAULT '{}',
     FOREIGN KEY(package_id) REFERENCES mail_packages(package_id),
     UNIQUE(account_id, mailbox_id, provider_message_id, provider_uid)
+);
+
+CREATE TABLE IF NOT EXISTS send_execution_leases (
+    send_request_id TEXT PRIMARY KEY,
+    lease_owner TEXT NOT NULL,
+    process_id TEXT NOT NULL,
+    acquired_at TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    lease_expires_at TEXT NOT NULL,
+    attempt_no INTEGER NOT NULL,
+    current_stage TEXT NOT NULL,
+    fixed_message_id TEXT NOT NULL,
+    fixed_mime_sha256 TEXT,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(send_request_id) REFERENCES send_requests(send_request_id)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS send_attempt_events (
+    event_id TEXT PRIMARY KEY,
+    send_request_id TEXT NOT NULL,
+    attempt_no INTEGER NOT NULL,
+    stage TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(send_request_id) REFERENCES send_requests(send_request_id)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS reconciliation_records (
+    reconciliation_id TEXT PRIMARY KEY,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    account_id TEXT,
+    package_id TEXT,
+    send_request_id TEXT,
+    mailbox_id TEXT,
+    status TEXT NOT NULL,
+    evidence_type TEXT NOT NULL,
+    confidence TEXT NOT NULL,
+    candidate_count INTEGER NOT NULL DEFAULT 0,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    resolved_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS cleanup_records (
+    cleanup_id TEXT PRIMARY KEY,
+    dry_run INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL,
+    eligible_count INTEGER NOT NULL DEFAULT 0,
+    cleaned_count INTEGER NOT NULL DEFAULT 0,
+    estimated_bytes INTEGER NOT NULL DEFAULT 0,
+    released_bytes INTEGER NOT NULL DEFAULT 0,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS health_issues (
+    issue_id TEXT PRIMARY KEY,
+    category TEXT NOT NULL,
+    issue_code TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'open',
+    details_json TEXT NOT NULL DEFAULT '{}',
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    resolved_at TEXT,
+    UNIQUE(issue_code, entity_type, entity_id)
+);
+
+CREATE TABLE IF NOT EXISTS consistency_scan_runs (
+    scan_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    issue_count INTEGER NOT NULL DEFAULT 0,
+    summary_json TEXT NOT NULL DEFAULT '{}',
+    started_at TEXT NOT NULL,
+    completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS consistency_repair_runs (
+    repair_id TEXT PRIMARY KEY,
+    scan_id TEXT NOT NULL,
+    issue_id TEXT NOT NULL,
+    issue_code TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    status TEXT NOT NULL,
+    backup_name TEXT,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    FOREIGN KEY(scan_id) REFERENCES consistency_scan_runs(scan_id)
 );
 
 CREATE TABLE IF NOT EXISTS mail_thread_relations (
@@ -769,6 +896,16 @@ CREATE INDEX IF NOT EXISTS idx_send_requests_status
     ON send_requests(status, expires_at, created_at);
 CREATE INDEX IF NOT EXISTS idx_sent_server_package
     ON sent_server_mappings(package_id, matched_at DESC);
+CREATE INDEX IF NOT EXISTS idx_send_leases_expiry
+    ON send_execution_leases(lease_expires_at, current_stage);
+CREATE INDEX IF NOT EXISTS idx_send_attempt_events_request
+    ON send_attempt_events(send_request_id, attempt_no, created_at);
+CREATE INDEX IF NOT EXISTS idx_reconciliation_status
+    ON reconciliation_records(status, entity_type, last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_health_issues_state
+    ON health_issues(state, severity, last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_consistency_repairs_issue
+    ON consistency_repair_runs(issue_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_thread_relations_account
     ON mail_thread_relations(account_id, package_id);
 """
@@ -914,6 +1051,54 @@ _SEND_REQUEST_V17_COLUMNS = {
     "mime_built_at": "TEXT",
 }
 
+_MAIL_PACKAGES_V171_COLUMNS = {
+    "identity_fingerprint": "TEXT",
+    "direction_evidence_json": "TEXT NOT NULL DEFAULT '[]'",
+    "direction_conflict": "INTEGER NOT NULL DEFAULT 0",
+    "source_type": "TEXT NOT NULL DEFAULT 'provider_sync'",
+    "first_seen_at": "TEXT",
+    "last_verified_at": "TEXT",
+    "date_header_raw": "TEXT",
+    "declared_at": "TEXT",
+    "observed_at": "TEXT",
+}
+
+_OUTBOUND_MESSAGES_V171_COLUMNS = {
+    "reconciliation_status": "TEXT NOT NULL DEFAULT 'waiting'",
+}
+
+_MAILBOX_SYNC_V171_COLUMNS = {
+    "current_attempt_json": "TEXT NOT NULL DEFAULT '{}'",
+    "last_attempt_at": "TEXT",
+    "last_error_at": "TEXT",
+    "consecutive_failures": "INTEGER NOT NULL DEFAULT 0",
+    "reconciliation_required": "INTEGER NOT NULL DEFAULT 0",
+    "full_rescan_cursor": "TEXT",
+    "server_snapshot_json": "TEXT NOT NULL DEFAULT '{}'",
+    "uidvalidity_changed_at": "TEXT",
+}
+
+_PACKAGE_MAILBOX_V171_COLUMNS = {
+    "currently_present": "INTEGER NOT NULL DEFAULT 1",
+    "removed_at": "TEXT",
+    "source": "TEXT NOT NULL DEFAULT 'sync_observed'",
+    "reconciliation_status": "TEXT NOT NULL DEFAULT 'observed'",
+}
+
+_SEND_REQUEST_V171_COLUMNS = {
+    "current_stage": "TEXT NOT NULL DEFAULT 'created'",
+    "recovery_required": "INTEGER NOT NULL DEFAULT 0",
+    "smtp_accepted_at": "TEXT",
+    "sent_reconciliation_status": "TEXT NOT NULL DEFAULT 'not_started'",
+    "last_reconciled_at": "TEXT",
+    "snapshot_cleaned_at": "TEXT",
+}
+
+_SENT_MAPPING_V171_COLUMNS = {
+    "confidence": "TEXT NOT NULL DEFAULT 'high'",
+    "reconciliation_status": "TEXT NOT NULL DEFAULT 'matched'",
+}
+
 _RECEIVE_RULE_EVALUATIONS_V14_COLUMNS = {
     "account_id": "TEXT",
 }
@@ -928,6 +1113,8 @@ AGENT_INTEGRATION_MIGRATION_KEY = "agent_integration_permission_v1"
 AGENT_INTEGRATION_SCHEMA_VERSION = 2
 V17_MAIL_FLOW_MIGRATION_KEY = "mail_flow_v17"
 V17_MAIL_FLOW_SCHEMA_VERSION = 1
+V171_CONSISTENCY_MIGRATION_KEY = "mail_consistency_v171"
+V171_CONSISTENCY_SCHEMA_VERSION = 3
 LEGACY_UNKNOWN_ACCOUNT_ID = stable_account_id("generic", "legacy-unknown")
 
 _AGENT_CLIENT_V16_COLUMNS = {
@@ -957,6 +1144,12 @@ def init_db(
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with _get_conn(db_path) as conn:
+        rebuild_identity_tables = _legacy_message_identity_rebuild_needed(conn)
+        if rebuild_identity_tables:
+            # SQLite requires foreign_keys to be disabled before BEGIN while a
+            # referenced parent table is rebuilt.  The transaction and the
+            # explicit foreign_key_check below keep the migration atomic.
+            conn.execute("PRAGMA foreign_keys = OFF")
         try:
             conn.execute("BEGIN IMMEDIATE")
             _execute_schema(conn)
@@ -971,14 +1164,24 @@ def init_db(
             _migrate_receive_rule_evaluations_v14(conn)
             _add_missing_columns(conn, "mail_accounts", _MAIL_ACCOUNTS_V141_COLUMNS)
             _migrate_mail_flow_v17(conn)
+            _migrate_mail_consistency_v171(conn)
             _migrate_multi_account_core(conn, tuple(legacy_accounts or ()))
             _ensure_unique_indexes(conn)
             _backfill_legacy_outbound_messages(conn)
             _backfill_multi_account_ownership(conn, tuple(legacy_accounts or ()))
+            if rebuild_identity_tables:
+                violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+                if violations:
+                    raise sqlite3.IntegrityError(
+                        "v1.7.1 邮件身份迁移产生外键不一致"
+                    )
             conn.commit()
         except Exception:
             conn.rollback()
             raise
+        finally:
+            if rebuild_identity_tables:
+                conn.execute("PRAGMA foreign_keys = ON")
 
 
 def _execute_schema(conn: sqlite3.Connection) -> None:
@@ -1107,6 +1310,111 @@ def _add_missing_columns(
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
 
 
+def _unique_index_columns(
+    conn: sqlite3.Connection, table: str
+) -> list[tuple[str, ...]]:
+    """Return unique-index column sets using SQLite's schema metadata."""
+    result: list[tuple[str, ...]] = []
+    for index in conn.execute(f"PRAGMA index_list({table})").fetchall():
+        if not int(index["unique"]):
+            continue
+        name = str(index["name"])
+        columns = tuple(
+            str(row["name"] or "").casefold()
+            for row in conn.execute(
+                f'PRAGMA index_info("{name.replace(chr(34), chr(34) * 2)}")'
+            ).fetchall()
+        )
+        result.append(columns)
+    return result
+
+
+def _legacy_message_identity_rebuild_needed(conn: sqlite3.Connection) -> bool:
+    """Detect v1.7 constraints that incorrectly made Message-ID an identity."""
+    tables = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "mail_packages" in tables and (
+        ("account_ref", "message_id")
+        in _unique_index_columns(conn, "mail_packages")
+        or ("account_id", "message_id")
+        in _unique_index_columns(conn, "mail_packages")
+    ):
+        return True
+    if "received_messages" in tables:
+        unique_sets = _unique_index_columns(conn, "received_messages")
+        if (("message_id",) in unique_sets
+                or ("account_id", "message_id") in unique_sets):
+            return True
+    return False
+
+
+def _quote_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _rebuild_table_without_message_identity_unique(
+    conn: sqlite3.Connection, table: str
+) -> None:
+    """Rebuild one legacy table from PRAGMA metadata without Message-ID UNIQUE."""
+    columns = [
+        row for row in conn.execute(f"PRAGMA table_xinfo({table})").fetchall()
+        if int(row["hidden"] or 0) == 0
+    ]
+    if not columns:
+        return
+    temp_table = f"__v171_{table}"
+    conn.execute(f"DROP TABLE IF EXISTS {_quote_identifier(temp_table)}")
+    definitions: list[str] = []
+    for row in columns:
+        name = str(row["name"])
+        declared_type = str(row["type"] or "").strip()
+        definition = _quote_identifier(name)
+        if declared_type:
+            definition += f" {declared_type}"
+        if int(row["pk"] or 0):
+            definition += " PRIMARY KEY"
+            if declared_type.casefold() == "integer":
+                definition += " AUTOINCREMENT"
+        else:
+            if int(row["notnull"] or 0):
+                definition += " NOT NULL"
+            if row["dflt_value"] is not None:
+                definition += f" DEFAULT {row['dflt_value']}"
+        definitions.append(definition)
+    conn.execute(
+        f"CREATE TABLE {_quote_identifier(temp_table)} "
+        f"({', '.join(definitions)})"
+    )
+    column_sql = ", ".join(
+        _quote_identifier(str(row["name"])) for row in columns
+    )
+    conn.execute(
+        f"INSERT INTO {_quote_identifier(temp_table)} ({column_sql}) "
+        f"SELECT {column_sql} FROM {_quote_identifier(table)}"
+    )
+    conn.execute(f"DROP TABLE {_quote_identifier(table)}")
+    conn.execute(
+        f"ALTER TABLE {_quote_identifier(temp_table)} "
+        f"RENAME TO {_quote_identifier(table)}"
+    )
+
+
+def _remove_legacy_message_identity_constraints(conn: sqlite3.Connection) -> None:
+    """Preserve every row/id while allowing distinct facts with reused Message-ID."""
+    package_uniques = _unique_index_columns(conn, "mail_packages")
+    if (("account_ref", "message_id") in package_uniques
+            or ("account_id", "message_id") in package_uniques):
+        _rebuild_table_without_message_identity_unique(conn, "mail_packages")
+    received_uniques = _unique_index_columns(conn, "received_messages")
+    if (("message_id",) in received_uniques
+            or ("account_id", "message_id") in received_uniques):
+        _rebuild_table_without_message_identity_unique(conn, "received_messages")
+
+
 def _migrate_mail_packages_v14(conn: sqlite3.Connection) -> None:
     _add_missing_columns(conn, "mail_packages", _MAIL_PACKAGES_V14_COLUMNS)
 
@@ -1166,6 +1474,141 @@ def _migrate_mail_flow_v17(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_mail_consistency_v171(conn: sqlite3.Connection) -> None:
+    """增量增加一致性与恢复事实，不改写旧 raw、Hash 或稳定身份。"""
+    _add_missing_columns(conn, "mail_packages", _MAIL_PACKAGES_V171_COLUMNS)
+    _add_missing_columns(
+        conn, "outbound_messages", _OUTBOUND_MESSAGES_V171_COLUMNS
+    )
+    _add_missing_columns(conn, "mailbox_sync_states", _MAILBOX_SYNC_V171_COLUMNS)
+    _add_missing_columns(
+        conn, "mail_package_mailboxes", _PACKAGE_MAILBOX_V171_COLUMNS
+    )
+    _add_missing_columns(conn, "send_requests", _SEND_REQUEST_V171_COLUMNS)
+    _add_missing_columns(
+        conn, "sent_server_mappings", _SENT_MAPPING_V171_COLUMNS
+    )
+    _remove_legacy_message_identity_constraints(conn)
+    package_columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(mail_packages)").fetchall()
+    }
+
+    def available_coalesce(*columns: str) -> str:
+        available = [column for column in columns if column in package_columns]
+        if len(available) == 1:
+            return available[0]
+        return f"COALESCE({', '.join(available)})"
+
+    first_seen = available_coalesce(
+        "first_seen_at", "created_at", "saved_at", "received_at"
+    )
+    last_verified = available_coalesce(
+        "last_verified_at", "updated_at", "saved_at", "first_seen_at",
+        "received_at",
+    )
+    declared = available_coalesce("declared_at", "received_at")
+    observed = available_coalesce(
+        "observed_at", "first_seen_at", "saved_at", "received_at"
+    )
+    now = _now()
+    conn.execute(
+        f"""
+        UPDATE mail_packages
+        SET first_seen_at={first_seen},
+            last_verified_at={last_verified},
+            declared_at={declared},
+            observed_at={observed},
+            direction_evidence_json=CASE
+                WHEN direction_evidence_json IS NULL OR direction_evidence_json='[]'
+                THEN json_array(json_object(
+                    'type', 'v1.7_migrated_direction',
+                    'direction', direction,
+                    'confidence', 'legacy'))
+                ELSE direction_evidence_json
+            END
+        """
+    )
+    conn.execute(
+        """
+        UPDATE mail_package_mailboxes
+        SET currently_present=COALESCE(currently_present, 1),
+            source=CASE WHEN source='sync_observed'
+                        THEN 'v1.7_mailbox_backfill' ELSE source END,
+            reconciliation_status=COALESCE(reconciliation_status, 'observed')
+        """
+    )
+    conn.execute(
+        """
+        UPDATE mailbox_sync_states
+        SET last_attempt_at=COALESCE(last_attempt_at, last_check_at),
+            last_error_at=CASE WHEN last_error IS NOT NULL
+                               THEN COALESCE(last_error_at, last_check_at)
+                               ELSE last_error_at END
+        """
+    )
+    conn.execute(
+        """
+        UPDATE send_requests
+        SET current_stage=CASE
+            WHEN current_stage='created' AND status='pending_confirmation'
+                THEN 'pending_confirmation'
+            WHEN current_stage='created' AND status='ready_to_send'
+                THEN 'ready'
+            WHEN current_stage='created' AND status='sending'
+                THEN 'legacy_sending'
+            WHEN current_stage='created' AND status='sent_archive_failed'
+                THEN 'sent_archive_failed'
+            WHEN current_stage='created' AND status='delivery_unknown'
+                THEN 'delivery_unknown'
+            WHEN current_stage='created' AND status='sent'
+                THEN 'local_archive_complete'
+            ELSE current_stage END,
+            recovery_required=CASE
+                WHEN status IN ('sending', 'sent_archive_failed',
+                                'delivery_unknown') THEN 1
+                ELSE recovery_required END,
+            sent_reconciliation_status=CASE
+                WHEN status='sent' AND sent_reconciliation_status='not_started'
+                    THEN 'waiting'
+                ELSE sent_reconciliation_status END
+        """
+    )
+    details = json.dumps(
+        {
+            "mail_packages_moved": False,
+            "raw_rewritten": False,
+            "hashes_recalculated": False,
+            "stable_ids_changed": False,
+            "message_id_unique_constraints_removed": True,
+            "legacy_memberships_preserved": True,
+            "legacy_recovery_material_preserved": True,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    conn.execute(
+        """
+        INSERT INTO migration_metadata
+            (migration_key, schema_version, status, details_json,
+             started_at, completed_at, updated_at)
+        VALUES (?, ?, 'completed', ?, ?, ?, ?)
+        ON CONFLICT(migration_key) DO UPDATE SET
+            schema_version=excluded.schema_version,
+            status='completed',
+            details_json=excluded.details_json,
+            completed_at=excluded.completed_at,
+            updated_at=excluded.updated_at
+        """,
+        (
+            V171_CONSISTENCY_MIGRATION_KEY,
+            V171_CONSISTENCY_SCHEMA_VERSION,
+            details,
+            now,
+            now,
+            now,
+        ),
+    )
 def _upsert_account_record(conn: sqlite3.Connection, account: MailAccount) -> None:
     values = account.to_record()
     now = _now()
@@ -1642,14 +2085,18 @@ def _backfill_multi_account_ownership(
 
 def _ensure_unique_indexes(conn: sqlite3.Connection) -> None:
     """数据库层阻止跨后端重复邮件和重复发送请求。"""
-    try:
-        conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS ux_received_account_message_id "
-            "ON received_messages(account_id, message_id COLLATE NOCASE)"
-        )
-    except sqlite3.IntegrityError:
-        # 旧库若已有仅大小写不同的历史记录，不破坏启动；新写入仍使用归一化键。
-        pass
+    conn.execute("DROP INDEX IF EXISTS ux_received_account_message_id")
+    conn.execute("DROP INDEX IF EXISTS ux_mail_packages_account_message")
+    conn.execute("DROP INDEX IF EXISTS ux_mail_packages_provider_identity")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_received_messages_package "
+        "ON received_messages(package_id) "
+        "WHERE package_id IS NOT NULL AND package_id != ''"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_received_account_message_id "
+        "ON received_messages(account_id, message_id COLLATE NOCASE)"
+    )
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_sent_request_id "
         "ON sent_files(request_id) WHERE request_id IS NOT NULL"
@@ -1679,14 +2126,34 @@ def _ensure_unique_indexes(conn: sqlite3.Connection) -> None:
         "ON received_files(resource_id) WHERE resource_id IS NOT NULL"
     )
     conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS ux_mail_packages_provider_identity "
-        "ON mail_packages(account_ref, backend, provider_message_id) "
-        "WHERE provider_message_id IS NOT NULL AND provider_message_id != ''"
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_mail_packages_package_id "
+        "ON mail_packages(package_id)"
     )
     conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS ux_mail_packages_account_message "
-        "ON mail_packages(account_id, message_id COLLATE NOCASE) "
-        "WHERE account_id IS NOT NULL AND account_id != ''"
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_mail_packages_provider_identity "
+        "ON mail_packages(account_id, backend, provider_message_id) "
+        "WHERE backend='gmail_api' AND provider_message_id IS NOT NULL "
+        "AND provider_message_id != ''"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_mail_packages_account_message "
+        "ON mail_packages(account_id, message_id COLLATE NOCASE)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_mail_packages_received "
+        "ON mail_packages(received_at DESC, id DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_mail_packages_thread "
+        "ON mail_packages(account_ref, thread_ref, received_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_mail_packages_mailbox "
+        "ON mail_packages(account_ref, mailbox_ref, received_at DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_received_messages_saved_date "
+        "ON received_messages(saved_date)"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_mail_packages_account_mailbox "
@@ -1879,14 +2346,24 @@ def insert_received_message(
     backend: str | None = None,
     account_id: str | None = None,
 ) -> int | None:
-    """插入一条收件记录。若 message_id 已存在则忽略并返回 None。
+    """插入一条旧兼容收件记录。若 message_id 已存在则返回 None。
 
     source/gmail_message_id/gmail_thread_id/backend 为 Gmail API 后端
     新增的可选字段，旧调用方可不传（兼容 IMAP 既有逻辑）。
     """
     now = _now()
+    resolved_account_id = account_id or LEGACY_UNKNOWN_ACCOUNT_ID
     with _get_conn(db_path) as conn:
         try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT 1 FROM received_messages "
+                "WHERE account_id=? AND message_id=? COLLATE NOCASE LIMIT 1",
+                (resolved_account_id, message_id),
+            ).fetchone()
+            if existing:
+                conn.rollback()
+                return None
             cur = conn.execute(
                 """
                 INSERT INTO received_messages
@@ -1902,13 +2379,13 @@ def insert_received_message(
                     received_at, saved_date, body_file_path, body_sha256,
                     1 if has_attachments else 0, status, now, now,
                     source, gmail_message_id, gmail_thread_id, backend,
-                    account_id or LEGACY_UNKNOWN_ACCOUNT_ID,
+                    resolved_account_id,
                 ),
             )
             conn.commit()
             return cur.lastrowid
         except sqlite3.IntegrityError:
-            # message_id 已存在，忽略
+            conn.rollback()
             return None
 
 
@@ -1959,6 +2436,17 @@ def store_received_message_atomically(
     with _get_conn(db_path) as conn:
         try:
             conn.execute("BEGIN IMMEDIATE")
+            resolved_account_id = (
+                message.get("account_id") or LEGACY_UNKNOWN_ACCOUNT_ID
+            )
+            existing = conn.execute(
+                "SELECT 1 FROM received_messages "
+                "WHERE account_id=? AND message_id=? COLLATE NOCASE LIMIT 1",
+                (resolved_account_id, message["message_id"]),
+            ).fetchone()
+            if existing:
+                conn.rollback()
+                return False, []
             cur = conn.execute(
                 """
                 INSERT INTO received_messages
@@ -1979,7 +2467,7 @@ def store_received_message_atomically(
                     now, now, message.get("source"),
                     message.get("gmail_message_id"), message.get("gmail_thread_id"),
                     message.get("backend"),
-                    message.get("account_id") or LEGACY_UNKNOWN_ACCOUNT_ID,
+                    resolved_account_id,
                 ),
             )
             if cur.rowcount == 0:
@@ -2441,6 +2929,68 @@ def v17_mail_flow_migration_needed(db_path: Path | str) -> bool:
         connection.close()
 
 
+def v171_consistency_migration_needed(db_path: Path | str) -> bool:
+    """只读判断 v1.7.1 一致性迁移，供任何写入前创建升级备份。"""
+    path = Path(db_path)
+    if not path.is_file():
+        return False
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    try:
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "mail_packages" not in tables:
+            return False
+        if _legacy_message_identity_rebuild_needed(connection):
+            return True
+        required = {
+            "send_execution_leases",
+            "send_attempt_events",
+            "reconciliation_records",
+            "cleanup_records",
+            "health_issues",
+            "consistency_scan_runs",
+            "consistency_repair_runs",
+        }
+        if not required.issubset(tables):
+            return True
+        for table, columns in (
+            ("mail_packages", _MAIL_PACKAGES_V171_COLUMNS),
+            ("outbound_messages", _OUTBOUND_MESSAGES_V171_COLUMNS),
+            ("mailbox_sync_states", _MAILBOX_SYNC_V171_COLUMNS),
+            ("mail_package_mailboxes", _PACKAGE_MAILBOX_V171_COLUMNS),
+            ("send_requests", _SEND_REQUEST_V171_COLUMNS),
+            ("sent_server_mappings", _SENT_MAPPING_V171_COLUMNS),
+        ):
+            existing = {
+                str(row[1])
+                for row in connection.execute(
+                    f"PRAGMA table_info({table})"
+                ).fetchall()
+            }
+            if not set(columns).issubset(existing):
+                return True
+        if "migration_metadata" not in tables:
+            return True
+        row = connection.execute(
+            "SELECT status, schema_version FROM migration_metadata "
+            "WHERE migration_key = ?",
+            (V171_CONSISTENCY_MIGRATION_KEY,),
+        ).fetchone()
+        return (
+            not row
+            or row["status"] != "completed"
+            or int(row["schema_version"])
+            < V171_CONSISTENCY_SCHEMA_VERSION
+        )
+    finally:
+        connection.close()
+
+
 def sync_mail_accounts(
     db_path: Path | str, accounts: Iterable[MailAccount]
 ) -> list[dict[str, Any]]:
@@ -2842,19 +3392,21 @@ def upsert_mailboxes(
                             uidvalidity=excluded.uidvalidity,
                             uidnext=excluded.uidnext,
                             highestmodseq=excluded.highestmodseq,
-                            checkpoint_json=CASE
+                            checkpoint_json=mailbox_sync_states.checkpoint_json,
+                            last_uid=mailbox_sync_states.last_uid,
+                            reconciliation_required=CASE
                                 WHEN mailbox_sync_states.uidvalidity IS NOT NULL
                                  AND excluded.uidvalidity IS NOT NULL
                                  AND mailbox_sync_states.uidvalidity <> excluded.uidvalidity
-                                THEN '{}'
-                                ELSE mailbox_sync_states.checkpoint_json
+                                THEN 1
+                                ELSE mailbox_sync_states.reconciliation_required
                             END,
-                            last_uid=CASE
+                            uidvalidity_changed_at=CASE
                                 WHEN mailbox_sync_states.uidvalidity IS NOT NULL
                                  AND excluded.uidvalidity IS NOT NULL
                                  AND mailbox_sync_states.uidvalidity <> excluded.uidvalidity
-                                THEN 0
-                                ELSE mailbox_sync_states.last_uid
+                                THEN excluded.updated_at
+                                ELSE mailbox_sync_states.uidvalidity_changed_at
                             END,
                             updated_at=excluded.updated_at
                         """,
@@ -2912,8 +3464,11 @@ def record_package_mailbox_mapping(
             """
             INSERT INTO mail_package_mailboxes
                 (package_id, mailbox_id, account_id, provider_message_id,
-                 uidvalidity, provider_uid, first_seen_at, last_seen_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 uidvalidity, provider_uid, first_seen_at, last_seen_at,
+                 currently_present, removed_at, source,
+                 reconciliation_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, NULL,
+                    'sync_observed', 'observed')
             ON CONFLICT(package_id, mailbox_id) DO UPDATE SET
                 provider_message_id=COALESCE(excluded.provider_message_id,
                                              mail_package_mailboxes.provider_message_id),
@@ -2921,7 +3476,11 @@ def record_package_mailbox_mapping(
                                      mail_package_mailboxes.uidvalidity),
                 provider_uid=COALESCE(excluded.provider_uid,
                                       mail_package_mailboxes.provider_uid),
-                last_seen_at=excluded.last_seen_at
+                last_seen_at=excluded.last_seen_at,
+                currently_present=1,
+                removed_at=NULL,
+                source='sync_observed',
+                reconciliation_status='observed'
             """,
             (
                 package_id,
@@ -3025,33 +3584,84 @@ def get_mail_package_by_identity(
     *,
     backend: str | None = None,
     provider_message_id: str | None = None,
+    mailbox_id: str | None = None,
+    provider_uid: str | None = None,
+    uidvalidity: int | None = None,
+    raw_eml_sha256: str | None = None,
+    content_fingerprint: str | None = None,
+    identity_fingerprint: str | None = None,
 ) -> dict[str, Any] | None:
-    """按 RFC Message-ID 或同一后端 provider id 查找正式归档。"""
+    """Resolve one fact only when provider or content evidence is unambiguous."""
     provider = str(provider_message_id or "").strip()
+    provider_uid = str(provider_uid or "").strip()
+    raw_hash = str(raw_eml_sha256 or "").strip().casefold()
+    content_hash = str(content_fingerprint or "").strip().casefold()
+    identity_hash = str(identity_fingerprint or "").strip().casefold()
     with _get_conn(db_path) as conn:
         if provider and backend:
-            row = conn.execute(
+            rows = conn.execute(
                 """
                 SELECT * FROM mail_packages
-                WHERE account_ref = ? AND (
-                    message_id = ? COLLATE NOCASE
-                    OR (backend = ? AND provider_message_id = ?)
-                )
-                ORDER BY CASE WHEN message_id = ? COLLATE NOCASE THEN 0 ELSE 1 END
-                LIMIT 1
+                WHERE account_ref = ? AND backend = ?
+                  AND provider_message_id = ?
+                ORDER BY id ASC LIMIT 2
                 """,
-                (account_ref, message_id, backend, provider, message_id),
-            ).fetchone()
-        else:
-            row = conn.execute(
+                (account_ref, backend, provider),
+            ).fetchall()
+            if len(rows) == 1:
+                return dict(rows[0])
+            if len(rows) > 1:
+                return None
+        if mailbox_id and provider_uid:
+            rows = conn.execute(
                 """
-                SELECT * FROM mail_packages
-                WHERE account_ref = ? AND message_id = ? COLLATE NOCASE
-                LIMIT 1
+                SELECT p.* FROM mail_packages p
+                JOIN mail_package_mailboxes mm ON mm.package_id=p.package_id
+                WHERE p.account_ref=? AND mm.mailbox_id=?
+                  AND mm.provider_uid=?
+                  AND COALESCE(mm.uidvalidity, 0)=?
+                ORDER BY p.id ASC LIMIT 2
                 """,
-                (account_ref, message_id),
-            ).fetchone()
-        return dict(row) if row else None
+                (account_ref, mailbox_id, provider_uid, int(uidvalidity or 0)),
+            ).fetchall()
+            if len(rows) == 1:
+                return dict(rows[0])
+            if len(rows) > 1:
+                return None
+        candidates = conn.execute(
+            """
+            SELECT * FROM mail_packages
+            WHERE account_ref = ? AND message_id = ? COLLATE NOCASE
+            ORDER BY id ASC
+            """,
+            (account_ref, message_id),
+        ).fetchall()
+        if not candidates:
+            return None
+
+        for column, expected in (
+            ("raw_eml_sha256", raw_hash),
+            ("identity_fingerprint", identity_hash),
+            ("content_fingerprint", content_hash),
+        ):
+            if not expected:
+                continue
+            exact = [
+                row for row in candidates
+                if str(row[column] or "").strip().casefold() == expected
+            ]
+            if len(exact) == 1:
+                return dict(exact[0])
+            if len(exact) > 1:
+                return None
+
+        if len(candidates) != 1:
+            return None
+        if raw_hash or identity_hash or content_hash:
+            # A lone Message-ID is not enough to merge a new observation into
+            # a legacy fact that has no comparable deterministic evidence.
+            return None
+        return dict(candidates[0])
 
 
 def get_mail_package(db_path: Path | str, package_id: str) -> dict[str, Any] | None:
@@ -3213,6 +3823,8 @@ def store_mail_archive_atomically(
                     (package_id, account_ref, account_id, mailbox_ref, mailbox_id,
                      backend, message_id,
                      provider_message_id, thread_ref, direction,
+                     identity_fingerprint,
+                     date_header_raw, declared_at, observed_at,
                      in_reply_to_raw, references_raw, reply_to_package_id,
                      forward_from_package_id, content_fingerprint,
                      subject, from_email,
@@ -3229,7 +3841,9 @@ def store_mail_archive_atomically(
                 VALUES (:package_id, :account_ref, :account_id, :mailbox_ref,
                         :mailbox_id, :backend,
                         :message_id, :provider_message_id, :thread_ref,
-                        :direction, :in_reply_to_raw, :references_raw,
+                        :direction, :identity_fingerprint,
+                        :date_header_raw, :declared_at, :observed_at,
+                        :in_reply_to_raw, :references_raw,
                         :reply_to_package_id, :forward_from_package_id,
                         :content_fingerprint, :subject,
                         :from_email, :to_emails, :cc_emails, :bcc_emails,
@@ -3250,7 +3864,20 @@ def store_mail_archive_atomically(
                     backend=excluded.backend,
                     provider_message_id=COALESCE(excluded.provider_message_id, mail_packages.provider_message_id),
                     thread_ref=COALESCE(excluded.thread_ref, mail_packages.thread_ref),
-                    direction=excluded.direction,
+                    direction=CASE
+                        WHEN mail_packages.local_outbound=1
+                          OR excluded.local_outbound=1 THEN 'outbound'
+                        ELSE mail_packages.direction
+                    END,
+                    identity_fingerprint=COALESCE(
+                        excluded.identity_fingerprint,
+                        mail_packages.identity_fingerprint),
+                    date_header_raw=COALESCE(
+                        excluded.date_header_raw, mail_packages.date_header_raw),
+                    declared_at=COALESCE(
+                        excluded.declared_at, mail_packages.declared_at),
+                    observed_at=COALESCE(
+                        mail_packages.observed_at, excluded.observed_at),
                     in_reply_to_raw=COALESCE(excluded.in_reply_to_raw, mail_packages.in_reply_to_raw),
                     references_raw=COALESCE(excluded.references_raw, mail_packages.references_raw),
                     reply_to_package_id=COALESCE(excluded.reply_to_package_id, mail_packages.reply_to_package_id),
@@ -3304,6 +3931,10 @@ def store_mail_archive_atomically(
                     "provider_message_id": package.get("provider_message_id"),
                     "thread_ref": package.get("thread_ref"),
                     "direction": package.get("direction", "inbound"),
+                    "identity_fingerprint": package.get("identity_fingerprint"),
+                    "date_header_raw": package.get("date_header_raw"),
+                    "declared_at": package.get("declared_at"),
+                    "observed_at": package.get("observed_at"),
                     "in_reply_to_raw": package.get("in_reply_to_raw"),
                     "references_raw": package.get("references_raw"),
                     "reply_to_package_id": package.get("reply_to_package_id"),
@@ -3350,10 +3981,27 @@ def store_mail_archive_atomically(
             )
             conn.execute(
                 """
+                UPDATE mail_packages
+                SET first_seen_at=COALESCE(first_seen_at, created_at, saved_at),
+                    last_verified_at=?,
+                    source_type=CASE
+                        WHEN local_outbound=1 THEN 'local_outbound'
+                        WHEN source_type IS NULL OR source_type=''
+                            THEN 'provider_sync'
+                        ELSE source_type END
+                WHERE package_id=?
+                """,
+                (now, package["package_id"]),
+            )
+            conn.execute(
+                """
                 INSERT INTO mail_package_mailboxes
                     (package_id, mailbox_id, account_id, provider_message_id,
-                     uidvalidity, provider_uid, first_seen_at, last_seen_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     uidvalidity, provider_uid, first_seen_at, last_seen_at,
+                     currently_present, removed_at, source,
+                     reconciliation_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, NULL,
+                        'archive_observed', 'observed')
                 ON CONFLICT(package_id, mailbox_id) DO UPDATE SET
                     provider_message_id=COALESCE(excluded.provider_message_id,
                                                  mail_package_mailboxes.provider_message_id),
@@ -3361,7 +4009,11 @@ def store_mail_archive_atomically(
                                          mail_package_mailboxes.uidvalidity),
                     provider_uid=COALESCE(excluded.provider_uid,
                                           mail_package_mailboxes.provider_uid),
-                    last_seen_at=excluded.last_seen_at
+                    last_seen_at=excluded.last_seen_at,
+                    currently_present=1,
+                    removed_at=NULL,
+                    source='archive_observed',
+                    reconciliation_status='observed'
                 """,
                 (
                     package["package_id"],
@@ -3438,35 +4090,58 @@ def store_mail_archive_atomically(
                         now, int(legacy_received_id),
                     ),
                 )
-            conn.execute(
-                """
-                INSERT INTO received_messages
-                    (message_id, gmail_uid, subject, from_email, to_email,
-                     received_at, saved_date, body_file_path, body_sha256,
-                     has_attachments, status, created_at, updated_at, source,
-                     gmail_message_id, gmail_thread_id, backend, package_id,
-                     account_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(account_id, message_id COLLATE NOCASE) DO UPDATE SET
-                    package_id=excluded.package_id,
-                    body_file_path=COALESCE(received_messages.body_file_path, excluded.body_file_path),
-                    body_sha256=COALESCE(received_messages.body_sha256, excluded.body_sha256),
-                    status=excluded.status,
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    package["message_id"], package.get("gmail_uid"),
-                    package.get("subject", ""), package.get("from_email", ""),
-                    ", ".join(filter(None, [package.get("to_emails", ""), package.get("cc_emails", "")])),
-                    package.get("received_at"), package.get("saved_date", ""),
-                    body_resource.get("saved_path") if body_resource else None,
-                    body_resource.get("sha256") if body_resource else None,
-                    1 if int(package.get("attachment_count") or 0) else 0,
-                    compatibility_status, created_at, now, package.get("backend"),
-                    package.get("provider_message_id"), package.get("gmail_thread_id"),
-                    package.get("backend"), package["package_id"], account_id,
-                ),
+            compatibility_values = (
+                package["message_id"], package.get("gmail_uid"),
+                package.get("subject", ""), package.get("from_email", ""),
+                ", ".join(filter(None, [
+                    package.get("to_emails", ""), package.get("cc_emails", "")
+                ])),
+                package.get("received_at"), package.get("saved_date", ""),
+                body_resource.get("saved_path") if body_resource else None,
+                body_resource.get("sha256") if body_resource else None,
+                1 if int(package.get("attachment_count") or 0) else 0,
+                compatibility_status, created_at, now, package.get("backend"),
+                package.get("provider_message_id"), package.get("gmail_thread_id"),
+                package.get("backend"), package["package_id"], account_id,
             )
+            existing_compatibility = conn.execute(
+                "SELECT id FROM received_messages WHERE package_id=? LIMIT 1",
+                (package["package_id"],),
+            ).fetchone()
+            if existing_compatibility:
+                conn.execute(
+                    """
+                    UPDATE received_messages SET
+                        message_id=?, gmail_uid=?, subject=?, from_email=?,
+                        to_email=?, received_at=?, saved_date=?,
+                        body_file_path=COALESCE(body_file_path, ?),
+                        body_sha256=COALESCE(body_sha256, ?),
+                        has_attachments=?, status=?, updated_at=?, source=?,
+                        gmail_message_id=?, gmail_thread_id=?, backend=?,
+                        account_id=?
+                    WHERE id=?
+                    """,
+                    (
+                        *compatibility_values[:11],
+                        now,
+                        *compatibility_values[13:17],
+                        account_id,
+                        int(existing_compatibility["id"]),
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO received_messages
+                        (message_id, gmail_uid, subject, from_email, to_email,
+                         received_at, saved_date, body_file_path, body_sha256,
+                         has_attachments, status, created_at, updated_at, source,
+                         gmail_message_id, gmail_thread_id, backend, package_id,
+                         account_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    compatibility_values,
+                )
 
             for item in compatibility_files:
                 legacy_file_id = item.get("legacy_file_id")

@@ -18,6 +18,7 @@ from agent_mail_bridge.maintenance import backup_dir
 from agent_mail_bridge.mcp_client_config import (
     ClientConfigError,
     apply_client_config,
+    mcp_client_command,
     preview_client_config,
     restore_client_config,
 )
@@ -360,7 +361,10 @@ def test_claude_code_user_and_project_json_fixtures_preserve_unknown_fields(
             json.dumps(
                 {
                     "projects": {"保留项目": {"allowedTools": ["Read"]}},
-                    "mcpServers": {"unrelated": {"command": "existing"}},
+                    "mcpServers": {
+                        "unrelated": {"command": "existing"},
+                        "agent-mail-bridge": {"command": "legacy"},
+                    },
                     "futureField": {"formatVersion": 99},
                 },
                 ensure_ascii=False,
@@ -380,11 +384,38 @@ def test_claude_code_user_and_project_json_fixtures_preserve_unknown_fields(
         assert parsed["futureField"]["formatVersion"] == 99
         assert parsed["mcpServers"]["unrelated"]["command"] == "existing"
         assert (
-            parsed["mcpServers"]["agent-mail-bridge"]["env"][
+            parsed["mcpServers"]["agent_mail_bridge"]["env"][
                 "AGENT_MAIL_BRIDGE_CLIENT_ID"
             ]
             == "client_" + "5" * 24
         )
+        assert "agent-mail-bridge" not in parsed["mcpServers"]
+        assert '"配置项": "agent_mail_bridge"' in plan.preview
+
+        remove = preview_client_config(
+            client_id="client_" + "5" * 24,
+            client_type="claude_code",
+            client_token="fixture-scoped-token",
+            config_scope="project" if name == ".mcp.json" else "user",
+            target_path=target,
+            action="remove",
+        )
+        apply_client_config(remove, backup_root=tmp_path / "backups")
+        removed = json.loads(target.read_text(encoding="utf-8"))
+        assert "agent_mail_bridge" not in removed["mcpServers"]
+        assert "agent-mail-bridge" not in removed["mcpServers"]
+        assert removed["mcpServers"]["unrelated"]["command"] == "existing"
+
+
+def test_claude_code_command_uses_routable_server_key():
+    command = mcp_client_command(
+        "claude_code",
+        client_id="client_test",
+        client_token="fixture-scoped-token",
+    )
+
+    assert "agent_mail_bridge" in command
+    assert "agent-mail-bridge" not in command
 
 
 def test_codex_toml_merge_preserves_unrelated_sections_unicode_and_rollback(tmp_path):

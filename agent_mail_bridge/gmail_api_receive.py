@@ -35,7 +35,7 @@ from agent_mail_bridge.database import (
     receive_retry_is_due,
     record_receive_failure,
     record_receive_rule_evaluation,
-    record_package_mailbox_mapping,
+    query_mailboxes,
     sync_mail_accounts,
 )
 from agent_mail_bridge.logging_setup import get_logger
@@ -46,6 +46,7 @@ from agent_mail_bridge.mail_common import (
     normalized_mail_from_raw,
 )
 from agent_mail_bridge.mail_processing import process_normalized_mail
+from agent_mail_bridge.mail_fact_membership import reconcile_package_memberships
 from agent_mail_bridge.mail_archive import stable_account_ref
 from agent_mail_bridge.mail_accounts import (
     current_receive_account_id,
@@ -54,6 +55,7 @@ from agent_mail_bridge.mail_accounts import (
 )
 from agent_mail_bridge.mailbox_sync import (
     discover_gmail_mailboxes,
+    ensure_gmail_message_mailboxes,
     mailbox_direction,
     selected_sync_mailboxes,
 )
@@ -558,7 +560,33 @@ def _process_one_unified(
     raw_bytes = decode_base64url(str(encoded_raw))
     parsed_message = email.message_from_bytes(raw_bytes)
     received_dt = _raw_message_datetime(parsed_message, msg.get("internalDate"))
-    mailbox_rows = list(mailboxes or [])
+    account_id = current_receive_account_id(cfg)
+    label_ids = msg.get("labelIds")
+    complete_label_snapshot = isinstance(label_ids, list)
+    configured_mailboxes = (
+        ensure_gmail_message_mailboxes(
+            cfg.db_path,
+            account_id,
+            [str(value) for value in label_ids],
+        )
+        if complete_label_snapshot
+        else query_mailboxes(cfg.db_path, account_id=account_id)
+    )
+    by_label_id = {
+        str(row.get("raw_name") or ""): row for row in configured_mailboxes
+    }
+    mailbox_rows = [
+        by_label_id[str(label_id)]
+        for label_id in (label_ids or [])
+        if str(label_id) in by_label_id
+    ]
+    if not mailbox_rows and not complete_label_snapshot:
+        mailbox_rows = list(mailboxes or [])
+    mailbox_rows.sort(
+        key=lambda row: 0
+        if str(row.get("mailbox_role") or "") == "sent"
+        else 1
+    )
     primary_mailbox = mailbox_rows[0] if mailbox_rows else {
         "external_ref": "gmail:INBOX",
         "mailbox_role": "inbox",
@@ -574,22 +602,33 @@ def _process_one_unified(
         max_attachment_bytes=cfg.max_attachment_bytes,
         mailbox_ref=str(primary_mailbox["external_ref"]),
         direction=mailbox_direction(primary_mailbox),
+        observed_at=fmt_datetime(now_local()),
     )
     single = process_normalized_mail(
         cfg, normalized, apply_receive_rule=apply_receive_rule
     )
     single.setdefault("message_id", normalized.message_id)
     package_id = str(single.get("package_id") or "")
-    account_id = current_receive_account_id(cfg)
-    for mailbox in mailbox_rows[1:] if package_id else []:
-        record_package_mailbox_mapping(
+    if package_id:
+        observed_ids = {
+            stable_mailbox_id(account_id, str(mailbox["external_ref"]))
+            for mailbox in mailbox_rows
+        }
+        scope_ids = {
+            str(mailbox["mailbox_id"])
+            for mailbox in configured_mailboxes
+            if str(mailbox.get("external_ref") or "").startswith("gmail:")
+        }
+        scope_ids.update(observed_ids)
+        reconcile_package_memberships(
             cfg.db_path,
             package_id=package_id,
             account_id=account_id,
-            mailbox_id=stable_mailbox_id(
-                account_id, str(mailbox["external_ref"])
-            ),
+            observed_mailbox_ids=observed_ids,
+            scope_mailbox_ids=scope_ids,
             provider_message_id=gmail_message_id,
+            source="gmail_label_snapshot",
+            complete_snapshot=complete_label_snapshot,
         )
     status = single["status"]
     if status in {"saved", "partial"}:

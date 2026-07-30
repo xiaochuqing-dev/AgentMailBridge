@@ -18,7 +18,7 @@ from typing import Any
 
 from agent_mail_bridge.config import AppConfig
 from agent_mail_bridge.security import SecurityError, assert_within_root
-from agent_mail_bridge.storage import atomic_copy_file
+from agent_mail_bridge.storage import atomic_copy_file, atomic_write_text
 from agent_mail_bridge.utils import sanitize_filename, sha256_of_file
 
 
@@ -276,7 +276,7 @@ def prepare_mail_resources(
 
     note = destination / "邮件说明.md"
     note_text = _mail_note(message, prepared)
-    _atomic_write_text(note, note_text)
+    atomic_write_text(note, note_text)
     return {
         "mode": "resources",
         "mail_id": package_id,
@@ -915,7 +915,7 @@ def _complete_collision_target(path: Path, policy: str) -> Path:
 
 
 def _atomic_write_json(path: Path, value: dict[str, Any]) -> None:
-    _atomic_write_text(
+    atomic_write_text(
         path,
         json.dumps(
             value,
@@ -1172,15 +1172,6 @@ def _mail_note(message: dict[str, Any], prepared: list[dict[str, Any]]) -> str:
     for item in prepared:
         lines.append(f"{item['filename']}  来源资源 {item['resource_id']}  SHA-256 {item['sha256']}")
     return "\n".join(lines).rstrip() + "\n"
-
-
-def _atomic_write_text(path: Path, text: str) -> None:
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        temporary.write_text(text, encoding="utf-8", newline="\n")
-        temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def _resource_available(resource: dict[str, Any]) -> bool:

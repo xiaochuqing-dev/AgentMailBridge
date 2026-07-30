@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agent_mail_bridge.runtime_paths import get_runtime_paths
+from agent_mail_bridge.storage import atomic_write_text
 
 _KEY_PATTERN = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
 _SECRET_KEYS = frozenset({"GMAIL_APP_PASSWORD", "QQ_AUTH_CODE"})
@@ -46,10 +47,7 @@ def save_env_values(
     for key, value in pending.items():
         output.append(f"{key}={_quote_env_value(value)}")
 
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = env_path.with_name(f".{env_path.name}.{os.getpid()}.tmp")
-    temporary.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
-    temporary.replace(env_path)
+    atomic_write_text(env_path, "\n".join(output).rstrip() + "\n")
 
 
 def persist_receive_rule_migration(cfg) -> bool:

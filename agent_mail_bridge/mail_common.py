@@ -9,10 +9,10 @@ from dataclasses import dataclass, field
 from email import message_from_bytes
 from email.message import Message
 from html.parser import HTMLParser
-from email.utils import getaddresses
+from email.utils import getaddresses, parsedate_to_datetime
 
 from agent_mail_bridge.security import is_attachment_allowed, is_dangerous
-from agent_mail_bridge.utils import decode_mime_header
+from agent_mail_bridge.utils import decode_mime_header, fmt_datetime
 
 
 @dataclass
@@ -78,6 +78,9 @@ class NormalizedMail:
     reply_to_package_id: str = ""
     forward_from_package_id: str = ""
     uidvalidity: int = 0
+    date_header_raw: str = ""
+    declared_at: str = ""
+    observed_at: str = ""
 
 
 def parse_mail_address_header(value: str | None) -> list[MailAddress]:
@@ -224,6 +227,7 @@ def normalized_mail_from_raw(
     mailbox_ref: str,
     direction: str = "inbound",
     uidvalidity: int = 0,
+    observed_at: str = "",
 ) -> NormalizedMail:
     """把真实 RFC822 bytes 归一化；两个收件后端共用此入口。"""
     if not isinstance(raw_bytes, bytes) or not raw_bytes:
@@ -283,6 +287,17 @@ def normalized_mail_from_raw(
     body_plain = "\n\n".join(plain_parts).strip()
     body_html = "\n\n".join(html_parts).strip()
     readable = body_plain or safe_html_to_text(body_html)
+    date_header_raw = str(message.get("Date", "") or "").strip()
+    declared_at = ""
+    if date_header_raw:
+        try:
+            parsed_date = parsedate_to_datetime(date_header_raw)
+            if parsed_date is not None:
+                if parsed_date.tzinfo is not None:
+                    parsed_date = parsed_date.astimezone().replace(tzinfo=None)
+                declared_at = fmt_datetime(parsed_date)
+        except (TypeError, ValueError, OverflowError):
+            declared_at = ""
     return NormalizedMail(
         backend=backend,
         message_id=str(message.get("Message-ID", "")),
@@ -310,6 +325,9 @@ def normalized_mail_from_raw(
         outbound_id=str(message.get("X-AgentMailBridge-Outbound-ID", "")).strip(),
         direction=direction,
         uidvalidity=max(0, int(uidvalidity)),
+        date_header_raw=date_header_raw,
+        declared_at=declared_at,
+        observed_at=str(observed_at or received_at),
     )
 
 

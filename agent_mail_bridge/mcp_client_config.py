@@ -25,8 +25,10 @@ from agent_mail_bridge.runtime_paths import get_runtime_paths
 
 
 SERVER_KEY = "agent-mail-bridge"
+CLAUDE_CODE_SERVER_KEY = "agent_mail_bridge"
 CLIENT_ID_ENV = "AGENT_MAIL_BRIDGE_CLIENT_ID"
 CLIENT_TOKEN_ENV = "AGENT_MAIL_BRIDGE_CLIENT_TOKEN"
+CONFIG_OVERRIDE_ENV = "AGENT_MAIL_BRIDGE_CONFIG"
 SUPPORTED_CLIENTS = {
     "claude_code",
     "codex",
@@ -35,7 +37,9 @@ SUPPORTED_CLIENTS = {
     "custom",
 }
 KNOWN_VERSION_PATTERNS = {
-    "codex": re.compile(r"^(?:codex-cli\s+)?0\.145\.0(?:\s|$)", re.IGNORECASE),
+    "codex": re.compile(
+        r"^(?:codex-cli\s+)?0\.(?:145|146)\.0(?:\s|$)", re.IGNORECASE
+    ),
     "claude_code": re.compile(r"^2\.1\.220(?:\s|$)", re.IGNORECASE),
     "hermes": re.compile(r"^Hermes Agent v0\.19\.0(?:\s|$)", re.IGNORECASE),
 }
@@ -106,6 +110,7 @@ def mcp_client_command(
     command, args = mcp_launch()
     runtime = get_runtime_paths()
     normalized = str(client or "").strip().casefold()
+    server_key = _server_key_for_client(normalized)
     env_items: list[str] = []
     if not runtime.frozen:
         env_items.extend(["--env", f"PYTHONPATH={runtime.source_root}"])
@@ -123,7 +128,7 @@ def mcp_client_command(
             "stdio",
             "--scope",
             scope,
-            SERVER_KEY,
+            server_key,
             "--",
         ]
     elif normalized == "hermes":
@@ -302,13 +307,20 @@ def preview_client_config(
     original_hash = _sha256(original)
     entry = _stdio_entry(client_id=client_id, client_token=client_token)
     remove = action == "remove"
+    server_key = _server_key_for_client(normalized)
     try:
         if normalized == "codex":
             planned = _merge_codex_toml(original, entry, remove=remove)
         elif normalized == "hermes":
             planned = _merge_hermes_yaml(original, entry, remove=remove)
         else:
-            planned = _merge_json_config(original, entry, remove=remove)
+            planned = _merge_json_config(
+                original,
+                entry,
+                remove=remove,
+                server_key=server_key,
+                legacy_keys=(SERVER_KEY,) if normalized == "claude_code" else (),
+            )
     except ClientConfigError:
         raise
     except (UnicodeError, ValueError, tomllib.TOMLDecodeError) as exc:
@@ -321,6 +333,7 @@ def preview_client_config(
         target=target,
         entry=entry,
         action=action,
+        server_key=server_key,
     )
     return ConfigPlan(
         client_id=client_id,
@@ -440,6 +453,9 @@ def _stdio_entry(
         env[CLIENT_ID_ENV] = client_id
     if client_token:
         env[CLIENT_TOKEN_ENV] = client_token
+    config_override = os.getenv(CONFIG_OVERRIDE_ENV, "").strip()
+    if config_override:
+        env[CONFIG_OVERRIDE_ENV] = config_override
     return {
         "type": "stdio",
         "command": command,
@@ -453,6 +469,8 @@ def _merge_json_config(
     entry: dict[str, Any],
     *,
     remove: bool,
+    server_key: str = SERVER_KEY,
+    legacy_keys: tuple[str, ...] = (),
 ) -> bytes:
     if original:
         try:
@@ -469,9 +487,13 @@ def _merge_json_config(
     if not isinstance(servers, dict):
         raise ClientConfigError("config_parse_failed", "mcpServers 必须是对象")
     if remove:
-        servers.pop(SERVER_KEY, None)
+        for key in dict.fromkeys((server_key, *legacy_keys)):
+            servers.pop(key, None)
     else:
-        servers[SERVER_KEY] = entry
+        for key in legacy_keys:
+            if key != server_key:
+                servers.pop(key, None)
+        servers[server_key] = entry
     return (
         json.dumps(data, ensure_ascii=False, indent=2)
         .rstrip()
@@ -700,12 +722,21 @@ def _is_supported_version(
     return bool(pattern and version and pattern.search(version.strip()))
 
 
+def _server_key_for_client(client_type: str) -> str:
+    return (
+        CLAUDE_CODE_SERVER_KEY
+        if client_type in {"claude", "claude_code"}
+        else SERVER_KEY
+    )
+
+
 def _config_preview(
     *,
     client_type: str,
     target: Path,
     entry: dict[str, Any],
     action: str,
+    server_key: str,
 ) -> str:
     env_names = sorted(str(key) for key in (entry.get("env") or {}))
     command_name = Path(str(entry.get("command") or "")).name
@@ -713,7 +744,7 @@ def _config_preview(
         "操作": "移除" if action == "remove" else "新增或更新",
         "Client": client_type,
         "目标文件": _redacted_path(target),
-        "配置项": SERVER_KEY,
+        "配置项": server_key,
         "command": command_name,
         "args": list(entry.get("args") or []),
         "环境变量名": env_names,

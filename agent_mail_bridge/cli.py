@@ -35,7 +35,9 @@ from agent_mail_bridge.database import (
     log_event,
     query_sent_files_by_date,
     query_received_messages_by_date,
+    v171_consistency_migration_needed,
 )
+from agent_mail_bridge.maintenance import create_database_backup
 from agent_mail_bridge.file_index import (
     list_received_files_for_date,
     scan_file_status,
@@ -52,6 +54,8 @@ from agent_mail_bridge.version import __version__
 def _setup(cfg) -> None:
     """初始化日志 + 数据目录 + 数据库（命令前置步骤）。"""
     ensure_data_dirs(cfg)
+    if v171_consistency_migration_needed(cfg.db_path):
+        create_database_backup(cfg, label="before_v1_7_1_consistency")
     init_db(cfg.db_path, legacy_accounts=legacy_accounts_from_config(cfg))
     setup_logging(cfg.logs_dir, cfg.log_level)
 

@@ -9,11 +9,17 @@ from typing import Any
 from agent_mail_bridge.config import AppConfig
 from agent_mail_bridge.database import (
     get_mailbox,
+    get_mail_package,
     get_mail_package_by_identity,
     record_package_mailbox_mapping,
     upsert_mailboxes,
 )
-from agent_mail_bridge.mail_archive import archive_normalized_mail, stable_account_ref
+from agent_mail_bridge.mail_archive import (
+    archive_normalized_mail,
+    mail_content_fingerprint,
+    mail_identity_fingerprint,
+    stable_account_ref,
+)
 from agent_mail_bridge.mail_accounts import (
     current_receive_account_id,
     stable_mailbox_id,
@@ -23,12 +29,23 @@ from agent_mail_bridge.mail_common import (
     fallback_dedup_key,
     normalize_message_id,
 )
+from agent_mail_bridge.mail_fact_membership import (
+    infer_direction,
+    record_direction_evidence,
+)
 from agent_mail_bridge.receive_rules import match_receive_rule
 from agent_mail_bridge.mail_threading import (
     record_sent_mapping,
     record_thread_relations,
 )
+from agent_mail_bridge.send_reconciliation import (
+    find_sent_candidate,
+    prepare_request_sent_observation,
+    reconcile_sent_observation,
+    record_external_outbound,
+)
 from agent_mail_bridge.security import assert_within_root
+from agent_mail_bridge.storage import atomic_write_bytes
 from agent_mail_bridge.utils import sanitize_filename, sha256_of_bytes, split_ext
 
 
@@ -48,15 +65,72 @@ def process_normalized_mail(
             attachments=mail.attachments,
         )
 
+    account_id = current_receive_account_id(cfg)
+    mailbox_ref = mail.mailbox_ref or (
+        "gmail:INBOX" if mail.backend == "gmail_api" else "INBOX"
+    )
+    mailbox_id = stable_mailbox_id(account_id, mailbox_ref)
+    raw_sha256 = sha256_of_bytes(mail.raw_bytes) if mail.raw_bytes else ""
+    archive_content_fingerprint = mail_content_fingerprint(mail)
+    identity_fingerprint = mail_identity_fingerprint(
+        mail, content_fingerprint=archive_content_fingerprint
+    )
+    proposed_direction, direction_evidence = infer_direction(
+        cfg.db_path,
+        account_id=account_id,
+        mailbox_id=mailbox_id,
+        backend=mail.backend,
+        from_header=mail.from_raw,
+        outbound_origin=mail.outbound_origin,
+        provider_direction=mail.direction,
+    )
+    mail.direction = proposed_direction
+
+    sent_match: dict[str, Any] | None = None
+    if proposed_direction == "outbound" and mail.backend != "smtp":
+        sent_match = find_sent_candidate(
+            cfg.db_path,
+            account_id=account_id,
+            provider_message_id=str(mail.backend_message_id or ""),
+            message_id=message_id,
+            outbound_id=str(mail.outbound_id or ""),
+            raw_sha256=raw_sha256,
+            content_fingerprint=archive_content_fingerprint,
+            from_header=mail.from_raw,
+            to_header=mail.to_raw,
+            cc_header=mail.cc_raw,
+            subject=mail.subject,
+        )
+        matched_request_id = str(sent_match.get("send_request_id") or "")
+        if sent_match.get("status") == "matched" and matched_request_id:
+            mail.outbound_id = prepare_request_sent_observation(
+                cfg,
+                send_request_id=matched_request_id,
+                observed_at=mail.sent_at or mail.received_at,
+            )
+            mail.outbound_origin = "outbound"
+
     # 正式归档事实优先于当前规则。规则变化不能把已归档邮件误报为 rule_skipped。
-    provider_message_id = mail.backend_message_id or mail.uid
+    provider_message_id = mail.backend_message_id or None
     existing = get_mail_package_by_identity(
         cfg.db_path,
         stable_account_ref(cfg),
         message_id,
         backend=mail.backend,
         provider_message_id=provider_message_id,
+        mailbox_id=mailbox_id,
+        provider_uid=mail.uid or None,
+        uidvalidity=mail.uidvalidity or 0,
+        raw_eml_sha256=raw_sha256,
+        content_fingerprint=archive_content_fingerprint,
+        identity_fingerprint=identity_fingerprint,
     )
+    if sent_match and sent_match.get("status") == "matched":
+        matched = get_mail_package(
+            cfg.db_path, str(sent_match.get("package_id") or "")
+        )
+        if matched is not None:
+            existing = matched
     if existing and existing.get("archive_status") in {"ready", "legacy"}:
         _record_mailbox_and_thread_facts(
             cfg,
@@ -64,6 +138,9 @@ def process_normalized_mail(
             message_id,
             str(existing.get("package_id") or ""),
             local_outbound=bool(existing.get("local_outbound")),
+            proposed_direction=proposed_direction,
+            direction_evidence=direction_evidence,
+            sent_match=sent_match,
         )
         return {
             "status": "duplicate",
@@ -89,6 +166,9 @@ def process_normalized_mail(
         message_id,
         archived.package_id,
         local_outbound=False,
+        proposed_direction=proposed_direction,
+        direction_evidence=direction_evidence,
+        sent_match=sent_match,
     )
     return {
         "status": "saved" if archived.status == "ready" else archived.status,
@@ -107,6 +187,9 @@ def _record_mailbox_and_thread_facts(
     package_id: str,
     *,
     local_outbound: bool,
+    proposed_direction: str,
+    direction_evidence: list[dict[str, str]],
+    sent_match: dict[str, Any] | None,
 ) -> None:
     if not package_id:
         return
@@ -148,6 +231,12 @@ def _record_mailbox_and_thread_facts(
         uidvalidity=mail.uidvalidity or None,
         provider_uid=mail.uid or None,
     )
+    record_direction_evidence(
+        cfg.db_path,
+        package_id=package_id,
+        proposed_direction=proposed_direction,
+        evidence=direction_evidence,
+    )
     record_thread_relations(
         cfg.db_path,
         account_id=account_id,
@@ -158,22 +247,53 @@ def _record_mailbox_and_thread_facts(
         forward_from_package_id=mail.forward_from_package_id or None,
     )
     if mail.direction == "outbound" and mail.backend != "smtp":
-        record_sent_mapping(
-            cfg.db_path,
-            account_id=account_id,
-            package_id=package_id,
-            mailbox_id=mailbox_id,
-            provider_message_id=mail.backend_message_id or None,
-            uidvalidity=mail.uidvalidity or None,
-            provider_uid=mail.uid or None,
-            message_id=message_id,
-            matched_by=(
-                "message_id_local_outbound"
-                if local_outbound
-                else "message_id"
-            ),
-            details={"source": mail.backend},
-        )
+        match_status = str((sent_match or {}).get("status") or "unmatched")
+        if match_status == "ambiguous":
+            record_sent_mapping(
+                cfg.db_path,
+                account_id=account_id,
+                package_id=package_id,
+                mailbox_id=mailbox_id,
+                provider_message_id=mail.backend_message_id or None,
+                uidvalidity=mail.uidvalidity or None,
+                provider_uid=mail.uid or None,
+                message_id=message_id,
+                matched_by="ambiguous_isolated_fact",
+                confidence="manual_review",
+                reconciliation_status="ambiguous",
+                details={"source": mail.backend},
+            )
+        else:
+            evidence_type = str(
+                (sent_match or {}).get("evidence_type")
+                or "provider_sent_observation"
+            )
+            reconcile_sent_observation(
+                cfg.db_path,
+                account_id=account_id,
+                package_id=package_id,
+                mailbox_id=mailbox_id,
+                provider_message_id=mail.backend_message_id or None,
+                uidvalidity=mail.uidvalidity or None,
+                provider_uid=mail.uid or None,
+                message_id=message_id,
+                evidence_type=evidence_type,
+                confidence=(
+                    str((sent_match or {}).get("confidence") or "high")
+                ),
+                send_request_id=(
+                    str((sent_match or {}).get("send_request_id") or "") or None
+                ),
+            )
+            if match_status == "unmatched":
+                record_external_outbound(
+                    cfg.db_path,
+                    account_id=account_id,
+                    package_id=package_id,
+                    provider_message_id=str(
+                        mail.backend_message_id or mail.uid or ""
+                    ),
+                )
 
 
 def _write_deterministic_files(
@@ -192,7 +312,7 @@ def _write_deterministic_files(
     assert_within_root(body_path, cfg.data_root_path)
     body_content = _compose_body(mail, message_id)
     body_bytes = body_content.encode("utf-8")
-    body_path.write_bytes(body_bytes)
+    atomic_write_bytes(body_path, body_bytes)
     files: list[dict[str, Any]] = [{
         "file_type": "body",
         "original_filename": mail.subject or "无标题邮件",
@@ -214,7 +334,7 @@ def _write_deterministic_files(
         )
         path = attachment_dir / filename
         assert_within_root(path, cfg.data_root_path)
-        path.write_bytes(attachment.content)
+        atomic_write_bytes(path, attachment.content)
         files.append({
             "file_type": "attachment",
             "original_filename": safe_name,

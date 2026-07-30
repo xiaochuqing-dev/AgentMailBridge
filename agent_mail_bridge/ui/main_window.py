@@ -89,6 +89,11 @@ from agent_mail_bridge.ui.account_management import (
     open_runtime_account_dialog,
 )
 from agent_mail_bridge.ui.branding import apply_brand_label, brand_icon, find_brand_asset, provider_icon
+from agent_mail_bridge.ui.health_page import (
+    format_mail_health,
+    format_recovery_requests,
+    recovery_status_name,
+)
 from agent_mail_bridge.ui.theme import (
     DANGER,
     PURPLE,
@@ -1714,8 +1719,8 @@ class BridgeWindow(QMainWindow):
 
     def _build_maintenance_page(self) -> QWidget:
         page, layout = self._standard_page(
-            "文件与数据 > 数据维护",
-            "备份和扫描默认不删除用户数据；数据库恢复前会再次确认并自动备份当前库。",
+            "文件与数据 > 邮件运行状态与数据维护",
+            "查看同步、发件恢复、事实一致性和存储状态。扫描与清理预览不会删除数据。",
         )
         back = QHBoxLayout()
         back.addStretch(1)
@@ -1731,7 +1736,15 @@ class BridgeWindow(QMainWindow):
         self.restore_backup_button = self._button("恢复备份", self.choose_restore_backup)
         self.open_backup_button = self._button("打开备份目录", self.open_backup_folder)
         self.export_maintenance_button = self._button("导出维护报告", self.export_maintenance_report)
+        self.mail_health_button = self._button("邮件运行状态", self.refresh_mail_health)
+        self.recovery_list_button = self._button("查看待恢复发件", self.show_send_recovery_requests)
+        self.reconcile_send_button = self._button("重新对账发件", self.reconcile_send_recovery_requests)
+        self.cleanup_preview_button = self._button("预览安全清理", self.preview_safe_cleanup)
+        self.cleanup_execute_button = self._button("执行安全清理", self.execute_safe_cleanup)
         for index, button in enumerate((
+            self.mail_health_button, self.recovery_list_button,
+            self.reconcile_send_button, self.cleanup_preview_button,
+            self.cleanup_execute_button,
             self.maintenance_refresh_button, self.backup_button, self.scan_button,
             self.verify_backup_button, self.restore_backup_button,
             self.open_backup_button, self.export_maintenance_button,
@@ -1739,6 +1752,60 @@ class BridgeWindow(QMainWindow):
             actions.addWidget(button, index // 4, index % 4)
         actions.setColumnStretch(3, 1)
         layout.addLayout(actions)
+        recovery_actions = QHBoxLayout()
+        recovery_actions.addWidget(QLabel("待恢复发件"))
+        self.recovery_request_selector = QComboBox()
+        self.recovery_request_selector.setMinimumWidth(300)
+        self.recovery_request_selector.currentIndexChanged.connect(
+            self._update_recovery_action_buttons
+        )
+        recovery_actions.addWidget(self.recovery_request_selector, 1)
+        self.recovery_detail_button = self._button(
+            "查看详情", self.show_selected_recovery_detail, outline=True
+        )
+        self.recovery_mark_sent_button = self._button(
+            "标记已发送",
+            lambda: self.mark_selected_send_resolution("sent"),
+            outline=True,
+        )
+        self.recovery_mark_not_sent_button = self._button(
+            "标记未发送",
+            lambda: self.mark_selected_send_resolution("not_sent"),
+            outline=True,
+        )
+        self.recovery_clone_button = self._button(
+            "创建新请求", self.clone_selected_recovery_request, outline=True
+        )
+        for button in (
+            self.recovery_detail_button,
+            self.recovery_mark_sent_button,
+            self.recovery_mark_not_sent_button,
+            self.recovery_clone_button,
+        ):
+            recovery_actions.addWidget(button)
+        layout.addLayout(recovery_actions)
+        self.recovery_request_rows: dict[str, dict] = {}
+        self._update_recovery_action_buttons()
+        repair_actions = QHBoxLayout()
+        repair_actions.addWidget(QLabel("一致性修复"))
+        self.consistency_repair_selector = QComboBox()
+        self.consistency_repair_selector.setMinimumWidth(300)
+        self.consistency_repair_selector.currentIndexChanged.connect(
+            self._update_consistency_repair_button
+        )
+        repair_actions.addWidget(self.consistency_repair_selector, 1)
+        self.consistency_repair_button = self._button(
+            "修复所选", self.apply_selected_consistency_repair, outline=True
+        )
+        repair_actions.addWidget(self.consistency_repair_button)
+        layout.addLayout(repair_actions)
+        self.consistency_repair_rows: dict[str, dict] = {}
+        self.consistency_repair_scan_id = ""
+        self._update_consistency_repair_button()
+        self.mail_health_summary = QTextEdit()
+        self.mail_health_summary.setReadOnly(True)
+        self.mail_health_summary.setFixedHeight(220)
+        layout.addWidget(self.mail_health_summary)
         self.maintenance_summary = QTextEdit()
         self.maintenance_summary.setReadOnly(True)
         self.maintenance_summary.setFixedHeight(190)
@@ -1753,6 +1820,273 @@ class BridgeWindow(QMainWindow):
             self.service.get_maintenance_status,
             self._show_maintenance_status,
             button=self.maintenance_refresh_button,
+        )
+
+    def refresh_mail_health(self) -> None:
+        self._run_task(
+            "正在读取邮件运行状态",
+            self.service.get_mail_health_status,
+            self._show_mail_health,
+            button=self.mail_health_button,
+        )
+
+    def _show_mail_health(self, result: ServiceResult) -> None:
+        if result.ok:
+            self.mail_health_summary.setPlainText(
+                format_mail_health(result.details, format_size)
+            )
+        self._show_service_result(result)
+
+    def show_send_recovery_requests(self) -> None:
+        self._run_task(
+            "正在读取待恢复发件",
+            self.service.list_send_recovery_requests,
+            self._show_send_recovery_requests,
+            button=self.recovery_list_button,
+        )
+
+    def _show_send_recovery_requests(self, result: ServiceResult) -> None:
+        if result.ok:
+            rows = list(result.details.get("requests", []))
+            self._populate_recovery_request_selector(rows)
+            self.mail_health_summary.setPlainText(
+                format_recovery_requests(rows)
+            )
+        self._show_service_result(result)
+
+    def _populate_recovery_request_selector(self, rows: list[dict]) -> None:
+        previous = str(self.recovery_request_selector.currentData() or "")
+        self.recovery_request_rows = {
+            str(row.get("send_request_id") or ""): dict(row)
+            for row in rows
+            if str(row.get("send_request_id") or "")
+        }
+        self.recovery_request_selector.blockSignals(True)
+        self.recovery_request_selector.clear()
+        for request_id, row in self.recovery_request_rows.items():
+            status = str(row.get("status") or "")
+            subject = str(row.get("subject") or "无主题").replace("\n", " ")
+            self.recovery_request_selector.addItem(
+                f"{recovery_status_name(status)} · {subject[:48]}",
+                request_id,
+            )
+        if previous:
+            index = self.recovery_request_selector.findData(previous)
+            if index >= 0:
+                self.recovery_request_selector.setCurrentIndex(index)
+        self.recovery_request_selector.blockSignals(False)
+        self._update_recovery_action_buttons()
+
+    def _selected_recovery_request(self) -> dict | None:
+        request_id = str(self.recovery_request_selector.currentData() or "")
+        return self.recovery_request_rows.get(request_id)
+
+    def _update_recovery_action_buttons(self, *_args) -> None:
+        row = self._selected_recovery_request() if hasattr(
+            self, "recovery_request_selector"
+        ) else None
+        status = str((row or {}).get("status") or "")
+        resolvable = status in {"delivery_unknown", "recovery_required"}
+        accepted = bool((row or {}).get("smtp_accepted_at")) or str(
+            (row or {}).get("delivery_status") or ""
+        ) in {"sent", "smtp_accepted"}
+        for name, enabled in (
+            ("recovery_detail_button", bool(row)),
+            ("recovery_mark_sent_button", resolvable),
+            ("recovery_mark_not_sent_button", resolvable and not accepted),
+            ("recovery_clone_button", status == "delivery_unknown"),
+        ):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.setEnabled(enabled)
+
+    def show_selected_recovery_detail(self) -> None:
+        request = self._selected_recovery_request()
+        if not request:
+            self.show_message("请选择待恢复发件", "error")
+            return
+        recipients = request.get("recipients") or {}
+        attachments = list(request.get("attachments") or [])
+        body_text = str(request.get("body_text") or "")
+        body_html = str(request.get("body_html") or "")
+        detail = "\n".join(
+            [
+                f"状态：{recovery_status_name(request.get('status'))}",
+                f"Message-ID：{request.get('message_id') or '无'}",
+                f"To：{', '.join(recipients.get('to') or []) or '无'}",
+                f"Cc：{', '.join(recipients.get('cc') or []) or '无'}",
+                f"Bcc：{', '.join(recipients.get('bcc') or []) or '无'}",
+                "",
+                body_text,
+                f"\nHTML 正文：\n{body_html}" if body_html else "",
+                "",
+                "附件：",
+                *(
+                    [
+                        f"{index}. {item.get('display_name') or '未命名附件'} "
+                        f"({format_size(item.get('size_bytes'))})"
+                        for index, item in enumerate(attachments, start=1)
+                    ]
+                    or ["无"]
+                ),
+            ]
+        )
+        dialog = QDialog(self)
+        dialog.setWindowTitle(str(request.get("subject") or "待恢复发件详情"))
+        dialog.resize(760, 560)
+        dialog_layout = QVBoxLayout(dialog)
+        viewer = QTextEdit()
+        viewer.setReadOnly(True)
+        viewer.setPlainText(detail)
+        dialog_layout.addWidget(viewer, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        dialog_layout.addWidget(buttons)
+        dialog.exec()
+
+    def mark_selected_send_resolution(self, resolution: str) -> None:
+        request = self._selected_recovery_request()
+        if not request:
+            self.show_message("请选择待恢复发件", "error")
+            return
+        sent = resolution == "sent"
+        confirmation = QMessageBox.question(
+            self,
+            "确认发件结果",
+            (
+                "确认该邮件已经发送？程序只会恢复本地归档，绝不会再次调用 SMTP。"
+                if sent
+                else "确认该邮件确定没有发送？此结论不会删除固定内容，仍可另建新请求。"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            return
+        request_id = str(request.get("send_request_id") or "")
+        button = (
+            self.recovery_mark_sent_button
+            if sent
+            else self.recovery_mark_not_sent_button
+        )
+        self._run_task(
+            "正在记录发件结果；不会调用 SMTP",
+            lambda: self.service.mark_agent_send_resolution(
+                request_id, resolution=resolution
+            ),
+            self._finish_recovery_action,
+            button=button,
+        )
+
+    def clone_selected_recovery_request(self) -> None:
+        request = self._selected_recovery_request()
+        if not request:
+            self.show_message("请选择待恢复发件", "error")
+            return
+        confirmation = QMessageBox.question(
+            self,
+            "创建新的待确认请求",
+            "将基于原固定内容创建一个全新幂等键的待确认请求。现在不会发送，是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            return
+        request_id = str(request.get("send_request_id") or "")
+        self._run_task(
+            "正在创建新的待确认发件",
+            lambda: self.service.clone_agent_send_request(request_id),
+            self._finish_recovery_action,
+            button=self.recovery_clone_button,
+        )
+
+    def _finish_recovery_action(self, result: ServiceResult) -> None:
+        self._show_service_result(result)
+        self.show_send_recovery_requests()
+        self.refresh_mail_health()
+        if result.ok and result.details.get("send_request", {}).get("status") == (
+            "pending_confirmation"
+        ):
+            self._refresh_pending_send_requests()
+
+    def reconcile_send_recovery_requests(self) -> None:
+        def task() -> ServiceResult:
+            listed = self.service.list_send_recovery_requests()
+            if not listed.ok:
+                return listed
+            changed = 0
+            unresolved = 0
+            failed = 0
+            for row in listed.details.get("requests", []):
+                result = self.service.reconcile_agent_send_request(
+                    str(row.get("send_request_id") or "")
+                )
+                if result.ok and result.details.get("changed"):
+                    changed += 1
+                elif result.ok:
+                    unresolved += 1
+                else:
+                    failed += 1
+            return ServiceResult(
+                OperationStatus.PARTIAL if failed or unresolved else OperationStatus.SUCCESS,
+                message=(
+                    f"发件对账完成：已解决 {changed}，仍待处理 {unresolved}，失败 {failed}"
+                ),
+                details={
+                    "changed": changed,
+                    "unresolved": unresolved,
+                    "failed": failed,
+                },
+            )
+
+        self._run_task(
+            "正在重新对账发件；不会调用 SMTP",
+            task,
+            lambda result: (
+                self._show_service_result(result),
+                self.refresh_mail_health(),
+            ),
+            button=self.reconcile_send_button,
+        )
+
+    def preview_safe_cleanup(self) -> None:
+        self._run_task(
+            "正在预览安全清理；不会删除文件",
+            self.service.preview_safe_cleanup,
+            self._show_cleanup_preview,
+            button=self.cleanup_preview_button,
+        )
+
+    def _show_cleanup_preview(self, result: ServiceResult) -> None:
+        if result.ok:
+            self.mail_health_summary.setPlainText(
+                "安全清理预览（尚未删除任何文件）\n"
+                f"符合条件：{result.details.get('eligible_count', 0)} 项\n"
+                f"预计释放：{format_size(result.details.get('estimated_bytes', 0))}\n"
+                "结果不确定、归档待恢复和仍在执行的发件快照不会被清理。"
+            )
+        self._show_service_result(result)
+
+    def execute_safe_cleanup(self) -> None:
+        confirmation = QMessageBox.question(
+            self,
+            "确认安全清理",
+            "只会清理已满足保留期且已确认可清理的 AgentMailBridge 发件快照。"
+            "不会删除永久邮件事实或用户原始附件。是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            self.show_message("已取消安全清理", "normal")
+            return
+        self._run_task(
+            "正在执行安全清理",
+            lambda: self.service.execute_safe_cleanup(confirmed=True),
+            lambda result: (
+                self._show_service_result(result),
+                self.refresh_mail_health(),
+            ),
+            button=self.cleanup_execute_button,
         )
 
     def _show_maintenance_status(self, result: ServiceResult) -> None:
@@ -1801,14 +2135,98 @@ class BridgeWindow(QMainWindow):
 
     def _show_consistency_result(self, result: ServiceResult) -> None:
         if result.ok:
-            summary = result.details.get("summary", {})
-            self.maintenance_summary.setPlainText(
-                "一致性扫描结果（未删除任何数据）\n"
-                f"缺失：{summary.get('missing', 0)}，孤立：{summary.get('orphan', 0)}，"
-                f"Hash 异常：{summary.get('hash_mismatch', 0)}，越界：{summary.get('unsafe_path', 0)}，"
-                f"暂存残留：{summary.get('staging_residual', 0)}，无法访问：{summary.get('inaccessible', 0)}"
-            )
+            self._render_consistency_scan(result.details)
         self._show_service_result(result)
+
+    def _render_consistency_scan(self, details: dict) -> None:
+        summary = details.get("summary", {})
+        preview = details.get("repair_preview", {})
+        self.maintenance_summary.setPlainText(
+            "一致性扫描结果（未删除任何数据）\n"
+            f"问题总数：{len(details.get('issues', []))}，"
+            f"可安全修复：{preview.get('repairable_count', 0)}，"
+            f"需人工处理：{preview.get('manual_count', 0)}\n"
+            f"缺失：{summary.get('missing', 0)}，孤立：{summary.get('orphan', 0)}，"
+            f"Hash 异常：{summary.get('hash_mismatch', 0)}，越界：{summary.get('unsafe_path', 0)}，"
+            f"暂存残留：{summary.get('staging_residual', 0)}，无法访问：{summary.get('inaccessible', 0)}\n"
+            "修复一次只处理一个所选问题；不可确定的问题会保留证据，不自动合并或重发。"
+        )
+        self._populate_consistency_repair_selector(preview)
+
+    def _populate_consistency_repair_selector(self, preview: dict) -> None:
+        previous = str(self.consistency_repair_selector.currentData() or "")
+        rows = list(preview.get("issues", []))
+        self.consistency_repair_rows = {
+            str(row.get("issue_id") or ""): dict(row)
+            for row in rows
+            if str(row.get("issue_id") or "")
+        }
+        self.consistency_repair_scan_id = str(preview.get("scan_id") or "")
+        self.consistency_repair_selector.blockSignals(True)
+        self.consistency_repair_selector.clear()
+        for issue_id, row in self.consistency_repair_rows.items():
+            mode = "可修复" if row.get("repairable") else "需人工处理"
+            entity = str(row.get("entity_id") or "")[:32]
+            self.consistency_repair_selector.addItem(
+                f"{mode} · {row.get('category')} · {row.get('title')} · {entity}",
+                issue_id,
+            )
+        if previous:
+            index = self.consistency_repair_selector.findData(previous)
+            if index >= 0:
+                self.consistency_repair_selector.setCurrentIndex(index)
+        self.consistency_repair_selector.blockSignals(False)
+        self._update_consistency_repair_button()
+
+    def _selected_consistency_repair(self) -> dict | None:
+        issue_id = str(self.consistency_repair_selector.currentData() or "")
+        return self.consistency_repair_rows.get(issue_id)
+
+    def _update_consistency_repair_button(self, *_args) -> None:
+        row = (
+            self._selected_consistency_repair()
+            if hasattr(self, "consistency_repair_selector")
+            else None
+        )
+        button = getattr(self, "consistency_repair_button", None)
+        if button is not None:
+            button.setEnabled(bool(row and row.get("repairable")))
+
+    def apply_selected_consistency_repair(self) -> None:
+        row = self._selected_consistency_repair()
+        if not row or not row.get("repairable"):
+            self.show_message("请选择可安全修复的问题", "error")
+            return
+        confirmation = QMessageBox.question(
+            self,
+            "确认单项一致性修复",
+            f"将执行：{row.get('title')}。\n"
+            "执行前会创建并校验数据库备份。此操作不会发送邮件、删除永久事实或合并模糊候选。是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            self.show_message("已取消一致性修复", "normal")
+            return
+        issue_id = str(row["issue_id"])
+        scan_id = self.consistency_repair_scan_id
+        self._run_task(
+            "正在备份并修复所选一致性问题",
+            lambda: self.service.apply_consistency_repair(
+                scan_id=scan_id,
+                issue_id=issue_id,
+                confirmed=True,
+            ),
+            self._finish_consistency_repair,
+            button=self.consistency_repair_button,
+        )
+
+    def _finish_consistency_repair(self, result: ServiceResult) -> None:
+        scan = result.details.get("scan", {}) if result.details else {}
+        if scan:
+            self._render_consistency_scan(scan)
+        self._show_service_result(result)
+        self.refresh_mail_health()
 
     def _choose_backup_path(self, title: str) -> str:
         path, _ = QFileDialog.getOpenFileName(
@@ -2809,6 +3227,8 @@ class BridgeWindow(QMainWindow):
             "advanced": "settings",
         }.get(target, target)
         self._set_exclusive_checked(self.nav_buttons, nav_target)
+        if target == "maintenance" and hasattr(self, "mail_health_button"):
+            self.refresh_mail_health()
 
     def _current_page_name(self) -> str:
         if not hasattr(self, "page_stack"):
