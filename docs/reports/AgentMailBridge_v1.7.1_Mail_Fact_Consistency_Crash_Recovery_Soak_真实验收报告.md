@@ -10,7 +10,7 @@
 
 ## 2. 最终 HEAD
 
-核心实现提交为 `0b3448baf901c9077f345aad41b6203bb182c039`。本报告首次发布提交与最终远端状态将在首次普通 push 后回填；不以未发生的推送作为证据。
+核心实现提交为 `0b3448baf901c9077f345aad41b6203bb182c039`。包含产品文档、69 项报告与 7 张矩阵的首次完整推送 HEAD 为 `18821153185f0f63fde1a99282c295810e4eaeb2`；GitHub `refs/heads/master` 已实际核对为同一 SHA。其后的提交仅回填本次推送状态。
 
 ## 3. 本阶段目标
 
@@ -284,11 +284,11 @@ Gmail 只读；Generic 为 implementation ready / E2E required；Outlook/Microso
 
 - `2bd6bababaaf7aae0dd8125c92e3a55d63c5367b`：Research Gate 与复用决策。
 - `0b3448baf901c9077f345aad41b6203bb182c039`：邮件事实一致性、恢复、GUI、迁移、测试和发布脚本。
-- 产品文档和本报告提交将在首次 push 前生成，并在第 69 项回填。
+- `18821153185f0f63fde1a99282c295810e4eaeb2`：产品文档、发布检查清单和最终专项报告。
 
 ## 69. push status
 
-当前为首次 push 前状态：尚未推送，因此不标记 PASS。计划只做普通 fast-forward push 到 `origin/master`，随后把首次推送 HEAD 和 GitHub 远端状态回填本报告，再以单独文档提交完成第二次普通 push。全程不建分支、不 force push、不改写历史、不创建 Tag、PR、GitHub Release 或 Release Assets。
+PASS。2026-07-31 首次普通 fast-forward push 已成功：`98d2c95..1882115 master -> master`。随后使用 `git ls-remote` 核对 GitHub `refs/heads/master` 为 `18821153185f0f63fde1a99282c295810e4eaeb2`。本段回填以独立文档提交再次普通 push；第二次推送结果由最终交付状态记录。全程不建分支、不 force push、不改写历史、不创建 Tag、PR、GitHub Release 或 Release Assets。
 
 ## A. 发件恢复矩阵
 
