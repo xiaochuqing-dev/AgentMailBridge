@@ -36,6 +36,10 @@ from agent_mail_bridge.database import (
 )
 from agent_mail_bridge.mail_archive import archive_normalized_mail
 from agent_mail_bridge.mail_common import normalized_mail_from_raw
+from agent_mail_bridge.maintenance import (
+    create_database_backup,
+    verify_database_backup,
+)
 from agent_mail_bridge.ui.settings_store import save_env_values
 from agent_mail_bridge.utils import sha256_of_file
 
@@ -113,7 +117,7 @@ def _packaged_probe(
     *,
     cfg: AppConfig | None = None,
     client_auth_env: dict[str, str] | None = None,
-    migration_backup_label: str | None = None,
+    required_backup_label: str | None = None,
 ) -> dict[str, bool]:
     gui = install_dir / "AgentMailBridge.exe"
     mcp = install_dir / "AgentMailBridgeMCP.exe"
@@ -176,12 +180,12 @@ def _packaged_probe(
         .get("serverInfo", {})
         .get("version")
     )
-    migration_backup_created = True
-    if migration_backup_label:
-        migration_backup_created = bool(
+    required_backup_created = True
+    if required_backup_label:
+        required_backup_created = bool(
             list(
                 (cfg.data_root_path / "backups").glob(
-                    f"*{migration_backup_label}*.db"
+                    f"*{required_backup_label}*.db"
                 )
             )
         )
@@ -193,7 +197,7 @@ def _packaged_probe(
         "mcp_sync_status": not bool(by_id.get(3, {}).get("result", {}).get("isError")),
         "mcp_stdout_purity": "Traceback" not in completed.stderr,
         "mcp_eof_exit": completed.returncode == 0,
-        "migration_backup": migration_backup_created,
+        "required_backup": required_backup_created,
     }
 
 
@@ -722,6 +726,13 @@ def _snapshot(home: Path, cfg: AppConfig, credential_exists: bool) -> dict[str, 
                 )
             )
         ),
+        "v172_upgrade_backup_count": len(
+            list(
+                (cfg.data_root_path / "backups").glob(
+                    "*before_v1_7_2_upgrade*.db"
+                )
+            )
+        ),
     }
 
 
@@ -759,8 +770,8 @@ def main() -> int:
     parser.add_argument("--new-installer", required=True, type=Path)
     parser.add_argument("--old-source-dir", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--old-version", default="1.7.0")
-    parser.add_argument("--new-version", default="1.7.1")
+    parser.add_argument("--old-version", default="1.7.1")
+    parser.add_argument("--new-version", default="1.7.2")
     parser.add_argument("--confirm-isolated-install", action="store_true")
     args = parser.parse_args()
     if not args.confirm_isolated_install:
@@ -785,8 +796,9 @@ def main() -> int:
     }
     final_uninstall_needed = False
     try:
-        with tempfile.TemporaryDirectory(prefix="amb-lifecycle-") as temporary:
-            root = Path(temporary)
+        temporary = tempfile.TemporaryDirectory(prefix="amb-lifecycle-")
+        try:
+            root = Path(temporary.name)
             install_dir = root / "Program Files" / "AgentMailBridge"
             home = root / "User Home"
             env = os.environ.copy()
@@ -810,8 +822,8 @@ def main() -> int:
             (home / "Workspace").mkdir(parents=True)
             credential_backend.write(credential_name, credential_value)
 
-            _install(old_installer, install_dir, env)
             final_uninstall_needed = True
+            _install(old_installer, install_dir, env)
             try:
                 cfg, lifecycle_client_auth = _seed_baseline_from_source(
                     old_source_dir,
@@ -835,6 +847,12 @@ def main() -> int:
                 credential_backend.read(credential_name) == credential_value,
             )
 
+            upgrade_backup = create_database_backup(
+                cfg, label="before_v1_7_2_upgrade"
+            )
+            verified_upgrade_backup = verify_database_backup(
+                cfg, upgrade_backup["path"]
+            )
             _install(new_installer, install_dir, env)
             upgraded_probe = _packaged_probe(
                 install_dir,
@@ -842,7 +860,7 @@ def main() -> int:
                 args.new_version,
                 cfg=cfg,
                 client_auth_env=lifecycle_client_auth,
-                migration_backup_label="before_v1_7_1_consistency",
+                required_backup_label="before_v1_7_2_upgrade",
             )
             after_upgrade = _snapshot(
                 home,
@@ -859,15 +877,15 @@ def main() -> int:
             )
             program_removed = not (install_dir / "AgentMailBridge.exe").exists()
 
-            _install(new_installer, install_dir, env)
             final_uninstall_needed = True
+            _install(new_installer, install_dir, env)
             reinstall_probe = _packaged_probe(
                 install_dir,
                 env,
                 args.new_version,
                 cfg=cfg,
                 client_auth_env=lifecycle_client_auth,
-                migration_backup_label="before_v1_7_1_consistency",
+                required_backup_label="before_v1_7_2_upgrade",
             )
             after_reinstall = _snapshot(
                 home,
@@ -880,8 +898,11 @@ def main() -> int:
                 "old_install": all(old_probe.values()),
                 "upgrade_install": all(upgraded_probe.values()),
                 "db_integrity": after_upgrade["db_integrity"] == "ok",
-                "v171_migration_backup_created": (
-                    after_upgrade["v171_migration_backup_count"] > 0
+                "upgrade_backup_created_and_verified": (
+                    after_upgrade["v172_upgrade_backup_count"] > 0
+                    and verified_upgrade_backup["integrity_check"] == "ok"
+                    and verified_upgrade_backup["sha256"]
+                    == upgrade_backup["sha256"]
                 ),
                 "v17_schema_preserved": (
                     after_upgrade["v17_schema_version"]
@@ -988,6 +1009,14 @@ def main() -> int:
             }
             _uninstall(install_dir, env)
             final_uninstall_needed = False
+        finally:
+            if final_uninstall_needed and install_dir.exists():
+                try:
+                    _uninstall(install_dir, env)
+                    final_uninstall_needed = False
+                except Exception:
+                    pass
+            temporary.cleanup()
     finally:
         try:
             credential_backend.delete(credential_name)

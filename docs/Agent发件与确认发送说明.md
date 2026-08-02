@@ -1,6 +1,6 @@
 # Agent 发件与确认发送说明
 
-AgentMailBridge v1.7.1 通过统一 `send_mail` 支持新建、回复、回复全部和转发。发件账号必须已启用、具备 Provider send 能力并在当前 Client 范围内；收件人可以是任意合法邮箱地址，支持多 To、Cc、Bcc。地址、显示名、主题和附件名拒绝 CRLF/Header 注入；IDN 域名规范化为 punycode，不声明 SMTPUTF8 时拒绝 Unicode local-part。
+AgentMailBridge v1.7.2 通过统一 `send_mail` 支持新建、回复、回复全部和转发。发件账号必须已启用、具备 Provider send 能力并在当前 Client 范围内；收件人可以是任意合法邮箱地址，支持多 To、Cc、Bcc。地址、显示名、主题和附件名拒绝 CRLF/Header 注入；IDN 域名规范化为 punycode，不声明 SMTPUTF8 时拒绝 Unicode local-part。
 
 发件模式只有两种。
 

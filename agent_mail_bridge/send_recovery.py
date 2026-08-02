@@ -8,6 +8,12 @@ from pathlib import Path
 from typing import Any
 
 from agent_mail_bridge.database import get_connection
+from agent_mail_bridge.mail_common import normalize_message_id, parse_mailboxes
+from agent_mail_bridge.reconciliation_evidence import (
+    decide_reconciliation_candidate,
+    request_content_fingerprints,
+    within_composite_evidence_window,
+)
 from agent_mail_bridge.send_requests import (
     RECOVERY_SEND_STATUSES,
     complete_send_request,
@@ -160,64 +166,120 @@ def reconcile_send_request_locally(
     if request is None:
         raise ValueError("发件请求不存在")
     connection = get_connection(db_path)
+    request_package_id = str(request.get("package_id") or "")
+    request_hash = str(request.get("raw_eml_sha256") or "")
+    request_message_id = normalize_message_id(str(request.get("message_id") or ""))
     rows = connection.execute(
         """
-        SELECT p.package_id, p.archive_status,
+        SELECT p.*,
                EXISTS(SELECT 1 FROM sent_server_mappings sm
-                      WHERE sm.package_id=p.package_id
-                        AND sm.reconciliation_status='matched') AS sent_matched,
-               CASE
-                 WHEN p.package_id=? THEN 0
-                 WHEN EXISTS(SELECT 1 FROM outbound_messages own
-                             WHERE own.package_id=p.package_id
-                               AND own.request_id=?) THEN 1
-                 ELSE 2
-               END AS evidence_rank
+                       WHERE sm.package_id=p.package_id
+                         AND sm.reconciliation_status='matched') AS sent_matched,
+               EXISTS(SELECT 1 FROM outbound_messages own
+                      WHERE own.package_id=p.package_id
+                        AND own.request_id=?) AS request_linked
         FROM mail_packages p
         WHERE p.account_id=? AND p.direction='outbound'
-          AND (p.package_id=? OR EXISTS(
-                 SELECT 1 FROM outbound_messages o
-                 WHERE o.package_id=p.package_id AND o.request_id=?
-               )
-               OR (p.message_id=? COLLATE NOCASE AND p.message_id!=''))
-        ORDER BY evidence_rank, sent_matched DESC, p.local_outbound DESC, p.id ASC
-        LIMIT 3
+          AND ((?!='' AND p.package_id=?)
+               OR EXISTS(SELECT 1 FROM outbound_messages o
+                         WHERE o.package_id=p.package_id AND o.request_id=?)
+               OR (?!='' AND p.raw_eml_sha256=? COLLATE NOCASE)
+               OR (?!='' AND p.message_id=? COLLATE NOCASE))
+        ORDER BY p.id ASC
+        LIMIT 500
         """,
         (
-            str(request.get("package_id") or ""),
             send_request_id,
             str(request.get("sender_account_id") or ""),
-            str(request.get("package_id") or ""),
+            request_package_id,
+            request_package_id,
             send_request_id,
-            str(request.get("message_id") or ""),
+            request_hash,
+            request_hash,
+            request_message_id,
+            request_message_id,
         ),
     ).fetchall()
-    if not rows:
-        return {"changed": False, "status": str(request.get("status") or "")}
-    best_rank = min(int(item["evidence_rank"]) for item in rows)
-    candidates = {
-        str(item["package_id"]): item
-        for item in rows
-        if int(item["evidence_rank"]) == best_rank
-        and str(item["archive_status"] or "") in {"ready", "legacy"}
+    usable = {
+        str(row["package_id"]): row
+        for row in rows
+        if str(row["archive_status"] or "") in {"ready", "legacy"}
     }
-    if len(candidates) != 1:
-        if len(candidates) > 1:
+    strong_matches: dict[str, set[str]] = {
+        "exact_request_package_id": {
+            package_id
+            for package_id in usable
+            if request_package_id and package_id == request_package_id
+        },
+        "exact_outbound_request_link": {
+            package_id
+            for package_id, row in usable.items()
+            if bool(row["request_linked"])
+        },
+        "exact_raw_hash": {
+            package_id
+            for package_id, row in usable.items()
+            if request_hash
+            and str(row["raw_eml_sha256"] or "").casefold()
+            == request_hash.casefold()
+        },
+    }
+    message_candidates = {
+        package_id
+        for package_id, row in usable.items()
+        if request_message_id
+        and normalize_message_id(str(row["message_id"] or ""))
+        == request_message_id
+    }
+    account = connection.execute(
+        "SELECT email_address FROM mail_accounts WHERE account_id=?",
+        (str(request.get("sender_account_id") or ""),),
+    ).fetchone()
+    composite_candidates = {
+        package_id
+        for package_id, row in usable.items()
+        if package_id in message_candidates
+        and _package_matches_request_composite(
+            package=row,
+            request=request,
+            sender_email=str(account[0] or "") if account else "",
+        )
+    }
+    decision = decide_reconciliation_candidate(
+        strong_matches=strong_matches,
+        evidence_priority=(
+            "exact_request_package_id",
+            "exact_outbound_request_link",
+            "exact_raw_hash",
+        ),
+        message_id_candidates=message_candidates,
+        composite_candidates=composite_candidates,
+        message_id_override_evidence={
+            "exact_request_package_id",
+            "exact_outbound_request_link",
+            "exact_raw_hash",
+        },
+    )
+    if decision.status != "matched" or not decision.candidate_id:
+        if decision.candidate_count:
             _record_resolution(
                 db_path,
                 request_id=send_request_id,
                 account_id=str(request.get("sender_account_id") or ""),
                 status="unresolved",
-                evidence_type="ambiguous_local_outbound_candidates",
-                confidence="manual_review",
+                evidence_type=decision.evidence_type,
+                confidence=decision.confidence,
+                candidate_count=decision.candidate_count,
+                decision_reason=decision.decision_reason,
             )
         return {
             "changed": False,
             "status": str(request.get("status") or ""),
-            "ambiguous": len(candidates) > 1,
-            "candidate_count": len(candidates),
+            "ambiguous": decision.status == "ambiguous",
+            "candidate_count": decision.candidate_count,
+            "evidence_type": decision.evidence_type,
         }
-    row = next(iter(candidates.values()))
+    row = usable[decision.candidate_id]
     matched = bool(row["sent_matched"])
     status = "sent_reconciled" if matched else "sent"
     completed = complete_send_request(
@@ -235,14 +297,80 @@ def reconcile_send_request_locally(
         account_id=str(request.get("sender_account_id") or ""),
         package_id=str(row["package_id"]),
         status="matched" if matched else "local_fact_confirmed",
-        evidence_type="exact_sent_mapping" if matched else "local_outbound_fact",
-        confidence="exact" if matched else "high",
+        evidence_type=decision.evidence_type,
+        confidence=decision.confidence,
+        decision_reason=decision.decision_reason,
     )
     return {
         "changed": str(request.get("status") or "") != status,
         "status": status,
         "request": completed,
+        "evidence_type": decision.evidence_type,
     }
+
+
+def _package_matches_request_composite(
+    *,
+    package: Any,
+    request: dict[str, Any],
+    sender_email: str,
+) -> bool:
+    package_fingerprint = str(package["content_fingerprint"] or "").casefold()
+    if not package_fingerprint:
+        return False
+    expected_sender = str(sender_email or "").strip().casefold()
+    package_senders = set(
+        parse_mailboxes(package["from_raw_header"], package["from_email"])
+    )
+    if not expected_sender or package_senders != {expected_sender}:
+        return False
+    grouped: dict[str, set[str]] = {"to": set(), "cc": set(), "bcc": set()}
+    for item in request.get("recipients") or []:
+        recipient_type = str(item.get("recipient_type") or "")
+        address = str(item.get("email_address") or "").strip().casefold()
+        if recipient_type in grouped and address:
+            grouped[recipient_type].add(address)
+    if set(parse_mailboxes(package["to_raw_header"], package["to_emails"])) != grouped["to"]:
+        return False
+    if set(parse_mailboxes(package["cc_raw_header"], package["cc_emails"])) != grouped["cc"]:
+        return False
+    if str(package["subject"] or "") != str(request.get("subject") or ""):
+        return False
+    fingerprints = request_content_fingerprints(
+        subject=str(request.get("subject") or ""),
+        body_text=str(request.get("body_text") or ""),
+        to_emails=grouped["to"],
+        cc_emails=grouped["cc"],
+        bcc_emails=grouped["bcc"],
+        attachments={
+            (
+                str(item.get("display_name") or ""),
+                int(item.get("size_bytes") or 0),
+                str(item.get("sha256") or ""),
+            )
+            for item in request.get("attachments") or []
+        },
+    )
+    if package_fingerprint not in {item.casefold() for item in fingerprints}:
+        return False
+    package_time = next(
+        (
+            str(package[field] or "")
+            for field in (
+                "sent_at",
+                "declared_at",
+                "received_at",
+                "observed_at",
+                "created_at",
+            )
+            if package[field]
+        ),
+        "",
+    )
+    request_time = str(
+        request.get("smtp_accepted_at") or request.get("created_at") or ""
+    )
+    return within_composite_evidence_window(package_time, request_time)
 
 
 def mark_send_request_resolution(
@@ -327,6 +455,8 @@ def _record_resolution(
     evidence_type: str,
     confidence: str,
     package_id: str | None = None,
+    candidate_count: int = 1,
+    decision_reason: str = "",
 ) -> None:
     connection = get_connection(db_path)
     now = _now(connection)
@@ -334,6 +464,11 @@ def _record_resolution(
     reconciliation_id = "recon_" + hashlib.sha256(
         material.encode("utf-8")
     ).hexdigest()[:24]
+    details_json = json.dumps(
+        {"decision_reason": decision_reason} if decision_reason else {},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
     connection.execute(
         """
         INSERT INTO reconciliation_records
@@ -341,12 +476,14 @@ def _record_resolution(
              package_id, send_request_id, status, evidence_type, confidence,
              candidate_count, details_json, first_seen_at, last_seen_at,
              resolved_at)
-        VALUES (?, 'send_request', ?, ?, ?, ?, ?, ?, ?, 1, '{}', ?, ?, ?)
+        VALUES (?, 'send_request', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(reconciliation_id) DO UPDATE SET
             package_id=COALESCE(excluded.package_id,
                                 reconciliation_records.package_id),
             status=excluded.status,
             confidence=excluded.confidence,
+            candidate_count=excluded.candidate_count,
+            details_json=excluded.details_json,
             last_seen_at=excluded.last_seen_at,
             resolved_at=excluded.resolved_at
         """,
@@ -359,6 +496,8 @@ def _record_resolution(
             status,
             evidence_type,
             confidence,
+            int(candidate_count),
+            details_json,
             now,
             now,
             now if status != "unresolved" else None,

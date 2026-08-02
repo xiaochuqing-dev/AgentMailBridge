@@ -1227,11 +1227,12 @@ def test_sent_matching_refuses_ambiguous_message_id_and_prefers_provider_id(
         raw_sha256="",
     )
     assert conflict == {
-        "status": "ambiguous",
-        "evidence_type": "conflicting_exact_evidence",
-        "confidence": "manual_review",
-        "candidate_count": 2,
-        "package_id": None,
+        "status": "matched",
+        "evidence_type": "exact_provider_id",
+        "confidence": "exact",
+        "candidate_count": 1,
+        "package_id": "pkg-v171-a",
+        "decision_reason": "strong_evidence_overrode_message_id",
     }
 
 

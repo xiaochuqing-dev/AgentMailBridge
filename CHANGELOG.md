@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## 1.7.2 Reliability Audit & Release Candidate - 2026-08-03
+
+- 修复 Sent 回流把唯一 Message-ID 直接提升为正式 package 的风险。Message-ID 现在只查找候选；自动匹配必须依赖精确关联、Provider mapping、raw MIME SHA-256，或完整的 Header、内容/附件指纹与绝对七天窗口复合证据。
+- 修复启动与手动本地发件恢复仅凭唯一 Message-ID 把 `delivery_unknown` 推进为已发送的风险；本地恢复与 Sent 同步共用无副作用证据决策，恢复过程不调用 SMTP。
+- 强 Provider/raw/outbound 证据指向不同事实时进入 `ambiguous/manual_review`；任一明确强关联可按可审计规则覆盖冲突的弱 Message-ID 候选，审计记录保存决策原因和真实候选数。
+- 内容/附件指纹不再脱离 Message-ID、Header 和时间边界单独充当物理邮件身份；账号隔离、external outbound、幂等 package、accepted 后只恢复归档和 `delivery_unknown` 不自动重发保持不变。
+- 新增独立 v1.7.2 Red Team，覆盖 Message-ID 复用、收件人和附件冲突、强证据冲突、弱恢复、时间回拨、账号隔离、外部发件、幂等与一致性扫描不自动合并。
+- 生命周期验收默认从 v1.7.1 覆盖升级到 v1.7.2，升级前创建并校验隔离数据库备份；失败路径先卸载随机 AppId 测试实例再清理临时目录，避免残留测试安装项。
+- 本版是可靠性审计与 Release Candidate 收口，不新增 Provider、权限、MCP 工具或产品功能；Gmail 仍严格为 `gmail.readonly`，QQ/163 仍正式支持，Generic 与 Outlook 状态不变。
+
 ## 1.7.1 Mail Fact Consistency, Crash Recovery & Long-Run Reliability - 2026-07-30
 
 - 邮件事实与邮箱目录归属拆分为多对多 membership；Inbox、Sent、Archive、Gmail Label 和自定义目录可共同指向同一 package，目录移动或服务器删除只更新 presence，不删除本地永久事实。

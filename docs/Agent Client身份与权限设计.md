@@ -2,7 +2,7 @@
 
 ## 产品边界
 
-v1.7.1 正式重点支持 Codex、Claude Code 和 Hermes。普通 Claude Desktop 只保留兼容代码。AgentMailBridge 提供 11 个确定性工具，不内置模型、不理解自然语言、不自动挑选邮件、不自动重发未知结果，也不建立通用 IAM、团队角色或远程认证系统。
+v1.7.2 正式重点支持 Codex、Claude Code 和 Hermes。普通 Claude Desktop 只保留兼容代码。AgentMailBridge 提供 11 个确定性工具，不内置模型、不理解自然语言、不自动挑选邮件、不自动重发未知结果，也不建立通用 IAM、团队角色或远程认证系统。
 
 权限以 Client 为边界并默认拒绝。读取、发件和兼容结果提交互相独立；读取账号、邮箱目录、发件账号、完整资料输出目录和本地附件目录分别支持动态 `all` 与显式 `selected`。旧 Client 迁移后保持 selected 且默认没有 `mail.send`。通用发件只有 `confirm` 和 `autonomous` 两种模式。
 

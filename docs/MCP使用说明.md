@@ -1,6 +1,6 @@
 # AgentMailBridge MCP 使用说明
 
-AgentMailBridge v1.7.1 MCP 是本机按需启动的统一 stdio 服务。它不按 Provider 或 Client 拆分，不监听端口、不常驻、不创建快捷方式或托盘；stdin 关闭后服务退出。11 个工具服务于同一账号、目录 membership、收件、发件、恢复状态和线程事实；兼容 `submit_result` 参数与 Gmail `gmail.readonly` scope 保持不变。
+AgentMailBridge v1.7.2 MCP 是本机按需启动的统一 stdio 服务。它不按 Provider 或 Client 拆分，不监听端口、不常驻、不创建快捷方式或托盘；stdin 关闭后服务退出。11 个工具服务于同一账号、目录 membership、收件、发件、恢复状态和线程事实；兼容 `submit_result` 参数与 Gmail `gmail.readonly` scope 保持不变。
 
 从左侧“Agent 接入”创建 Client。推荐权限默认动态允许所有当前及以后新增邮箱和资料目录、读取与完整资料准备，并关闭结果提交；自定义模式才使用显式 capability、账号和目录。下面的匿名结构只说明 command 形态，不具备 v1.6.0 调用身份，不能直接连接：
 

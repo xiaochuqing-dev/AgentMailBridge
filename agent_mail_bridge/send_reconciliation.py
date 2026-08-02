@@ -11,16 +11,19 @@ from agent_mail_bridge.config import AppConfig
 from agent_mail_bridge.database import get_connection
 from agent_mail_bridge.mail_common import normalize_message_id, parse_mailboxes
 from agent_mail_bridge.mail_threading import record_sent_mapping
+from agent_mail_bridge.reconciliation_evidence import (
+    decide_reconciliation_candidate,
+    request_content_fingerprints,
+    within_composite_evidence_window,
+)
 from agent_mail_bridge.send_requests import get_send_request, record_outbound_fact
 
 
-EVIDENCE_PRIORITY = {
-    "exact_outbound_id": 0,
-    "exact_provider_id": 1,
-    "exact_message_id": 2,
-    "exact_raw_hash": 3,
-    "exact_content_attachment_fingerprint": 4,
-}
+EVIDENCE_PRIORITY = (
+    "exact_outbound_id",
+    "exact_provider_id",
+    "exact_raw_hash",
+)
 
 
 def find_sent_candidate(
@@ -36,10 +39,11 @@ def find_sent_candidate(
     to_header: str = "",
     cc_header: str = "",
     subject: str = "",
+    observed_at: str = "",
 ) -> dict[str, Any]:
-    """只返回唯一的最强证据候选；歧义时绝不自动选择。"""
+    """只返回确定性证据候选；Message-ID 单独命中永不匹配。"""
     connection = get_connection(db_path)
-    matches: dict[str, set[str]] = {}
+    strong_matches: dict[str, set[str]] = {}
     if outbound_id:
         rows = connection.execute(
             """
@@ -48,7 +52,7 @@ def find_sent_candidate(
             """,
             (account_id, outbound_id),
         ).fetchall()
-        matches["exact_outbound_id"] = {str(row[0]) for row in rows}
+        strong_matches["exact_outbound_id"] = {str(row[0]) for row in rows}
     if provider_message_id:
         rows = connection.execute(
             """
@@ -57,18 +61,22 @@ def find_sent_candidate(
             """,
             (account_id, provider_message_id),
         ).fetchall()
-        matches["exact_provider_id"] = {str(row[0]) for row in rows}
+        strong_matches["exact_provider_id"] = {str(row[0]) for row in rows}
     normalized_id = normalize_message_id(message_id)
+    message_rows: list[Any] = []
     if normalized_id:
-        rows = connection.execute(
+        message_rows = connection.execute(
             """
-            SELECT package_id FROM mail_packages
+            SELECT package_id, content_fingerprint, subject, from_email,
+                   from_raw_header, to_emails, to_raw_header, cc_emails,
+                   cc_raw_header, sent_at, declared_at, received_at,
+                   observed_at, created_at
+            FROM mail_packages
             WHERE account_id=? AND message_id=? COLLATE NOCASE
               AND direction='outbound'
             """,
             (account_id, normalized_id),
         ).fetchall()
-        matches["exact_message_id"] = {str(row[0]) for row in rows}
     if raw_sha256:
         rows = connection.execute(
             """
@@ -77,70 +85,57 @@ def find_sent_candidate(
             """,
             (account_id, raw_sha256),
         ).fetchall()
-        matches["exact_raw_hash"] = {str(row[0]) for row in rows}
-    if content_fingerprint:
-        rows = connection.execute(
-            """
-            SELECT package_id FROM mail_packages
-            WHERE account_id=? AND content_fingerprint=?
-              AND direction='outbound'
-            """,
-            (account_id, content_fingerprint),
-        ).fetchall()
-        matches["exact_content_attachment_fingerprint"] = {
-            str(row[0]) for row in rows
-        }
-    nonempty = [
-        (evidence, candidates)
-        for evidence, candidates in matches.items()
-        if candidates
-    ]
-    if not nonempty:
-        result = _find_recoverable_send_request(
-            connection,
-            account_id=account_id,
-            message_id=normalized_id,
-            raw_sha256=raw_sha256,
+        strong_matches["exact_raw_hash"] = {str(row[0]) for row in rows}
+    message_candidates = {str(row["package_id"]) for row in message_rows}
+    composite_candidates = {
+        str(row["package_id"])
+        for row in message_rows
+        if _package_matches_observation_composite(
+            row,
+            content_fingerprint=content_fingerprint,
             from_header=from_header,
             to_header=to_header,
             cc_header=cc_header,
             subject=subject,
+            observed_at=observed_at,
         )
-    else:
-        evidence, candidates = min(
-            nonempty, key=lambda item: EVIDENCE_PRIORITY[item[0]]
+    }
+    decision = decide_reconciliation_candidate(
+        strong_matches=strong_matches,
+        evidence_priority=EVIDENCE_PRIORITY,
+        message_id_candidates=message_candidates,
+        composite_candidates=composite_candidates,
+        message_id_override_evidence=set(EVIDENCE_PRIORITY),
+    )
+    result = decision.as_result(id_key="package_id")
+    if decision.status == "unmatched":
+        request_result = _find_recoverable_send_request(
+            connection,
+            account_id=account_id,
+            message_id=normalized_id,
+            raw_sha256=raw_sha256,
+            content_fingerprint=content_fingerprint,
+            from_header=from_header,
+            to_header=to_header,
+            cc_header=cc_header,
+            subject=subject,
+            observed_at=observed_at,
         )
-        if len(candidates) == 1:
-            selected = next(iter(candidates))
-            conflicting_unique = {
-                next(iter(other_candidates))
-                for _other_evidence, other_candidates in nonempty
-                if len(other_candidates) == 1 and selected not in other_candidates
-            }
-            if conflicting_unique:
-                result = {
-                    "status": "ambiguous",
-                    "evidence_type": "conflicting_exact_evidence",
-                    "confidence": "manual_review",
-                    "candidate_count": len({selected, *conflicting_unique}),
-                    "package_id": None,
-                }
-            else:
-                result = {
-                    "status": "matched",
-                    "evidence_type": evidence,
-                    "confidence": "exact",
-                    "candidate_count": 1,
-                    "package_id": selected,
-                }
-        else:
+        if request_result["status"] != "unmatched":
+            result = request_result
+        elif int(result.get("candidate_count") or 0) and int(
+            request_result.get("candidate_count") or 0
+        ):
             result = {
                 "status": "ambiguous",
-                "evidence_type": evidence,
+                "evidence_type": "weak_package_and_request_candidates",
                 "confidence": "manual_review",
-                "candidate_count": len(candidates),
+                "candidate_count": int(result["candidate_count"])
+                + int(request_result["candidate_count"]),
                 "package_id": None,
             }
+        elif not int(result.get("candidate_count") or 0):
+            result = request_result
     _record_sent_reconciliation(
         db_path,
         account_id=account_id,
@@ -355,6 +350,15 @@ def _record_sent_reconciliation(
     status = str(result.get("status") or "unmatched")
     package_id = str(result.get("package_id") or "") or None
     send_request_id = str(result.get("send_request_id") or "") or None
+    details_json = json.dumps(
+        {
+            "decision_reason": str(result.get("decision_reason") or ""),
+        }
+        if result.get("decision_reason")
+        else {},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
     connection.execute(
         """
         INSERT INTO reconciliation_records
@@ -362,7 +366,7 @@ def _record_sent_reconciliation(
              package_id, send_request_id, status, evidence_type, confidence,
              candidate_count, details_json, first_seen_at, last_seen_at,
              resolved_at)
-        VALUES (?, 'sent_observation', ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?)
+        VALUES (?, 'sent_observation', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(reconciliation_id) DO UPDATE SET
             package_id=COALESCE(excluded.package_id,
                                 reconciliation_records.package_id),
@@ -371,6 +375,7 @@ def _record_sent_reconciliation(
             status=excluded.status,
             confidence=excluded.confidence,
             candidate_count=excluded.candidate_count,
+            details_json=excluded.details_json,
             last_seen_at=excluded.last_seen_at,
             resolved_at=excluded.resolved_at
         """,
@@ -384,6 +389,7 @@ def _record_sent_reconciliation(
             evidence,
             str(result.get("confidence") or "unknown"),
             int(result.get("candidate_count") or 0),
+            details_json,
             now,
             now,
             now if status in {"matched", "external_fact_created"} else None,
@@ -392,21 +398,73 @@ def _record_sent_reconciliation(
     connection.commit()
 
 
+def _package_matches_observation_composite(
+    row: Any,
+    *,
+    content_fingerprint: str,
+    from_header: str,
+    to_header: str,
+    cc_header: str,
+    subject: str,
+    observed_at: str,
+) -> bool:
+    expected_fingerprint = str(row["content_fingerprint"] or "").casefold()
+    if (
+        not content_fingerprint
+        or not expected_fingerprint
+        or content_fingerprint.casefold() != expected_fingerprint
+    ):
+        return False
+    observed_senders = set(parse_mailboxes(from_header))
+    expected_senders = set(
+        parse_mailboxes(row["from_raw_header"], row["from_email"])
+    )
+    if not observed_senders or observed_senders != expected_senders:
+        return False
+    if set(parse_mailboxes(to_header)) != set(
+        parse_mailboxes(row["to_raw_header"], row["to_emails"])
+    ):
+        return False
+    if set(parse_mailboxes(cc_header)) != set(
+        parse_mailboxes(row["cc_raw_header"], row["cc_emails"])
+    ):
+        return False
+    if str(row["subject"] or "") != str(subject or ""):
+        return False
+    package_time = next(
+        (
+            str(row[field] or "")
+            for field in (
+                "sent_at",
+                "declared_at",
+                "received_at",
+                "observed_at",
+                "created_at",
+            )
+            if row[field]
+        ),
+        "",
+    )
+    return within_composite_evidence_window(package_time, observed_at)
+
+
 def _find_recoverable_send_request(
     connection: Any,
     *,
     account_id: str,
     message_id: str,
     raw_sha256: str,
+    content_fingerprint: str,
     from_header: str,
     to_header: str,
     cc_header: str,
     subject: str,
+    observed_at: str,
 ) -> dict[str, Any]:
     rows = connection.execute(
         """
         SELECT r.send_request_id, r.message_id, r.raw_eml_sha256, r.subject,
-               a.email_address
+               r.body_text, r.created_at, r.smtp_accepted_at, a.email_address
         FROM send_requests r
         LEFT JOIN mail_accounts a ON a.account_id=r.sender_account_id
         WHERE r.sender_account_id=?
@@ -419,6 +477,7 @@ def _find_recoverable_send_request(
         (account_id,),
     ).fetchall()
     raw_matches: set[str] = set()
+    message_candidates: set[str] = set()
     composite_matches: set[str] = set()
     observed_senders = set(parse_mailboxes(from_header))
     observed_to = set(parse_mailboxes(to_header))
@@ -430,10 +489,11 @@ def _find_recoverable_send_request(
             raw_matches.add(request_id)
         if not message_id or normalize_message_id(str(row["message_id"] or "")) != message_id:
             continue
+        message_candidates.add(request_id)
         sender = str(row["email_address"] or "").strip().casefold()
-        if not sender or sender not in observed_senders:
+        if not sender or observed_senders != {sender}:
             continue
-        if subject and str(row["subject"] or "") != subject:
+        if str(row["subject"] or "") != str(subject or ""):
             continue
         recipients = connection.execute(
             "SELECT recipient_type, email_address FROM send_request_recipients "
@@ -452,48 +512,66 @@ def _find_recoverable_send_request(
         }
         if expected_to != observed_to or expected_cc != observed_cc:
             continue
+        if not content_fingerprint or content_fingerprint.casefold() not in {
+            item.casefold()
+            for item in _request_content_fingerprints(
+                connection, row=row, recipients=recipients
+            )
+        }:
+            continue
+        request_time = str(row["smtp_accepted_at"] or row["created_at"] or "")
+        if not within_composite_evidence_window(request_time, observed_at):
+            continue
         composite_matches.add(request_id)
 
-    matches = [
-        ("exact_send_request_raw_hash", raw_matches),
-        ("deterministic_send_request_composite", composite_matches),
-    ]
-    nonempty = [(evidence, candidates) for evidence, candidates in matches if candidates]
-    if not nonempty:
-        return {
-            "status": "unmatched",
-            "evidence_type": "unmatched",
-            "confidence": "none",
-            "candidate_count": 0,
-            "package_id": None,
-        }
-    evidence, candidates = nonempty[0]
-    if len(candidates) == 1:
-        selected = next(iter(candidates))
-        conflicts = {
-            next(iter(other))
-            for _other_evidence, other in nonempty[1:]
-            if len(other) == 1 and selected not in other
-        }
-        if not conflicts:
-            return {
-                "status": "matched",
-                "evidence_type": evidence,
-                "confidence": "exact" if evidence.startswith("exact_") else "high",
-                "candidate_count": 1,
-                "package_id": None,
-                "send_request_id": selected,
-            }
-        candidates = {selected, *conflicts}
-    return {
-        "status": "ambiguous",
-        "evidence_type": "conflicting_exact_evidence"
-        if len(nonempty) > 1
-        else evidence,
-        "confidence": "manual_review",
-        "candidate_count": len(candidates),
-        "package_id": None,
-    }
+    decision = decide_reconciliation_candidate(
+        strong_matches={"exact_send_request_raw_hash": raw_matches},
+        evidence_priority=("exact_send_request_raw_hash",),
+        message_id_candidates=message_candidates,
+        composite_candidates=composite_matches,
+        message_id_override_evidence={"exact_send_request_raw_hash"},
+    )
+    result = decision.as_result(id_key="send_request_id")
+    result["package_id"] = None
+    return result
+
+
+def _request_content_fingerprints(
+    connection: Any,
+    *,
+    row: Any,
+    recipients: list[Any],
+) -> set[str]:
+    grouped: dict[str, set[str]] = {"to": set(), "cc": set(), "bcc": set()}
+    for item in recipients:
+        recipient_type = str(item["recipient_type"] or "")
+        address = str(item["email_address"] or "").strip().casefold()
+        if recipient_type in grouped and address:
+            grouped[recipient_type].add(address)
+    attachments = connection.execute(
+        """
+        SELECT display_name, size_bytes, sha256
+        FROM send_request_attachments
+        WHERE send_request_id=? AND status!='snapshot_cleaned'
+        ORDER BY sort_order, id
+        """,
+        (str(row["send_request_id"]),),
+    ).fetchall()
+    return request_content_fingerprints(
+        subject=str(row["subject"] or ""),
+        body_text=str(row["body_text"] or ""),
+        to_emails=grouped["to"],
+        cc_emails=grouped["cc"],
+        bcc_emails=grouped["bcc"],
+        attachments={
+            (
+                str(item["display_name"] or ""),
+                int(item["size_bytes"]),
+                str(item["sha256"] or ""),
+            )
+            for item in attachments
+        },
+    )
 
 
 def _outbound_id(send_request_id: str) -> str:

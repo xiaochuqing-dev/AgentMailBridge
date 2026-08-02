@@ -23,7 +23,7 @@ from agent_mail_bridge.provider_foundation import PROVIDER_PROFILES
 from agent_mail_bridge.version import __version__
 
 
-TARGET_VERSION = "1.7.1"
+TARGET_VERSION = "1.7.2"
 TARGETED_TESTS = (
     "tests/test_v1_7_1_consistency_recovery.py",
     "tests/test_v1_7_1_fault_injection.py",

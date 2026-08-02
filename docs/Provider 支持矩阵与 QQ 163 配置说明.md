@@ -12,7 +12,7 @@
 
 QQ、163 与 Generic 共用 Generic IMAP/SMTP Core、统一 Mail Package、Mail Facts、调度、重试、历史邮件导入和 outbound archive。v1.4.4 根据真实证据只在 163 Profile 开启 RFC 2971 IMAP ID，并保持 QQ/163 业务处理、解析、归档与调度共享。Provider profile 只保存服务器默认值和少量差异，不复制协议代码。
 
-v1.7.1 的 membership、发件恢复、Sent 对账、checkpoint 和一致性扫描不改变 Provider 支持状态。QQ/163 正式支持；Gmail 只读收件且 scope 仍只有 `gmail.readonly`；Generic 需独立第三方真实 E2E；Outlook planned。真实 v1.7.1 QQ/163 回归结果以本次最终验收报告为准，不用历史通过替代本次证据。
+v1.7.2 的可靠性审计、发件恢复与 Sent 证据加固不改变 Provider 支持状态。QQ/163 正式支持；Gmail 只读收件且 scope 仍只有 `gmail.readonly`；Generic 需独立第三方真实 E2E；Outlook planned。真实 v1.7.2 QQ/163 回归结果以本次最终验收报告为准，不用历史通过替代本次证据。
 
 ## QQ 配置
 

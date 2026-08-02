@@ -100,6 +100,7 @@ def process_normalized_mail(
             to_header=mail.to_raw,
             cc_header=mail.cc_raw,
             subject=mail.subject,
+            observed_at=mail.sent_at or mail.received_at or mail.observed_at,
         )
         matched_request_id = str(sent_match.get("send_request_id") or "")
         if sent_match.get("status") == "matched" and matched_request_id:

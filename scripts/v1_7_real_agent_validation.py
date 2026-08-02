@@ -56,6 +56,7 @@ CAPABILITIES = [
     "workspace.list",
     "mail.accounts.list",
     "mailboxes.list",
+    "sync.ensure_fresh",
     "mail.send",
     "send.status",
 ]
@@ -259,7 +260,7 @@ def _natural_prompt(
             "请使用我已经授权的邮箱能力完成一次真实回归。先了解当前可读邮箱账号和"
             "邮箱目录；不要限定某一个年份。验收必须各包含至少一次仅限收件箱目录"
             "和仅限已发送目录的历史搜索，不能用两次全目录搜索代替。找出与 "
-            "AgentMailBridge v1.7.0 有关的邮件，选择最近一封含可预览附件的邮件。"
+            f"AgentMailBridge v{__version__} 有关的邮件，选择最近一封含可预览附件的邮件。"
             "读取邮件和一个附件，并把整封邮件的完整资料准备到当前项目。若相同资料"
             "已经存在且 Hash 一致，请复用，不要制造无意义的重命名副本。不要发送邮件。"
             + privacy
@@ -279,7 +280,7 @@ def _natural_prompt(
         )
     return (
         "请先了解当前获准的邮箱账号和目录，并在全部历史范围内分别核对收件箱和"
-        "已发送中的 AgentMailBridge v1.7.0 测试邮件，读取其中一封及一个附件。"
+        f"已发送中的 AgentMailBridge v{__version__} 测试邮件，读取其中一封及一个附件。"
         "随后使用获准的 QQ 发件账号向我已配置的 163 邮箱账号新建一封邮件，"
         f"主题为 {marker}，正文说明自主发送真实验收成功，并附上当前项目中的 "
         f"{relative_names}。本次使用已经授权的自主发送模式，只提交一次；若状态不明确，"
