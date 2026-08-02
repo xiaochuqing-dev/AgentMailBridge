@@ -210,6 +210,6 @@ CONDITIONALLY PASS。核心可靠性缺陷已修复，未解决 P0/P1 为 0；�
 ## 30. commits 与 push 状态
 
 - 94d82ceb33f95affc5b6f786bf5f276272ffd718：fix: harden v1.7.2 Sent reconciliation evidence，已推送 origin/master。
-- 最终报告与清单提交：当前待提交；提交并推送后将在本节做一次纯文档状态收口。
-- 旧远端/本地分支已删除，远端当前只保留 master。
-- 最终 GitHub HEAD 与工作区干净状态：待报告提交后复核。
+- c259d31b7a5c4b370202a8e6f6d34f92fd33fd23：docs: add v1.7.2 reliability acceptance report，已推送 origin/master。
+- 报告提交推送后复核：本地 HEAD、origin/master 和 GitHub 远端 master 均为 c259d31b7a5c4b370202a8e6f6d34f92fd33fd23；远端只保留 master，主 worktree 干净且无临时 worktree。
+- 当前改动仅记录上述已完成事实；其纯文档收口提交将在随后普通推送，并在最终用户交付中报告最终 HEAD。
