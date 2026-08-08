@@ -266,8 +266,8 @@ def test_account_cards_keep_complete_title_email_and_status(specialty_window):
     specialty_window.gmail_card.email_label.setText(long_email)
     assert specialty_window.gmail_card.title_label.text() == "Gmail"
     assert specialty_window.qq_card.title_label.text() == "QQ 邮箱"
-    assert specialty_window.gmail_card.detail_label.text() == "当前能力：收件 · 归档"
-    assert specialty_window.qq_card.detail_label.text() == "当前能力：发件"
+    assert specialty_window.gmail_card.detail_label.text() == "收件：正常  ·  发件：不支持"
+    assert specialty_window.qq_card.detail_label.text() == "收件：正常  ·  发件：正常"
     assert specialty_window.gmail_card.email_label.text() == long_email
     assert specialty_window.gmail_card.email_label.wordWrap()
     assert specialty_window.gmail_card.status_tag.text() in {"已配置", "未配置"}

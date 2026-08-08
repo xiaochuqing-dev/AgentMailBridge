@@ -23,6 +23,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
+    QScrollArea,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -37,7 +39,13 @@ from agent_mail_bridge.credentials import (
 )
 from agent_mail_bridge.models import OperationStatus, ServiceResult
 from agent_mail_bridge.ui.settings_store import save_env_values
-from agent_mail_bridge.ui.theme import DANGER, PURPLE, SUCCESS, WARNING
+from agent_mail_bridge.ui.theme import (
+    DANGER,
+    SUCCESS,
+    THEME_TOKENS,
+    WARNING,
+    normalize_theme,
+)
 
 
 FIXED_SECRET_MASK = "•" * 16
@@ -341,8 +349,8 @@ class _AccountDialog(QDialog):
         self._background_button_text = ""
         self._close_after_background = False
         self.setModal(True)
-        self.setMinimumSize(680, 590)
-        self.resize(760, 680)
+        self.setMinimumSize(620, 480)
+        self.resize(700, 600)
         app = QApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self._prepare_application_exit)
@@ -354,6 +362,7 @@ class _AccountDialog(QDialog):
         return label
 
     def _show_result(self, result: ServiceResult) -> None:
+        self.result_label.setProperty("themeAccentInline", False)
         self.result_label.setText(result.message or result.status.value)
         color = (
             SUCCESS
@@ -367,8 +376,15 @@ class _AccountDialog(QDialog):
         )
 
     def _running(self, text: str) -> None:
+        self.result_label.setProperty("themeAccentInline", True)
         self.result_label.setText(text)
-        self.result_label.setStyleSheet(f"color: {PURPLE};")
+        app = QApplication.instance()
+        theme = normalize_theme(
+            app.property("agentMailBridgeTheme") if app is not None else None
+        )
+        self.result_label.setStyleSheet(
+            f"color: {THEME_TOKENS[theme]['accent']};"
+        )
 
     def _background_busy(self) -> bool:
         if not self._background_active:
@@ -452,8 +468,8 @@ class GmailAccountDialog(_AccountDialog):
 
     def __init__(self, service: ApplicationService, parent: QWidget | None = None):
         super().__init__(service, parent)
-        self.setMinimumSize(680, 700)
-        self.resize(760, 740)
+        self.setMinimumSize(640, 600)
+        self.resize(720, 680)
         self._oauth_thread: QThread | None = None
         self._oauth_worker: _OAuthWorker | None = None
         self._oauth_session = None
@@ -465,8 +481,8 @@ class GmailAccountDialog(_AccountDialog):
         self._oauth_timeout_seconds = 300.0
         self.setWindowTitle("Gmail 邮箱账号")
         root = QVBoxLayout(self)
-        root.setContentsMargins(22, 20, 22, 18)
-        root.setSpacing(12)
+        root.setContentsMargins(18, 16, 18, 14)
+        root.setSpacing(9)
 
         title = QLabel("Gmail 邮箱账号")
         title.setObjectName("pageTitle")
@@ -496,7 +512,7 @@ class GmailAccountDialog(_AccountDialog):
         self.imap_mode_button = QPushButton("Gmail IMAP（配置简单）")
         for button in (self.api_mode_button, self.imap_mode_button):
             button.setCheckable(True)
-            button.setMinimumHeight(64)
+            button.setMinimumHeight(54)
             button.setObjectName("accountChoice")
         group = QButtonGroup(self)
         group.setExclusive(True)
@@ -511,7 +527,20 @@ class GmailAccountDialog(_AccountDialog):
         self.imap_page = self._build_imap_page()
         self.gmail_stack.addWidget(self.api_page)
         self.gmail_stack.addWidget(self.imap_page)
-        root.addWidget(self.gmail_stack, 1)
+        self.gmail_stack_scroll = QScrollArea()
+        self.gmail_stack_scroll.setObjectName("accountPageScroll")
+        self.gmail_stack_scroll.setWidgetResizable(True)
+        self.gmail_stack_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.gmail_stack_scroll.setWidget(self.gmail_stack)
+        self.gmail_stack.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        self.gmail_stack.setMinimumHeight(
+            max(self.api_page.sizeHint().height(), self.imap_page.sizeHint().height())
+        )
+        root.addWidget(self.gmail_stack_scroll, 1)
         self.api_mode_button.clicked.connect(lambda: self._select_backend("gmail_api"))
         self.imap_mode_button.clicked.connect(lambda: self._select_backend("imap"))
 
@@ -539,8 +568,8 @@ class GmailAccountDialog(_AccountDialog):
         page.setObjectName("accountPanel")
         self.api_content = page
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(10)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
         heading = QLabel("Gmail API 专属配置")
         heading.setObjectName("sectionTitle")
         self.api_setup_note = QLabel(
@@ -667,6 +696,10 @@ class GmailAccountDialog(_AccountDialog):
         self.oauth_error_detail.setObjectName("oauthResultDetail")
         self.oauth_error_detail.setProperty("severity", "neutral")
         self.oauth_error_detail.setWordWrap(True)
+        self.oauth_error_detail.setMinimumHeight(48)
+        self.oauth_error_detail.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum
+        )
         self.oauth_error_detail.hide()
         layout.addWidget(self.oauth_error_detail)
         for button in (
@@ -696,8 +729,8 @@ class GmailAccountDialog(_AccountDialog):
         page = QFrame()
         page.setObjectName("accountPanel")
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(10)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
         heading = QLabel("Gmail IMAP 专属配置")
         heading.setObjectName("sectionTitle")
         layout.addWidget(heading)
@@ -1192,10 +1225,11 @@ class QQAccountDialog(_AccountDialog):
     def __init__(self, service: ApplicationService, parent: QWidget | None = None):
         super().__init__(service, parent)
         self.setWindowTitle("QQ 邮箱账号")
-        self.setMinimumSize(640, 480)
+        self.setMinimumSize(600, 400)
+        self.resize(680, 480)
         root = QVBoxLayout(self)
-        root.setContentsMargins(22, 20, 22, 18)
-        root.setSpacing(12)
+        root.setContentsMargins(18, 16, 18, 14)
+        root.setSpacing(9)
         title = QLabel("QQ 邮箱账号")
         title.setObjectName("pageTitle")
         subtitle = QLabel("发件身份、SMTP 授权码和连接测试统一在此管理。")
@@ -1321,11 +1355,11 @@ class AccountTypeDialog(QDialog):
         self.created_account_id = ""
         self.setWindowTitle("添加邮箱账号")
         self.setModal(True)
-        self.setMinimumSize(680, 650)
-        self.resize(720, 700)
+        self.setMinimumSize(600, 480)
+        self.resize(680, 540)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 22, 24, 20)
-        layout.setSpacing(12)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(9)
         title = QLabel("添加邮箱账号")
         title.setObjectName("pageTitle")
         hint = QLabel(
@@ -1340,8 +1374,8 @@ class AccountTypeDialog(QDialog):
         form_card = QFrame()
         form_card.setObjectName("accountPanel")
         form = QFormLayout(form_card)
-        form.setContentsMargins(16, 14, 16, 14)
-        form.setSpacing(10)
+        form.setContentsMargins(14, 12, 14, 12)
+        form.setSpacing(8)
         self.provider_combo = QComboBox()
         self.provider_combo.addItem("Gmail", self.GMAIL)
         self.provider_combo.addItem("QQ 邮箱", self.QQ)
@@ -1369,7 +1403,7 @@ class AccountTypeDialog(QDialog):
         self.server_panel = QFrame()
         self.server_panel.setObjectName("card")
         server_form = QFormLayout(self.server_panel)
-        server_form.setContentsMargins(16, 14, 16, 14)
+        server_form.setContentsMargins(14, 12, 14, 12)
         server_form.setSpacing(8)
         self.imap_host_edit = QLineEdit()
         self.imap_port_edit = QLineEdit("993")
@@ -1483,11 +1517,11 @@ class RuntimeAccountDialog(_AccountDialog):
         self._oauth_active = False
         self._close_after_oauth = False
         self.setWindowTitle("邮箱账号")
-        self.setMinimumSize(680, 610)
-        self.resize(740, 680)
+        self.setMinimumSize(620, 520)
+        self.resize(700, 600)
         root = QVBoxLayout(self)
-        root.setContentsMargins(22, 20, 22, 18)
-        root.setSpacing(12)
+        root.setContentsMargins(18, 16, 18, 14)
+        root.setSpacing(9)
         title = QLabel(str(self.account.get("display_name") or "邮箱账号"))
         title.setObjectName("pageTitle")
         identity = QLabel(

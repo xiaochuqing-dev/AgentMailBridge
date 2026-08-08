@@ -22,6 +22,7 @@ from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap
 
 from agent_mail_bridge.runtime_paths import get_runtime_paths
+from agent_mail_bridge.windows_process import run_hidden
 
 
 SERVER_KEY = "agent-mail-bridge"
@@ -665,7 +666,7 @@ def _detect_executable_version(
 
 def _safe_version(executable: str) -> str | None:
     try:
-        completed = subprocess.run(
+        completed = run_hidden(
             [executable, "--version"],
             capture_output=True,
             text=True,

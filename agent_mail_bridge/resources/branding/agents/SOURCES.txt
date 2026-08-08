@@ -1,0 +1,20 @@
+Agent client brand icon sources
+
+openai.png
+Source: https://github.com/openai
+Asset: official OpenAI GitHub organization avatar
+Use: identifies Codex
+
+anthropic.png
+Source: https://github.com/anthropics
+Asset: official Anthropic GitHub organization avatar
+Use: identifies Claude Code and Claude Desktop
+
+hermes.png
+Source: https://github.com/NousResearch/hermes-agent/blob/main/apps/desktop/assets/icon.png
+Asset: official Hermes Agent desktop application icon
+Use: identifies Hermes
+
+The marks remain the property of their respective owners and are used only to
+identify compatible local clients. Custom clients use the product's neutral
+linear terminal icon instead of an imitated brand mark.

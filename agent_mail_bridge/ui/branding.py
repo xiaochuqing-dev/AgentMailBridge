@@ -8,10 +8,49 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QIcon, QPixmap
+from PySide6.QtGui import QGuiApplication, QIcon, QIconEngine, QPixmap
 from PySide6.QtWidgets import QLabel
 
 from agent_mail_bridge.runtime_paths import get_runtime_paths
+
+
+class _DeferredFileIconEngine(QIconEngine):
+    """Keep icon lookup safe before Qt creates the GUI application."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__()
+        self._path = str(path)
+
+    def key(self) -> str:
+        return f"agent-mail-bridge-file:{self._path}"
+
+    def clone(self) -> "_DeferredFileIconEngine":
+        return _DeferredFileIconEngine(Path(self._path))
+
+    def isNull(self) -> bool:  # noqa: N802 - Qt virtual method name
+        return not Path(self._path).is_file()
+
+    def actualSize(self, size, mode, state):  # noqa: N802 - Qt virtual method name
+        if QGuiApplication.instance() is None:
+            return size
+        return QIcon(self._path).actualSize(size, mode, state)
+
+    def pixmap(self, size, mode, state):
+        if QGuiApplication.instance() is None:
+            return QPixmap()
+        return QIcon(self._path).pixmap(size, mode, state)
+
+    def paint(self, painter, rect, mode, state):
+        if QGuiApplication.instance() is not None:
+            QIcon(self._path).paint(painter, rect, mode, state)
+
+
+def _file_icon(path: Path) -> QIcon:
+    if not path.is_file():
+        return QIcon()
+    if QGuiApplication.instance() is None:
+        return QIcon(_DeferredFileIconEngine(path))
+    return QIcon(str(path))
 
 
 def brand_candidates() -> tuple[Path, ...]:
@@ -35,7 +74,7 @@ def find_brand_asset() -> Path | None:
 def brand_icon() -> QIcon:
     """构建窗口和托盘共用图标；没有素材时返回空图标。"""
     path = find_brand_asset()
-    return QIcon(str(path)) if path is not None else QIcon()
+    return _file_icon(path) if path is not None else QIcon()
 
 
 def provider_icon(name: str) -> QIcon:
@@ -45,7 +84,22 @@ def provider_icon(name: str) -> QIcon:
     if not filename:
         return QIcon()
     path = get_runtime_paths().resource_root / "branding" / filename
-    return QIcon(str(path)) if path.is_file() else QIcon()
+    return _file_icon(path)
+
+
+def agent_icon(name: str) -> QIcon:
+    """返回来自官方 GitHub 组织或产品仓库的 Agent 品牌图标。"""
+    filenames = {
+        "codex": "agents/openai.png",
+        "claude_code": "agents/anthropic.png",
+        "claude_desktop": "agents/anthropic.png",
+        "hermes": "agents/hermes.png",
+    }
+    filename = filenames.get(name.strip().lower())
+    if not filename:
+        return QIcon()
+    path = get_runtime_paths().resource_root / "branding" / filename
+    return _file_icon(path)
 
 
 def apply_brand_label(label: QLabel, fallback) -> bool:

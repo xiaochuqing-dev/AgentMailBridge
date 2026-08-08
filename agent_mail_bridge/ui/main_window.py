@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import QDate, QEvent, QObject, QPoint, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QFont, QIcon, QPalette, QPixmap
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QFont, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QRadioButton,
     QScrollArea,
+    QSizePolicy,
     QSystemTrayIcon,
     QMenu,
     QSizeGrip,
@@ -88,7 +89,13 @@ from agent_mail_bridge.ui.account_management import (
     open_add_account_dialog,
     open_runtime_account_dialog,
 )
-from agent_mail_bridge.ui.branding import apply_brand_label, brand_icon, find_brand_asset, provider_icon
+from agent_mail_bridge.ui.branding import (
+    agent_icon,
+    apply_brand_label,
+    brand_icon,
+    find_brand_asset,
+    provider_icon,
+)
 from agent_mail_bridge.ui.health_page import (
     format_mail_health,
     format_recovery_requests,
@@ -100,10 +107,13 @@ from agent_mail_bridge.ui.theme import (
     SUCCESS,
     TEXT_MUTED,
     WARNING,
+    THEME_TOKENS,
     build_stylesheet,
+    normalize_theme,
 )
 from agent_mail_bridge.ui.widgets import (
     AccountCard,
+    clear_layout,
     DataTable,
     HealthStatusRow,
     MessageBar,
@@ -112,6 +122,7 @@ from agent_mail_bridge.ui.widgets import (
     StatusRow,
     TipRow,
     ToggleSwitch,
+    ThemeBackground,
     draw_status_dot,
     format_size,
     horizontal_line,
@@ -119,6 +130,7 @@ from agent_mail_bridge.ui.widgets import (
     paint_app_icon,
 )
 from agent_mail_bridge.utils import sha256_of_file
+from agent_mail_bridge.windows_process import popen_hidden
 
 AUTO_RECEIVE_DEFAULT_SECONDS = 60
 AUTO_RECEIVE_MIN_SECONDS = 30
@@ -160,14 +172,6 @@ class SendFileSelection:
             and current.st_mtime_ns == self.modified_ns
             and current_sha == self.sha256
         )
-
-
-def _fill_background(widget: QWidget, color: str) -> None:
-    """使用调色板填充背景，避免局部样式表污染子控件。"""
-    palette = widget.palette()
-    palette.setColor(QPalette.ColorRole.Window, QColor(color))
-    widget.setAutoFillBackground(True)
-    widget.setPalette(palette)
 
 
 class _ValueSink:
@@ -315,11 +319,10 @@ class TitleBar(QWidget):
         self.drag_position: QPoint | None = None
         self.setObjectName("titleBar")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        _fill_background(self, "#FFFFFF")
-        self.setFixedHeight(56)
+        self.setFixedHeight(52)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 0, 8, 0)
-        layout.setSpacing(8)
+        layout.setContentsMargins(10, 0, 7, 0)
+        layout.setSpacing(7)
 
         icon = QLabel()
         self.brand_asset_loaded = apply_brand_label(icon, paint_app_icon)
@@ -334,10 +337,10 @@ class TitleBar(QWidget):
 
         status_box = QWidget()
         status_layout = QHBoxLayout(status_box)
-        status_layout.setContentsMargins(12, 0, 12, 0)
+        status_layout.setContentsMargins(10, 0, 10, 0)
         status_layout.setSpacing(5)
         status_box.setStyleSheet("background: #ECFAF1; border-radius: 15px;")
-        status_box.setFixedHeight(30)
+        status_box.setFixedHeight(28)
         status_layout.addWidget(draw_status_dot())
         self.status_label = QLabel("服务已启动")
         self.status_label.setObjectName("successText")
@@ -348,7 +351,7 @@ class TitleBar(QWidget):
 
         self.theme_button = QPushButton()
         self.theme_button.setObjectName("titleButton")
-        self.theme_button.setFixedSize(38, 30)
+        self.theme_button.setFixedSize(34, 28)
         self.theme_button.clicked.connect(self.window_ref.toggle_theme)
         self.set_theme(self.window_ref.theme_mode)
         layout.addWidget(self.theme_button)
@@ -358,9 +361,9 @@ class TitleBar(QWidget):
         self.close_button = QPushButton()
         for button in (self.minimize_button, self.maximize_button):
             button.setObjectName("titleButton")
-            button.setFixedSize(42, 38)
+            button.setFixedSize(38, 34)
         self.close_button.setObjectName("closeButton")
-        self.close_button.setFixedSize(42, 38)
+        self.close_button.setFixedSize(38, 34)
         self.minimize_button.clicked.connect(window.minimize_to_tray)
         self.maximize_button.clicked.connect(self._toggle_maximized)
         self.close_button.clicked.connect(window.close)
@@ -375,15 +378,18 @@ class TitleBar(QWidget):
         """用清晰图标显示下一次可切换的主题。"""
         if theme == "dark":
             self.theme_button.setIcon(QIcon(line_icon_pixmap("sun", 18, "#D8DBE8")))
-            self.theme_button.setToolTip("切换为浅色模式")
+            self.theme_button.setToolTip("切换为云境蓝主题")
+        elif theme == "coral":
+            self.theme_button.setIcon(QIcon(line_icon_pixmap("sun", 18, "#A94457")))
+            self.theme_button.setToolTip("切换为云境蓝主题")
         else:
-            self.theme_button.setIcon(QIcon(line_icon_pixmap("moon", 18, "#555B69")))
-            self.theme_button.setToolTip("切换为深色模式")
+            self.theme_button.setIcon(QIcon(line_icon_pixmap("moon", 18, "#2F78E5")))
+            self.theme_button.setToolTip("切换为珊瑚霞主题")
         self.theme_button.setText("")
         self.theme_button.setIconSize(QSize(18, 18))
         if not hasattr(self, "minimize_button"):
             return
-        color = "#D8DBE8" if theme == "dark" else "#555B69"
+        color = "#D8DBE8" if theme == "dark" else "#5D5360"
         self.minimize_button.setIcon(QIcon(line_icon_pixmap("minimize", 16, color)))
         self.close_button.setIcon(QIcon(line_icon_pixmap("close", 16, color)))
         self.minimize_button.setIconSize(QSize(16, 16))
@@ -395,7 +401,7 @@ class TitleBar(QWidget):
         if not hasattr(self, "maximize_button"):
             return
         if color is None:
-            color = "#D8DBE8" if self.window_ref.theme_mode == "dark" else "#555B69"
+            color = "#D8DBE8" if self.window_ref.theme_mode == "dark" else "#5D5360"
         maximized = self.window_ref.isMaximized()
         kind = "restore" if maximized else "maximize"
         self.maximize_button.setIcon(QIcon(line_icon_pixmap(kind, 16, color)))
@@ -453,8 +459,8 @@ class BridgeWindow(QMainWindow):
         self._active_task_button: QPushButton | None = None
         self._active_task_button_text = ""
         self._task_refresh_on_finish = True
-        saved_theme = os.getenv("GUI_THEME", "light").strip().lower()
-        self.theme_mode = saved_theme if saved_theme in {"light", "dark"} else "light"
+        saved_theme = os.getenv("GUI_THEME", "cloud_blue").strip().lower()
+        self.theme_mode = normalize_theme(saved_theme)
         self.file_rows: list[dict] = []
         self.mail_rows: list[dict] = []
         self.log_rows: list[dict] = []
@@ -494,8 +500,8 @@ class BridgeWindow(QMainWindow):
         self.setWindowTitle("Agent 邮箱桥接工具")
         self.setWindowIcon(brand_icon())
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
-        self.resize(1400, 960)
-        self.setMinimumSize(1320, 660)
+        self.resize(1280, 820)
+        self.setMinimumSize(1100, 620)
         self._build()
         self.apply_theme(self.theme_mode)
         self._build_tray()
@@ -523,6 +529,11 @@ class BridgeWindow(QMainWindow):
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         """紧凑窗口中让文件表格滚轮优先移动页面，以保证日志可达。"""
         if (
+            watched is getattr(self, "receive_tools_widget", None)
+            and event.type() == QEvent.Type.Resize
+        ):
+            self._arrange_receive_toolbar(event.size().width())
+        if (
             watched is getattr(self, "_inbox_page_wheel_source", None)
             and event.type() == QEvent.Type.Wheel
             and hasattr(self, "inbox_page_scroll")
@@ -538,10 +549,9 @@ class BridgeWindow(QMainWindow):
         return super().eventFilter(watched, event)
 
     def _build(self) -> None:
-        root = QWidget()
+        root = ThemeBackground(self.theme_mode)
         root.setObjectName("windowRoot")
-        root.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        _fill_background(root, "#FFFFFF")
+        self.window_background = root
         self.setCentralWidget(root)
         outer = QVBoxLayout(root)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -553,7 +563,6 @@ class BridgeWindow(QMainWindow):
         body = QWidget()
         body.setObjectName("bodySurface")
         body.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        _fill_background(body, "#FFFFFF")
         body_layout = QHBoxLayout(body)
         body_layout.setContentsMargins(0, 0, 0, 0)
         body_layout.setSpacing(0)
@@ -578,14 +587,13 @@ class BridgeWindow(QMainWindow):
             return
         available = screen.availableGeometry()
         self.setMinimumSize(
-            min(1320, available.width()),
-            min(660, available.height()),
+            min(1100, available.width()),
+            min(620, available.height()),
         )
         target_width = min(max(self.width(), self.minimumWidth()), available.width())
-        preferred_height = min(1020, available.height())
         target_height = min(
-            max(self.height(), preferred_height, self.minimumHeight()),
-            available.height(),
+            max(self.height(), self.minimumHeight()),
+            min(900, available.height()),
         )
         self.resize(target_width, target_height)
         frame = self.frameGeometry()
@@ -597,15 +605,14 @@ class BridgeWindow(QMainWindow):
         panel = QWidget()
         panel.setObjectName("sidebar")
         panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        _fill_background(panel, "#FFFFFF")
-        panel.setFixedWidth(248)
+        panel.setFixedWidth(216)
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(10, 14, 10, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(9, 11, 9, 10)
+        layout.setSpacing(6)
 
         self.add_account_button = QPushButton("添加邮箱账号")
         self.add_account_button.setObjectName("primaryButton")
-        self.add_account_button.setFixedHeight(46)
+        self.add_account_button.setFixedHeight(40)
         self.add_account_button.clicked.connect(self.open_add_account)
         layout.addWidget(self.add_account_button)
         layout.addSpacing(3)
@@ -617,14 +624,14 @@ class BridgeWindow(QMainWindow):
         account_list.setObjectName("accountList")
         self.account_cards_layout = QVBoxLayout(account_list)
         self.account_cards_layout.setContentsMargins(0, 0, 0, 0)
-        self.account_cards_layout.setSpacing(8)
+        self.account_cards_layout.setSpacing(6)
         self.gmail_card = AccountCard(
             provider_icon("gmail"), "Gmail", "未配置",
-            "当前能力：收件 · 归档", "#EA4335"
+            "收件：未配置  ·  发件：不支持", "#EA4335"
         )
         self.qq_card = AccountCard(
             provider_icon("qq"), "QQ 邮箱", "未配置",
-            "当前能力：发件", "#21A4E8"
+            "收件：未配置  ·  发件：未配置", "#21A4E8"
         )
         self.gmail_card.clicked.connect(lambda: self.open_account(AccountTypeDialog.GMAIL))
         self.qq_card.clicked.connect(lambda: self.open_account(AccountTypeDialog.QQ))
@@ -640,9 +647,9 @@ class BridgeWindow(QMainWindow):
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
         self.account_list_scroll.setWidget(account_list)
-        self.account_list_scroll.setMinimumHeight(252)
+        self.account_list_scroll.setMinimumHeight(220)
         layout.addWidget(self.account_list_scroll, 1)
-        layout.addSpacing(8)
+        layout.addSpacing(5)
 
         self.nav_buttons: dict[str, NavButton] = {}
         nav_card = QFrame()
@@ -661,7 +668,7 @@ class BridgeWindow(QMainWindow):
         nav_layout.addWidget(self.agent_nav_button)
         nav_layout.addWidget(horizontal_line())
         nav_specs = (
-            ("pending_send", "send", "待确认发送"),
+            ("pending_send", "send", "传输与发送"),
             ("history", "clock", "历史记录"),
             ("files_data", "database", "文件与数据"),
             ("settings", "settings", "设置"),
@@ -681,8 +688,7 @@ class BridgeWindow(QMainWindow):
         panel = QWidget()
         panel.setObjectName("centralPanel")
         panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        _fill_background(panel, "#FFFFFF")
-        panel.setMinimumWidth(720)
+        panel.setMinimumWidth(590)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -690,10 +696,9 @@ class BridgeWindow(QMainWindow):
         tabs = QWidget()
         tabs.setObjectName("tabBar")
         tabs.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        tabs.setFixedHeight(52)
-        _fill_background(tabs, "#FFFFFF")
+        tabs.setFixedHeight(48)
         tab_layout = QHBoxLayout(tabs)
-        tab_layout.setContentsMargins(23, 0, 0, 0)
+        tab_layout.setContentsMargins(18, 0, 0, 0)
         tab_layout.setSpacing(4)
         self.tab_buttons: dict[str, QPushButton] = {}
         for key, text in (("inbox", "收件"), ("send", "发件")):
@@ -716,7 +721,7 @@ class BridgeWindow(QMainWindow):
         )
         tab_layout.addWidget(self.global_refresh_label)
         tab_layout.addWidget(self.global_refresh_button)
-        tab_layout.addSpacing(18)
+        tab_layout.addSpacing(13)
         layout.addWidget(tabs)
 
         self.page_stack = QStackedWidget()
@@ -810,9 +815,8 @@ class BridgeWindow(QMainWindow):
         scroll.setWidgetResizable(True)
         content = QWidget()
         content.setObjectName("pageSurface")
-        _fill_background(content, "#FFFFFF")
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(24, 17, 20, 17)
+        layout.setContentsMargins(18, 14, 17, 15)
         layout.setSpacing(9)
 
         title = QLabel("邮箱连接与快捷操作")
@@ -868,6 +872,8 @@ class BridgeWindow(QMainWindow):
         self.self_mail_check.setChecked(self.service.cfg.auto_receive_only_self_mail)
         help_label = QLabel()
         help_label.setPixmap(line_icon_pixmap("info", 16, PURPLE))
+        help_label.setProperty("lineIconKind", "info")
+        help_label.setProperty("lineIconSize", 16)
         help_label.setToolTip("只接收可信 Gmail 自发自收邮件，避免结果邮件形成循环")
         help_label.setStyleSheet(f"color: {TEXT_MUTED};")
         rule_row.addWidget(rule_label)
@@ -961,34 +967,51 @@ class BridgeWindow(QMainWindow):
             "日常收件工作台；收件账号、认证方式与 Provider 能力请通过左侧账号卡片管理。",
         )
         # 高内容页在当前屏幕可用高度足够时整页显示，较矮窗口保留滚动兜底。
-        layout.setContentsMargins(24, 20, 22, 24)
-        layout.setSpacing(12)
+        layout.setContentsMargins(18, 15, 17, 18)
+        layout.setSpacing(9)
         self.inbox_refresh_button = self.global_refresh_button
-        tools = QHBoxLayout()
-        tools.setSpacing(9)
-        tools.addWidget(QLabel("自动收取"))
+        self.receive_tools_widget = QWidget()
+        self.receive_tools_widget.setObjectName("receiveToolbar")
+        self.receive_tools_layout = QGridLayout(self.receive_tools_widget)
+        self.receive_tools_layout.setContentsMargins(0, 0, 0, 0)
+        self.receive_tools_layout.setHorizontalSpacing(8)
+        self.receive_tools_layout.setVerticalSpacing(7)
+
+        self.receive_options_widget = QWidget()
+        options = QHBoxLayout(self.receive_options_widget)
+        options.setContentsMargins(0, 0, 0, 0)
+        options.setSpacing(7)
+        options.addWidget(QLabel("自动收取"))
         self.auto_switch = ToggleSwitch()
         self.auto_switch.toggled.connect(self._toggle_auto_receive)
-        tools.addWidget(self.auto_switch)
-        tools.addSpacing(5)
-        tools.addWidget(QLabel("检查间隔"))
+        options.addWidget(self.auto_switch)
+        options.addSpacing(3)
+        options.addWidget(QLabel("检查间隔"))
         self.interval_combo = QComboBox()
         for label, seconds in (
             ("每 30 秒", 30), ("每 1 分钟", 60), ("每 3 分钟", 180),
             ("每 5 分钟", 300), ("每 10 分钟", 600),
         ):
             self.interval_combo.addItem(label, seconds)
-        self.interval_combo.setFixedWidth(145)
+        self.interval_combo.setFixedWidth(124)
         self.interval_combo.currentIndexChanged.connect(self._reschedule_auto_receive)
-        tools.addWidget(self.interval_combo)
-        tools.addWidget(QLabel("账号"))
+        options.addWidget(self.interval_combo)
+        options.addWidget(QLabel("账号"))
         self.receive_account_combo = QComboBox()
-        self.receive_account_combo.setMinimumWidth(190)
+        self.receive_account_combo.setMinimumWidth(145)
+        self.receive_account_combo.setMaximumWidth(270)
+        self.receive_account_combo.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
         self.receive_account_combo.setToolTip(
             "手动收取、连接测试和历史邮件导入使用这里选择的账号"
         )
-        tools.addWidget(self.receive_account_combo)
-        tools.addStretch(1)
+        options.addWidget(self.receive_account_combo, 1)
+
+        self.receive_actions_widget = QWidget()
+        actions = QHBoxLayout(self.receive_actions_widget)
+        actions.setContentsMargins(0, 0, 0, 0)
+        actions.setSpacing(7)
         self.inbox_test_button = self._button("测试当前连接", self.test_connection)
         receive = self._button("立即收取", self.receive, primary=True, icon_kind="mail")
         receive.setToolTip("检查当前增量范围；如需找回较早邮件，请使用“导入历史邮件”")
@@ -1001,17 +1024,20 @@ class BridgeWindow(QMainWindow):
         self.receive_button = receive
         self.task_buttons.extend((self.inbox_test_button, self.history_rescan_button, receive))
         self.manual_receive_buttons.extend((self.history_rescan_button, receive))
-        tools.addWidget(self.inbox_test_button)
-        tools.addWidget(self.history_rescan_button)
-        tools.addWidget(receive)
-        layout.addLayout(tools)
+        actions.addWidget(self.inbox_test_button)
+        actions.addWidget(self.history_rescan_button)
+        actions.addWidget(receive)
+        self._receive_toolbar_mode = ""
+        self._arrange_receive_toolbar(590)
+        self.receive_tools_widget.installEventFilter(self)
+        layout.addWidget(self.receive_tools_widget)
 
         auto_state_card = QFrame()
         auto_state_card.setObjectName("card")
         auto_state_layout = QGridLayout(auto_state_card)
-        auto_state_layout.setContentsMargins(16, 10, 16, 10)
-        auto_state_layout.setHorizontalSpacing(14)
-        auto_state_layout.setVerticalSpacing(5)
+        auto_state_layout.setContentsMargins(13, 8, 13, 8)
+        auto_state_layout.setHorizontalSpacing(11)
+        auto_state_layout.setVerticalSpacing(3)
         self.auto_state_values: dict[str, QLabel] = {}
         for index, (key, title) in enumerate((
             ("state", "自动收取"), ("last_check", "上次检查"),
@@ -1034,9 +1060,9 @@ class BridgeWindow(QMainWindow):
         preference_card = QFrame()
         preference_card.setObjectName("card")
         preference_row = QHBoxLayout(preference_card)
-        preference_row.setContentsMargins(16, 12, 16, 12)
+        preference_row.setContentsMargins(13, 9, 13, 9)
         preference_text = QVBoxLayout()
-        preference_text.setSpacing(4)
+        preference_text.setSpacing(2)
         preference_title = QLabel("当前收件偏好")
         preference_title.setObjectName("fieldLabel")
         self.preference_summary_label = QLabel()
@@ -1065,8 +1091,8 @@ class BridgeWindow(QMainWindow):
             QIcon(line_icon_pixmap("search", 17, TEXT_MUTED)),
             QLineEdit.ActionPosition.LeadingPosition,
         )
-        self.inbox_search.setMinimumWidth(260)
-        self.inbox_search.setMaximumWidth(420)
+        self.inbox_search.setMinimumWidth(210)
+        self.inbox_search.setMaximumWidth(330)
         self.inbox_search_timer = QTimer(self)
         self.inbox_search_timer.setSingleShot(True)
         self.inbox_search_timer.setInterval(250)
@@ -1116,6 +1142,38 @@ class BridgeWindow(QMainWindow):
         self._inbox_page_wheel_source = self.files_table.viewport()
         self._inbox_page_wheel_source.installEventFilter(self)
         return scroll
+
+    def _arrange_receive_toolbar(self, width: int) -> None:
+        """Keep receive options readable by wrapping actions on compact widths."""
+        if not hasattr(self, "receive_tools_layout"):
+            return
+        mode = "inline" if int(width) >= 940 else "stacked"
+        if mode == self._receive_toolbar_mode:
+            return
+        while self.receive_tools_layout.count():
+            self.receive_tools_layout.takeAt(0)
+        self.receive_tools_layout.setColumnStretch(0, 1)
+        self.receive_tools_layout.setColumnStretch(1, 0)
+        if mode == "inline":
+            self.receive_tools_layout.addWidget(self.receive_options_widget, 0, 0)
+            self.receive_tools_layout.addWidget(
+                self.receive_actions_widget,
+                0,
+                1,
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            )
+        else:
+            self.receive_tools_layout.addWidget(self.receive_options_widget, 0, 0, 1, 2)
+            self.receive_tools_layout.addWidget(
+                self.receive_actions_widget,
+                1,
+                0,
+                1,
+                2,
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            )
+        self._receive_toolbar_mode = mode
+        self.receive_tools_widget.setProperty("responsiveMode", mode)
 
     def _build_send_page(self) -> QWidget:
         page, layout = self._standard_page(
@@ -1436,7 +1494,7 @@ class BridgeWindow(QMainWindow):
         card_layout.addWidget(self.startup_check)
         appearance = QHBoxLayout()
         appearance.addWidget(QLabel("界面外观"))
-        self.theme_value_label = QLabel("深色模式" if self.theme_mode == "dark" else "浅色模式")
+        self.theme_value_label = QLabel(self._theme_display_name(self.theme_mode))
         self.theme_value_label.setObjectName("hint")
         appearance.addWidget(self.theme_value_label)
         appearance.addStretch(1)
@@ -2293,7 +2351,7 @@ class BridgeWindow(QMainWindow):
     def _build_agent_page(self) -> QWidget:
         page, layout = self._standard_page(
             "Agent 接入",
-            "连接 Codex Desktop、Claude Code、Hermes 或自定义 MCP Client，并分别授权邮箱、能力和资料目录。",
+            "高级设置与深度管理：配置 Client、权限、资料目录、审计和诊断。",
         )
 
         status_card = QFrame()
@@ -2371,7 +2429,7 @@ class BridgeWindow(QMainWindow):
         config_card.setObjectName("card")
         config_layout = QVBoxLayout(config_card)
         config_layout.setContentsMargins(18, 14, 18, 14)
-        config_title = QLabel("连接 Agent Client")
+        config_title = QLabel("连接与深度管理 Agent Client")
         config_title.setObjectName("sectionTitle")
         config_layout.addWidget(config_title)
         config_hint = QLabel(
@@ -2425,22 +2483,24 @@ class BridgeWindow(QMainWindow):
         )
         config_actions.setColumnStretch(3, 1)
         config_layout.addLayout(config_actions)
+        self.agent_client_list = QWidget()
+        self.agent_client_list.setObjectName("agentClientList")
+        self.agent_client_list_layout = QVBoxLayout(self.agent_client_list)
+        self.agent_client_list_layout.setContentsMargins(0, 6, 0, 0)
+        self.agent_client_list_layout.setSpacing(0)
+        self.agent_client_empty = QLabel("暂无已注册的 Agent / MCP Client")
+        self.agent_client_empty.setObjectName("hint")
+        self.agent_client_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.agent_client_empty.setMinimumHeight(64)
+        self.agent_client_list_layout.addWidget(self.agent_client_empty)
+        config_layout.addWidget(self.agent_client_list)
+        self.agent_client_row_widgets: list[QWidget] = []
+
+        # 仅保留隐藏模型供旧扩展和回归脚本读取行数/列名，正式页面不显示表格。
         self.agent_client_table = DataTable(
             ["Client", "安装 / 配置", "权限摘要", "最近调用", "操作"]
         )
-        self.agent_client_table.setMinimumHeight(178)
-        self.agent_client_table.setSelectionMode(
-            QAbstractItemView.SelectionMode.NoSelection
-        )
-        self.agent_client_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        client_header = self.agent_client_table.horizontalHeader()
-        client_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        client_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        client_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        client_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        client_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
-        self.agent_client_table.setColumnWidth(4, 330)
-        config_layout.addWidget(self.agent_client_table)
+        self.agent_client_table.hide()
         layout.addWidget(config_card)
 
         example_card = QFrame()
@@ -2912,93 +2972,144 @@ class BridgeWindow(QMainWindow):
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setFixedWidth(315)
+        scroll.setFixedWidth(292)
         panel = QWidget()
         panel.setObjectName("rightPanelContent")
         panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        _fill_background(panel, "#FCFCFE")
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(20, 24, 20, 18)
-        layout.setSpacing(12)
+        layout.setContentsMargins(12, 14, 12, 12)
+        layout.setSpacing(8)
 
+        service_header = QHBoxLayout()
         title = QLabel("服务状态")
         title.setObjectName("sectionTitle")
-        layout.addWidget(title)
+        service_header.addWidget(title)
+        service_header.addStretch(1)
+        self.service_refresh_button = self._button(
+            "", lambda: self.request_refresh(self.service_refresh_button),
+            icon_kind="refresh", outline=True,
+        )
+        self.service_refresh_button.setFixedSize(32, 30)
+        self.service_refresh_button.setToolTip("刷新服务状态")
+        service_header.addWidget(self.service_refresh_button)
+        layout.addLayout(service_header)
+
+        accent = THEME_TOKENS[self.theme_mode]["accent"]
+        service_specs = {
+            "core": ("shield", "核心服务", "运行中"),
+            "auto": ("calendar", "自动收件引擎", "未开启"),
+            "send": ("send", "发件服务", "待检查"),
+            "agent": ("terminal", "Agent / MCP 桥接", "未连接"),
+            "oauth": ("key", "OAuth / 凭据", "待检查"),
+            "database": ("database", "SQLite / 数据目录", "待检查"),
+        }
+        rows = {
+            key: StatusRow(line_icon_pixmap(kind, 17, accent), label, value)
+            for key, (kind, label, value) in service_specs.items()
+        }
+        self._service_row_icon_kinds = {
+            key: kind for key, (kind, _label, _value) in service_specs.items()
+        }
+        for key, row in rows.items():
+            row.icon_label.setProperty("lineIconKind", self._service_row_icon_kinds[key])
+            row.icon_label.setProperty("lineIconSize", 17)
+        # 旧诊断代码仍使用 receive/qq 别名；它们映射到新的真实服务行。
         self.service_rows = {
-            "service": StatusRow(line_icon_pixmap("shield", 17, PURPLE), "服务状态", "运行中"),
-            "receive": StatusRow(line_icon_pixmap("clock", 17, PURPLE), "上次收取时间"),
-            "send": StatusRow(line_icon_pixmap("send", 17, PURPLE), "上次发件时间"),
-            "auto": StatusRow(line_icon_pixmap("calendar", 17, PURPLE), "自动收件状态", "未开启"),
-            "qq": StatusRow(line_icon_pixmap("mail", 17, PURPLE), "QQ 邮箱", "未配置"),
+            **rows,
+            "service": rows["core"],
+            "receive": rows["auto"],
+            "qq": rows["send"],
         }
         service_card = QFrame()
         service_card.setObjectName("card")
+        service_card.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum
+        )
         service_layout = QVBoxLayout(service_card)
-        service_layout.setContentsMargins(12, 9, 12, 9)
+        service_layout.setContentsMargins(10, 6, 10, 6)
         service_layout.setSpacing(0)
-        for row in self.service_rows.values():
+        for index, row in enumerate(rows.values()):
             service_layout.addWidget(row)
-            if row is not tuple(self.service_rows.values())[-1]:
+            if index < len(rows) - 1:
                 service_layout.addWidget(horizontal_line())
         layout.addWidget(service_card)
 
-        stats_title = QLabel("今日统计")
-        stats_title.setObjectName("sectionTitle")
-        layout.addWidget(stats_title)
-        stats = QGridLayout()
-        stats.setSpacing(9)
+        agent_header = QHBoxLayout()
+        agent_title = QLabel("Agent 接入情况")
+        agent_title.setObjectName("sectionTitle")
+        agent_header.addWidget(agent_title)
+        agent_header.addStretch(1)
+        self.agent_permission_button = self._button(
+            "权限入口", lambda: self.select_page("agent"), outline=True,
+            icon_kind="shield",
+        )
+        self.agent_permission_button.setToolTip("打开 Agent 高级权限管理")
+        agent_header.addWidget(self.agent_permission_button)
+        layout.addLayout(agent_header)
+        agent_card = QFrame()
+        agent_card.setObjectName("card")
+        agent_card.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum
+        )
+        agent_card_layout = QVBoxLayout(agent_card)
+        agent_card_layout.setContentsMargins(10, 8, 10, 8)
+        agent_card_layout.setSpacing(4)
+        self.agent_overview_body = QWidget()
+        self.agent_overview_body.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum
+        )
+        self.agent_overview_layout = QVBoxLayout(self.agent_overview_body)
+        self.agent_overview_layout.setContentsMargins(0, 0, 0, 0)
+        self.agent_overview_layout.setSpacing(4)
+        self.agent_overview_empty = QLabel("暂无已接入的 Agent / MCP Client")
+        self.agent_overview_empty.setObjectName("hint")
+        self.agent_overview_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.agent_overview_layout.addWidget(self.agent_overview_empty)
+        agent_card_layout.addWidget(self.agent_overview_body)
+        self.add_agent_overview_button = self._button(
+            "添加 Agent / MCP", lambda: self._create_agent_client_dialog("custom"),
+            primary=True, icon_kind="terminal",
+        )
+        self.add_agent_overview_button.setFixedHeight(32)
+        agent_card_layout.addWidget(self.add_agent_overview_button)
+        layout.addWidget(agent_card)
+        layout.addStretch(1)
+        self.agent_overview_rows: list[QWidget] = []
+
+        # 诊断页仍需要五个独立对象；将其保留为隐藏兼容容器，右栏不再显示旧版统计/提示。
         self.stat_cards = {
             "received": StatCard("statPurple", line_icon_pixmap("mail", 28, PURPLE), "收取邮件", PURPLE),
             "saved": StatCard("statGreen", line_icon_pixmap("calendar", 28, SUCCESS), "保存内容", SUCCESS),
             "sent": StatCard("statBlue", line_icon_pixmap("send", 28, "#2394C8"), "发送邮件", "#2394C8"),
             "errors": StatCard("statRed", line_icon_pixmap("warning", 28, WARNING), "失败 / 错误", DANGER),
         }
-        stats.addWidget(self.stat_cards["received"], 0, 0)
-        stats.addWidget(self.stat_cards["saved"], 0, 1)
-        stats.addWidget(self.stat_cards["sent"], 1, 0)
-        stats.addWidget(self.stat_cards["errors"], 1, 1)
-        layout.addLayout(stats)
-        health_card = QFrame()
-        health_card.setObjectName("card")
-        health_layout = QVBoxLayout(health_card)
-        health_layout.setContentsMargins(12, 11, 12, 11)
-        health_title = QLabel("连接健康")
-        health_title.setObjectName("minorTitle")
+        hidden_stats = QWidget(panel)
+        hidden_stats.setVisible(False)
+        for card in self.stat_cards.values():
+            card.setParent(hidden_stats)
+        hidden_health = QWidget(panel)
+        hidden_health.setVisible(False)
+        health_layout = QVBoxLayout(hidden_health)
         self.health_summary_label = QLabel("5 项尚未检查")
-        self.health_summary_label.setObjectName("hint")
-        self.health_summary_label.setWordWrap(True)
-        health_layout.addWidget(health_title)
         health_layout.addWidget(self.health_summary_label)
         self.health_rows: dict[str, HealthStatusRow] = {}
-        health_specs = (
+        for name, icon_kind, target in (
             ("Gmail 收件", "mail", "gmail"),
             ("QQ SMTP", "send", "qq"),
             ("Agent / MCP", "terminal", "agent"),
             ("凭据 / OAuth", "key", "credentials"),
             ("SQLite / 数据目录", "database", "files_data"),
-        )
-        for name, icon_kind, target in health_specs:
+        ):
             row = HealthStatusRow(icon_kind, name, target)
             row.fix_requested.connect(self.go_to_health_target)
             self.health_rows[name] = row
             health_layout.addWidget(row)
         self.health_check_button = self._button(
-            "一键检查全部",
-            self.run_all_connection_diagnostics,
-            primary=True,
-            icon_kind="shield",
+            "一键检查全部", self.run_all_connection_diagnostics,
+            primary=True, icon_kind="shield",
         )
         self.task_buttons.append(self.health_check_button)
         health_layout.addWidget(self.health_check_button)
-        layout.addWidget(health_card)
-
-        tips_title = QLabel("快捷提示")
-        tips_title.setObjectName("sectionTitle")
-        layout.addWidget(tips_title)
-        layout.addWidget(TipRow(provider_icon("gmail"), "收件范围可通过“编辑偏好”调整。", PURPLE))
-        layout.addWidget(TipRow(provider_icon("qq"), "GUI 手动发件可填写一个明确收件人。", "#329BC5"))
-        help_button = self._button("查看帮助文档", self._show_help, text_only=True)
-        layout.addWidget(help_button, 0, Qt.AlignmentFlag.AlignLeft)
         scroll.setWidget(panel)
         return scroll
 
@@ -3013,10 +3124,9 @@ class BridgeWindow(QMainWindow):
         page = QWidget()
         page.setObjectName("pageSurface")
         page.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        _fill_background(page, "#FFFFFF")
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(24, 20, 22, 20)
-        layout.setSpacing(12)
+        layout.setContentsMargins(18, 15, 17, 16)
+        layout.setSpacing(9)
         heading_row = QHBoxLayout()
         heading = QLabel(title)
         heading.setObjectName("pageTitle")
@@ -3031,6 +3141,8 @@ class BridgeWindow(QMainWindow):
             heading_row.addWidget(page.header_action_button)
         hint = QLabel(description)
         hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        hint.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         separator = horizontal_line()
         page.description_label = hint
         page.header_separator = separator
@@ -3120,7 +3232,9 @@ class BridgeWindow(QMainWindow):
             button.setObjectName("textButton")
         button.setCursor(Qt.CursorShape.PointingHandCursor)
         if icon_kind:
-            button.setIcon(QIcon(line_icon_pixmap(icon_kind, 15, PURPLE)))
+            accent = THEME_TOKENS[self.theme_mode]["accent"]
+            button.setProperty("lineIconKind", icon_kind)
+            button.setIcon(QIcon(line_icon_pixmap(icon_kind, 15, accent)))
             button.setIconSize(QSize(15, 15))
         if callback is not None:
             button.clicked.connect(callback)
@@ -3315,6 +3429,27 @@ class BridgeWindow(QMainWindow):
                 and account.get("credential_configured")
             )
             card.set_configured(configured)
+            receive_state = (
+                "ready"
+                if account.get("receive_enabled") and (
+                    account.get("credential_configured")
+                    or account.get("receive_authorized")
+                )
+                else "disabled"
+                if not account.get("receive_enabled")
+                else "authorization_required"
+            )
+            implemented = set(account.get("capabilities") or ())
+            send_state = (
+                "unsupported"
+                if "send" not in implemented
+                else "ready"
+                if account.get("send_enabled") and account.get("credential_configured")
+                else "disabled"
+                if not account.get("send_enabled")
+                else "authorization_required"
+            )
+            card.set_capability_status(receive_state, send_state)
             if not account.get("enabled"):
                 card.status_tag.setText("已停用")
             elif not account.get("credential_configured"):
@@ -3648,7 +3783,7 @@ class BridgeWindow(QMainWindow):
         layout.addWidget(stats)
 
         safety = QLabel(
-            "导入按有限分段、分页处理并可取消，不删除服务器邮件；Gmail API 保持只读，IMAP 使用 BODY.PEEK 不标记已读。"
+            "导入按有限分段、分页处理并可取消，不删除服务器邮件；Gmail API 收件操作保持只读，IMAP 使用 BODY.PEEK 不标记已读。"
         )
         safety.setObjectName("hint")
         safety.setWordWrap(True)
@@ -4678,6 +4813,10 @@ class BridgeWindow(QMainWindow):
             self._populate_agent_clients(
                 result.details.get("agent_clients", [])
             )
+        if hasattr(self, "agent_overview_layout"):
+            self._refresh_agent_overview(
+                result.details.get("agent_clients", [])
+            )
         if hasattr(self, "pending_send_table"):
             self._populate_pending_send_requests(
                 result.details.get("pending_send_requests", [])
@@ -4718,6 +4857,8 @@ class BridgeWindow(QMainWindow):
         try:
             self.gmail_card.email_label.setText(cfg.gmail_address or "未配置")
             self.qq_card.email_label.setText(cfg.qq_email or "未配置")
+            self.gmail_card.email_label.setToolTip(cfg.gmail_address or "未配置")
+            self.qq_card.email_label.setToolTip(cfg.qq_email or "未配置")
             self.gmail_card.set_configured(bool(cfg.gmail_address))
             self.qq_card.set_configured(bool(cfg.qq_email))
             accounts = list(status.get("mail_accounts") or [])
@@ -4788,6 +4929,29 @@ class BridgeWindow(QMainWindow):
                         f"稳定账号 ID：{account.get('account_id')}\n"
                         f"数据命名空间：{account.get('data_namespace')}"
                     )
+                    provider = str(account.get("provider") or "")
+                    receive_state = (
+                        "ready"
+                        if account.get("receive_enabled") and (
+                            account.get("credential_configured")
+                            or account.get("receive_authorized")
+                        )
+                        else "disabled"
+                        if not account.get("receive_enabled")
+                        else "authorization_required"
+                    )
+                    implemented = set(account.get("capabilities") or ())
+                    send_state = (
+                        "unsupported"
+                        if "send" not in implemented
+                        else "ready"
+                        if account.get("send_enabled")
+                        and account.get("credential_configured")
+                        else "disabled"
+                        if not account.get("send_enabled")
+                        else "authorization_required"
+                    )
+                    card.set_capability_status(receive_state, send_state)
             if hasattr(self, "receive_account_label"):
                 self.receive_account_label.setText(cfg.gmail_address or "尚未配置具备收件能力的账号")
             self.self_mail_check.setChecked(cfg.auto_receive_only_self_mail)
@@ -4834,7 +4998,7 @@ class BridgeWindow(QMainWindow):
         if oauth_text is None:
             oauth_text = "未配置" if "MISSING" in oauth_key else "需重新授权" if "EXPIRED" in oauth_key else "状态待检查"
         qq_text_short = "已配置" if qq == "configured" else "未配置"
-        self.service_rows["service"].set_value("● 运行中", success=True)
+        self.service_rows["core"].set_value("运行中", success=True)
         auto_state = getattr(self, "_auto_state", {})
         auto_failures = int(auto_state.get("consecutive_global_failures") or 0)
         auto_text = (
@@ -4847,12 +5011,42 @@ class BridgeWindow(QMainWindow):
             success=self.auto_switch.isChecked() and not auto_failures,
             danger=bool(auto_failures),
         )
-        qq_text = self.service.cfg.qq_email or "未配置"
-        self.service_rows["qq"].set_value(qq_text, success=qq == "configured")
         receive_time = self._latest_event_time(("receive", "收件"))
         send_time = self._latest_event_time(("send", "sent", "发件", "发送"))
-        self.service_rows["receive"].set_value(receive_time)
-        self.service_rows["send"].set_value(send_time)
+        accounts = list(status.get("mail_accounts") or [])
+        send_ready = any(
+            item.get("enabled")
+            and item.get("send_enabled")
+            and "send" in set(item.get("capabilities") or ())
+            and item.get("credential_configured")
+            for item in accounts
+        )
+        send_needs_auth = any(
+            item.get("enabled")
+            and item.get("send_enabled")
+            and "send" in set(item.get("capabilities") or ())
+            and not item.get("credential_configured")
+            for item in accounts
+        )
+        send_value = "正常" if send_ready else "待认证" if send_needs_auth else "未配置"
+        self.service_rows["send"].set_value(
+            send_value,
+            success=send_ready,
+            danger=send_value == "待认证",
+        )
+        self.service_rows["agent"].set_value(
+            "已连接" if getattr(self, "agent_overview_rows", []) else "未连接",
+            success=bool(getattr(self, "agent_overview_rows", [])),
+        )
+        self.service_rows["oauth"].set_value(
+            oauth_text,
+            success=oauth_text in {"已授权", "可安全刷新"},
+            danger=oauth_text in {"需重新授权", "状态待检查"},
+        )
+        data_ok = bool(self.service.cfg.data_root_path.exists())
+        self.service_rows["database"].set_value(
+            "正常" if data_ok else "不可用", success=data_ok, danger=not data_ok
+        )
         self.title_bar.status_label.setText("服务已启动")
         self.title_bar.status_label.setToolTip(f"Gmail API：{oauth}")
         health_detail = (
@@ -4888,6 +5082,109 @@ class BridgeWindow(QMainWindow):
         )
         self.stat_cards["sent"].set_count(sent_today)
         self.stat_cards["errors"].set_count(error_today)
+
+    def _refresh_agent_overview(self, clients: list[dict[str, Any]]) -> None:
+        """刷新右栏紧凑 Agent 概览；完整权限仍在高级管理页维护。"""
+        for row in getattr(self, "agent_overview_rows", []):
+            self.agent_overview_layout.removeWidget(row)
+            row.deleteLater()
+        self.agent_overview_rows = []
+        active_clients = [
+            item for item in clients
+            if not bool(item.get("revoked_at"))
+        ]
+        self.agent_overview_empty.setVisible(not active_clients)
+        for client in active_clients[:8]:
+            row = QWidget()
+            row.setFixedHeight(46)
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 1, 0, 1)
+            row_layout.setSpacing(6)
+            icon_label = QLabel()
+            icon_label.setFixedSize(22, 22)
+            icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            client_type = str(client.get("client_type") or "").casefold()
+            row.setProperty("clientType", client_type)
+            # The square Anthropic source mark is too heavy for this compact row;
+            # Claude clients use the same product-wide linear Agent symbol.
+            official_icon = (
+                QIcon()
+                if client_type in {"claude_code", "claude_desktop"}
+                else agent_icon(client_type)
+            )
+            if official_icon.isNull():
+                accent = THEME_TOKENS[self.theme_mode]["accent"]
+                icon_label.setProperty("lineIconKind", "terminal")
+                icon_label.setProperty("lineIconSize", 18)
+                icon_label.setPixmap(line_icon_pixmap("terminal", 18, accent))
+                icon_label.setToolTip(
+                    "Claude Agent Client"
+                    if client_type in {"claude_code", "claude_desktop"}
+                    else "自定义 Agent / MCP Client"
+                )
+            else:
+                icon_label.setPixmap(official_icon.pixmap(20, 20))
+                icon_label.setToolTip(
+                    "官方品牌图标："
+                    + {
+                        "codex": "OpenAI / Codex",
+                        "claude_code": "Anthropic / Claude Code",
+                        "claude_desktop": "Anthropic / Claude Desktop",
+                        "hermes": "Nous Research / Hermes",
+                    }.get(client_type, "Agent Client")
+                )
+            row_layout.addWidget(icon_label)
+            text_box = QVBoxLayout()
+            text_box.setContentsMargins(0, 0, 0, 0)
+            text_box.setSpacing(0)
+            display_name = str(
+                client.get("display_name")
+                or client.get("client_type")
+                or "Agent Client"
+            )
+            name = QLabel(display_name)
+            name.setObjectName("minorTitle")
+            name.setToolTip(display_name)
+            name.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            activity_raw = str(
+                client.get("last_seen_at")
+                or client.get("last_call_at")
+                or "尚未活动"
+            )
+            activity = (
+                activity_raw
+                if activity_raw == "尚未活动"
+                else f"最近活动 {self._short_time(activity_raw)}"
+            )
+            activity_label = QLabel(activity)
+            activity_label.setObjectName("hint")
+            activity_label.setToolTip(activity_raw)
+            text_box.addWidget(name)
+            text_box.addWidget(activity_label)
+            row_layout.addLayout(text_box, 1)
+            status = str(client.get("status") or "")
+            if status in {"revoked", "撤销"} or client.get("revoked_at"):
+                auth_text = "已撤销"
+            elif status in {"paused", "暂停"} or client.get("paused"):
+                auth_text = "已暂停"
+            elif client.get("enabled") or status in {"active", "connected", "enabled"}:
+                auth_text = "已授权"
+            else:
+                auth_text = "待启用"
+            auth_label = QLabel(auth_text)
+            auth_label.setObjectName("tag")
+            auth_label.setProperty("configured", auth_text == "已授权")
+            auth_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            row_layout.addWidget(auth_label)
+            manage = self._button(
+                "", lambda: self.select_page("agent"),
+                outline=True, icon_kind="settings",
+            )
+            manage.setFixedSize(26, 26)
+            manage.setToolTip("管理此 Agent Client")
+            row_layout.addWidget(manage)
+            self.agent_overview_layout.addWidget(row)
+            self.agent_overview_rows.append(row)
 
     def _populate_inbox_messages(self, rows: list[dict]) -> None:
         table = self.inbox_table
@@ -6521,9 +6818,11 @@ class BridgeWindow(QMainWindow):
     def _populate_agent_clients(self, clients: list[dict] | None = None) -> None:
         if not hasattr(self, "agent_client_table"):
             return
-        rows = clients
-        if rows is None:
-            rows = self.service.list_agent_clients().details.get("clients", [])
+        rows = list(
+            clients
+            if clients is not None
+            else self.service.list_agent_clients().details.get("clients", [])
+        )
         if hasattr(self, "mcp_client_filter"):
             selected = str(self.mcp_client_filter.currentData() or "")
             self.mcp_client_filter.blockSignals(True)
@@ -6537,9 +6836,20 @@ class BridgeWindow(QMainWindow):
             match = self.mcp_client_filter.findData(selected)
             self.mcp_client_filter.setCurrentIndex(max(0, match))
             self.mcp_client_filter.blockSignals(False)
-        self.agent_client_table.setRowCount(0)
+
+        # 隐藏兼容模型仅保留可查询事实，不参与页面布局。
+        self.agent_client_table.setRowCount(len(rows))
+        clear_layout(self.agent_client_list_layout)
+        self.agent_client_row_widgets = []
+        if not rows:
+            self.agent_client_empty = QLabel("暂无已注册的 Agent / MCP Client")
+            self.agent_client_empty.setObjectName("hint")
+            self.agent_client_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.agent_client_empty.setMinimumHeight(64)
+            self.agent_client_list_layout.addWidget(self.agent_client_empty)
+            return
+
         for index, client in enumerate(rows):
-            self.agent_client_table.insertRow(index)
             state = str(client.get("state") or "active")
             enabled = bool(client.get("enabled"))
             state_text = (
@@ -6606,44 +6916,139 @@ class BridgeWindow(QMainWindow):
                 item.setToolTip(value)
                 item.setData(Qt.ItemDataRole.UserRole, client)
                 self.agent_client_table.setItem(index, column, item)
-            actions = QWidget()
-            grid = QGridLayout(actions)
-            grid.setContentsMargins(3, 3, 3, 3)
-            grid.setHorizontalSpacing(4)
-            grid.setVerticalSpacing(3)
-            buttons = [
-                (
-                    "修改权限",
-                    lambda checked=False, value=client: self._edit_agent_client_permissions(value),
-                ),
-                (
-                    "检查并修复",
-                    lambda checked=False, value=client: self._configure_agent_client(value),
-                ),
-                (
-                    "检查连接",
-                    lambda checked=False, value=client: self._test_agent_client(value),
-                ),
-                (
-                    "审计",
-                    lambda checked=False, value=client: self._show_agent_client_audit(value),
-                ),
-                (
-                    "恢复启用" if state == "paused" else "暂停",
-                    lambda checked=False, value=client: self._toggle_agent_client(value),
-                ),
-                (
-                    "撤销",
-                    lambda checked=False, value=client: self._revoke_agent_client(value),
-                ),
-            ]
-            for position, (text, callback) in enumerate(buttons):
-                button = self._button(text, callback, text_only=True)
-                button.setObjectName("compactButton")
-                button.setEnabled(state != "revoked")
-                grid.addWidget(button, position // 3, position % 3)
-            self.agent_client_table.setCellWidget(index, 4, actions)
-            self.agent_client_table.setRowHeight(index, 96)
+            row = self._build_agent_client_management_row(
+                client,
+                install_text=install_text,
+                state_text=state_text,
+                permission_summary=permission_summary,
+            )
+            self.agent_client_list_layout.addWidget(row)
+            self.agent_client_row_widgets.append(row)
+            if index < len(rows) - 1:
+                separator = horizontal_line()
+                self.agent_client_list_layout.addWidget(separator)
+                self.agent_client_row_widgets.append(separator)
+
+    def _build_agent_client_management_row(
+        self,
+        client: dict,
+        *,
+        install_text: str,
+        state_text: str,
+        permission_summary: str,
+    ) -> QWidget:
+        """构建无横向滚动的单个 Client 深度管理行。"""
+        state = str(client.get("state") or "active")
+        row = QWidget()
+        row.setObjectName("agentClientRow")
+        layout = QVBoxLayout(row)
+        layout.setContentsMargins(4, 12, 4, 12)
+        layout.setSpacing(8)
+
+        header = QHBoxLayout()
+        header.setSpacing(9)
+        icon = QLabel()
+        icon.setFixedSize(30, 30)
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon.setPixmap(line_icon_pixmap("terminal", 21, PURPLE))
+        icon.setProperty("lineIconKind", "terminal")
+        icon.setProperty("lineIconSize", 21)
+        icon.setToolTip("Agent / MCP Client")
+        header.addWidget(icon)
+        identity = QVBoxLayout()
+        identity.setSpacing(1)
+        name = QLabel(str(client.get("display_name") or "Agent Client"))
+        name.setObjectName("minorTitle")
+        client_type = QLabel(
+            self._agent_client_type_text(
+                str(client.get("client_type") or "custom")
+            )
+        )
+        client_type.setObjectName("hint")
+        identity.addWidget(name)
+        identity.addWidget(client_type)
+        header.addLayout(identity, 1)
+        install = QLabel(install_text)
+        install.setObjectName("hint")
+        install.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        header.addWidget(install)
+        state_label = QLabel(state_text)
+        state_label.setObjectName("tag")
+        state_label.setProperty(
+            "configured", state != "revoked" and bool(client.get("enabled"))
+        )
+        header.addWidget(state_label)
+        layout.addLayout(header)
+
+        permission = QLabel(permission_summary)
+        permission.setObjectName("hint")
+        permission.setWordWrap(True)
+        permission.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        permission.setToolTip(permission_summary)
+        layout.addWidget(permission)
+
+        activity = QLabel(
+            "最近活动："
+            + self._short_time(client.get("last_seen_at"), include_date=True)
+        )
+        activity.setObjectName("hint")
+        layout.addWidget(activity)
+
+        actions = QGridLayout()
+        actions.setContentsMargins(0, 0, 0, 0)
+        actions.setHorizontalSpacing(6)
+        actions.setVerticalSpacing(6)
+        buttons = [
+            (
+                "修改权限",
+                "shield",
+                lambda checked=False, value=client: self._edit_agent_client_permissions(value),
+            ),
+            (
+                "检查并修复",
+                "settings",
+                lambda checked=False, value=client: self._configure_agent_client(value),
+            ),
+            (
+                "检查连接",
+                "refresh",
+                lambda checked=False, value=client: self._test_agent_client(value),
+            ),
+            (
+                "查看审计",
+                "clock",
+                lambda checked=False, value=client: self._show_agent_client_audit(value),
+            ),
+            (
+                "恢复启用" if state == "paused" else "暂停",
+                "settings",
+                lambda checked=False, value=client: self._toggle_agent_client(value),
+            ),
+            (
+                "撤销",
+                "warning",
+                lambda checked=False, value=client: self._revoke_agent_client(value),
+            ),
+        ]
+        for position, (text, icon_kind, callback) in enumerate(buttons):
+            button = self._button(
+                text,
+                callback,
+                text_only=True,
+                icon_kind=icon_kind,
+            )
+            button.setObjectName("compactButton")
+            button.setMinimumHeight(30)
+            button.setEnabled(state != "revoked")
+            actions.addWidget(button, position // 3, position % 3)
+        for column in range(3):
+            actions.setColumnStretch(column, 1)
+        layout.addLayout(actions)
+        return row
 
     def _show_agent_client_audit(self, client: dict) -> None:
         client_id = str(client.get("client_id") or "")
@@ -7918,25 +8323,56 @@ class BridgeWindow(QMainWindow):
 
     def apply_theme(self, theme: str) -> None:
         """在不重建界面的情况下应用主题。"""
-        self.theme_mode = "dark" if theme == "dark" else "light"
+        self.theme_mode = normalize_theme(theme)
+        if hasattr(self, "window_background"):
+            self.window_background.set_theme(self.theme_mode)
         app = QApplication.instance()
         if app is not None:
+            app.setProperty("agentMailBridgeTheme", self.theme_mode)
             app.setStyleSheet(build_stylesheet(self.theme_mode))
+            accent = THEME_TOKENS[self.theme_mode]["accent"]
+            for widget in app.allWidgets():
+                if isinstance(widget, ToggleSwitch):
+                    widget.update()
+                if isinstance(widget, MessageBar):
+                    widget.refresh_theme()
+                if isinstance(widget, QLabel) and widget.property(
+                    "themeAccentInline"
+                ):
+                    widget.setStyleSheet(f"color: {accent};")
+                icon_kind = widget.property("lineIconKind")
+                if not icon_kind:
+                    continue
+                icon_size = int(widget.property("lineIconSize") or 15)
+                pixmap = line_icon_pixmap(str(icon_kind), icon_size, accent)
+                if isinstance(widget, QPushButton):
+                    widget.setIcon(QIcon(pixmap))
+                    widget.setIconSize(QSize(icon_size, icon_size))
+                elif isinstance(widget, QLabel):
+                    widget.setPixmap(pixmap)
         if hasattr(self, "title_bar"):
             self.title_bar.set_theme(self.theme_mode)
         if hasattr(self, "theme_value_label"):
-            self.theme_value_label.setText("深色模式" if self.theme_mode == "dark" else "浅色模式")
+            self.theme_value_label.setText(self._theme_display_name(self.theme_mode))
 
     def toggle_theme(self) -> None:
-        next_theme = "dark" if self.theme_mode == "light" else "light"
+        next_theme = "coral" if self.theme_mode == "cloud_blue" else "cloud_blue"
         self.apply_theme(next_theme)
         try:
             save_env_values({"GUI_THEME": next_theme})
         except OSError as exc:
             self.show_message(f"已切换主题，但无法保存下次启动设置：{exc}", "error")
             return
-        theme_name = "深色模式" if next_theme == "dark" else "浅色模式"
+        theme_name = self._theme_display_name(next_theme)
         self.show_message(f"已切换为{theme_name}", "success")
+
+    @staticmethod
+    def _theme_display_name(theme: str) -> str:
+        return {
+            "cloud_blue": "云境蓝",
+            "coral": "珊瑚霞",
+            "dark": "深色兼容",
+        }.get(normalize_theme(theme), "云境蓝")
 
     def _sync_manual_receive_actions(self) -> None:
         """自动任务执行中禁止重复启动；开启自动收取不禁用立即收取。"""
@@ -8291,7 +8727,11 @@ class BridgeWindow(QMainWindow):
 
     def _reveal_file(self, path: Path) -> None:
         try:
-            subprocess.Popen(["explorer", f"/select,{path}"])
+            # Explorer 是用户明确要求显示的 GUI；仍阻止它创建附带控制台。
+            popen_hidden(
+                ["explorer", f"/select,{path}"],
+                hide_window=False,
+            )
         except OSError as exc:
             self.show_message(f"定位文件失败：{exc}", "error")
 
@@ -8468,6 +8908,8 @@ class BridgeWindow(QMainWindow):
         if hasattr(self, "vertical_resize_handle"):
             self.vertical_resize_handle.setGeometry(0, self.height() - 6, self.width() - 16, 6)
         super().resizeEvent(event)
+        if hasattr(self, "receive_tools_widget"):
+            self._arrange_receive_toolbar(self.receive_tools_widget.width())
 
     def changeEvent(self, event) -> None:
         if event.type() == QEvent.Type.WindowStateChange and hasattr(self, "title_bar"):

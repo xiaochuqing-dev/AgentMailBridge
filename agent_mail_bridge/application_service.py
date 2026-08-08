@@ -226,6 +226,7 @@ from agent_mail_bridge.retention_cleanup import (
     preview_send_snapshot_cleanup,
     recover_snapshot_cleanup_transactions,
 )
+from agent_mail_bridge.windows_process import run_hidden
 
 
 logger = get_logger("application_service")
@@ -4280,7 +4281,7 @@ class ApplicationService:
             }
         )
         try:
-            completed = subprocess.run(
+            completed = run_hidden(
                 [command, *args],
                 input="\n".join(
                     json.dumps(item, ensure_ascii=False, separators=(",", ":"))

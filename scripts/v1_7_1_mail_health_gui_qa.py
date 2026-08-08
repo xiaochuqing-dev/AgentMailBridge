@@ -220,7 +220,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--evidence", required=True, type=Path)
-    parser.add_argument("--theme", choices=("light", "dark"), default="light")
+    parser.add_argument(
+        "--theme",
+        choices=("cloud_blue", "coral", "dark", "light"),
+        default="cloud_blue",
+    )
     parser.add_argument("--scale", default="1.0")
     parser.add_argument("--expected-dpr", type=float)
     parser.add_argument("--width", type=int, default=1400)

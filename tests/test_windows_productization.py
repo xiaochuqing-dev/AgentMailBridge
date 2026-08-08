@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
 
 from agent_mail_bridge import __version__
 from agent_mail_bridge.credentials import (
@@ -218,7 +218,8 @@ def test_startup_command_supports_source_and_frozen(monkeypatch, tmp_path: Path)
 
 
 def test_second_instance_notifies_existing_window(tmp_path: Path, monkeypatch):
-    QCoreApplication.instance() or QCoreApplication([])
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
     first = SingleInstanceGuard(tmp_path / "data")
     second = SingleInstanceGuard(tmp_path / "data")
     notified: list[str] = []
@@ -290,3 +291,17 @@ def test_windows_packaging_keeps_only_gmail_discovery_data():
     assert spec.count("hookspath=[str(HOOK_DIR)]") == 2
     assert 'includes=["documents/gmail.v1.json"]' in hook
     assert "collect_data_files" in hook
+
+
+def test_agent_brand_assets_are_in_wheel_and_pyinstaller_resources():
+    root = Path(__file__).resolve().parents[1]
+    pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+    spec = (
+        root / "packaging" / "windows" / "AgentMailBridge.spec"
+    ).read_text(encoding="utf-8")
+
+    assert '"resources/branding/agents/*"' in pyproject
+    assert 'RESOURCE_DIR = ROOT / "agent_mail_bridge" / "resources"' in spec
+    assert '(str(RESOURCE_DIR), "agent_mail_bridge/resources")' in spec
+    for name in ("openai.png", "anthropic.png", "hermes.png", "SOURCES.txt"):
+        assert (root / "agent_mail_bridge" / "resources" / "branding" / "agents" / name).is_file()

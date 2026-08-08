@@ -36,6 +36,7 @@ TARGETED_TESTS = (
     "tests/test_v1_4_1_multi_account_runtime.py",
     "tests/test_v1_4_1_multi_account_ui.py",
     "tests/test_account_management_ui.py",
+    "tests/test_windows_process.py",
     "tests/test_windows_productization.py",
 )
 

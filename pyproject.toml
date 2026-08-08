@@ -37,7 +37,10 @@ include = ["agent_mail_bridge*"]
 version = { attr = "agent_mail_bridge.version.__version__" }
 
 [tool.setuptools.package-data]
-agent_mail_bridge = ["resources/branding/*"]
+agent_mail_bridge = [
+    "resources/branding/*",
+    "resources/branding/agents/*",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

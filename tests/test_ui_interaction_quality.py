@@ -9,7 +9,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEvent, QPoint, Qt
+from PySide6.QtCore import QEvent, QPoint, QRect, Qt
 from PySide6.QtWidgets import QApplication, QHeaderView, QLabel, QPushButton, QScrollArea
 
 from agent_mail_bridge.application_service import ApplicationService
@@ -184,7 +184,7 @@ def test_theme_icon_and_typography_tokens_are_formal(quality_window):
 def test_high_dpi_window_expands_and_keeps_full_page_scroll_fallback(quality_window):
     available = quality_window.screen().availableGeometry()
     assert quality_window.height() <= max(available.height(), quality_window.minimumHeight())
-    assert quality_window.height() == min(1020, available.height())
+    assert quality_window.height() == min(820, available.height())
     assert isinstance(quality_window.pages["inbox"], QScrollArea)
     assert isinstance(quality_window.right_panel, QScrollArea)
     assert quality_window.files_table.minimumHeight() == 220
@@ -228,7 +228,7 @@ def test_inbox_has_no_duplicate_gmail_route_or_table_overlap(quality_window, qua
     button_texts = {button.text() for button in page.findChildren(QPushButton)}
     assert "管理 Gmail 账号" not in button_texts
     assert page.minimumHeight() == 0
-    assert quality_window.central_panel.minimumWidth() >= 720
+    assert quality_window.central_panel.minimumWidth() == 590
 
     log_titles = [
         label for label in page.findChildren(QLabel) if label.text() == "最近日志"
@@ -239,3 +239,48 @@ def test_inbox_has_no_duplicate_gmail_route_or_table_overlap(quality_window, qua
     ).y()
     log_top = log_titles[0].mapTo(page, QPoint(0, 0)).y()
     assert file_bottom <= log_top
+
+
+def test_receive_toolbar_wraps_without_clipping_at_default_width(
+    quality_window, quality_app
+):
+    quality_window.resize(1280, 820)
+    quality_app.processEvents()
+    quality_app.processEvents()
+
+    toolbar = quality_window.receive_tools_widget
+    assert toolbar.property("responsiveMode") == "stacked"
+    assert quality_window.pages["inbox"].horizontalScrollBar().maximum() == 0
+    controls = (
+        quality_window.auto_switch,
+        quality_window.interval_combo,
+        quality_window.receive_account_combo,
+        quality_window.inbox_test_button,
+        quality_window.history_rescan_button,
+        quality_window.receive_button,
+    )
+    for control in controls:
+        rect = QRect(control.mapTo(toolbar, QPoint(0, 0)), control.size())
+        assert toolbar.rect().adjusted(-1, -1, 1, 1).contains(rect)
+
+    action_rects = [
+        QRect(button.mapTo(toolbar, QPoint(0, 0)), button.size())
+        for button in (
+            quality_window.inbox_test_button,
+            quality_window.history_rescan_button,
+            quality_window.receive_button,
+        )
+    ]
+    assert all(
+        not left.intersects(right)
+        for index, left in enumerate(action_rects)
+        for right in action_rects[index + 1 :]
+    )
+    assert min(rect.top() for rect in action_rects) > quality_window.interval_combo.mapTo(
+        toolbar, QPoint(0, 0)
+    ).y()
+
+    quality_window.resize(1700, 900)
+    quality_app.processEvents()
+    quality_app.processEvents()
+    assert toolbar.property("responsiveMode") == "inline"

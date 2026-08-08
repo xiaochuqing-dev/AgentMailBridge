@@ -1304,6 +1304,7 @@ def test_sent_observation_recovers_delivery_unknown_without_duplicate_fact(tmp_c
     message["Subject"] = str(request["subject"])
     message["Message-ID"] = str(request["message_id"])
     message.set_content(str(request["body_text"] or "deterministic body"))
+    observed_at = str(request["created_at"])
     normalized = normalized_mail_from_raw(
         message.as_bytes(),
         backend="imap",
@@ -1311,8 +1312,8 @@ def test_sent_observation_recovers_delivery_unknown_without_duplicate_fact(tmp_c
         thread_id="",
         uid="172",
         uidvalidity=171,
-        received_at="2026-07-30 17:12:00",
-        saved_date="2026-07-30",
+        received_at=observed_at,
+        saved_date=observed_at[:10],
         max_attachment_bytes=runtime_cfg.max_attachment_bytes,
         mailbox_ref="Sent",
         direction="outbound",

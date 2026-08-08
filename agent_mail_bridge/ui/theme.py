@@ -6,6 +6,8 @@ from pathlib import Path
 
 from PySide6.QtGui import QFont, QFontDatabase
 
+from agent_mail_bridge.runtime_paths import get_runtime_paths
+
 PURPLE = "#5B3DF5"
 PURPLE_DARK = "#4930D9"
 PURPLE_SOFT = "#F1EEFF"
@@ -18,6 +20,46 @@ SUCCESS_SOFT = "#ECFAF1"
 WARNING = "#E59A24"
 DANGER = "#D84A56"
 FONT_FAMILY = "Microsoft YaHei UI"
+
+# 主题只切换视觉 token；成功、警告、错误和禁用色保持语义独立。
+THEME_ALIASES = {
+    "light": "cloud_blue",
+    "blue": "cloud_blue",
+    "cloud": "cloud_blue",
+    "cloud_blue": "cloud_blue",
+    "coral": "coral",
+    "pink": "coral",
+    "dark": "dark",
+}
+THEME_TOKENS = {
+    "cloud_blue": {
+        "accent": "#2F78E5",
+        "accent_dark": "#1E5FC4",
+        "accent_soft": "#E7F1FF",
+        "text": "#17253B",
+        "muted": "#63748B",
+        "border": "#D5E4F6",
+        "background": "#EAF4FF",
+    },
+    "coral": {
+        "accent": "#E56878",
+        "accent_dark": "#C84D61",
+        "accent_soft": "#FFE7EB",
+        "text": "#38252E",
+        "muted": "#806872",
+        "border": "#F1D3D9",
+        "background": "#FFF0F2",
+    },
+    "dark": {
+        "accent": PURPLE,
+        "accent_dark": PURPLE_DARK,
+        "accent_soft": PURPLE_SOFT,
+        "text": TEXT,
+        "muted": TEXT_MUTED,
+        "border": BORDER,
+        "background": "#171923",
+    },
+}
 
 # Qt 样式表不支持 CSS line-height；行高由控件高度与布局间距落实。
 TYPOGRAPHY = {
@@ -57,8 +99,33 @@ def load_interface_font() -> QFont:
     return font
 
 
-def build_stylesheet(theme: str = "light") -> str:
+def normalize_theme(theme: str | None) -> str:
+    return THEME_ALIASES.get(str(theme or "").strip().lower(), "cloud_blue")
+
+
+def theme_background_path(theme: str | None) -> Path | None:
+    mode = normalize_theme(theme)
+    if mode == "cloud_blue":
+        candidate = get_runtime_paths().resource_root / "branding" / "theme-cloud-blue.jpg"
+    elif mode == "coral":
+        candidate = get_runtime_paths().resource_root / "branding" / "theme-coral.jpg"
+    else:
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def build_stylesheet(theme: str = "cloud_blue") -> str:
     """生成指定的全局主题样式。"""
+    theme = normalize_theme(theme)
+    tokens = THEME_TOKENS[theme]
+    # 保留现有 QSS 结构，只将主题相关 token 绑定到当前调色板。
+    PURPLE = tokens["accent"]
+    PURPLE_DARK = tokens["accent_dark"]
+    PURPLE_SOFT = tokens["accent_soft"]
+    TEXT = tokens["text"]
+    TEXT_MUTED = tokens["muted"]
+    BORDER = tokens["border"]
+    BACKGROUND = tokens["background"]
     base = f"""
     * {{
         font-family: "Microsoft YaHei UI";
@@ -117,13 +184,13 @@ def build_stylesheet(theme: str = "light") -> str:
         font-size: 11px;
     }}
     QLabel#fieldLabel {{
-        color: #555A68;
+        color: {TEXT_MUTED};
         font-size: 12px;
     }}
     QLabel#oauthExpectedAccount {{
-        color: #4A3E87;
-        background: #F4F1FF;
-        border: 1px solid #D8D0FF;
+        color: {PURPLE};
+        background: {PURPLE_SOFT};
+        border: 1px solid {BORDER};
         border-radius: 4px;
         padding: 7px 9px;
         font-size: 11px;
@@ -163,7 +230,7 @@ def build_stylesheet(theme: str = "light") -> str:
         color: {SUCCESS};
         background: {SUCCESS_SOFT};
         border-radius: 9px;
-        padding: 2px 7px;
+        padding: 2px 6px;
         font-size: 9px;
         font-weight: 700;
     }}
@@ -187,17 +254,17 @@ def build_stylesheet(theme: str = "light") -> str:
     QFrame#card {{
         background: #FFFFFF;
         border: 1px solid {BORDER};
-        border-radius: 10px;
+        border-radius: 8px;
     }}
     QFrame#navCard {{
         background: #FFFFFF;
         border: 1px solid {BORDER};
-        border-radius: 10px;
+        border-radius: 8px;
     }}
     QFrame#accountPanel, QFrame#credentialCard {{
-        background: #FBFAFF;
-        border: 1px solid #E4DFFF;
-        border-radius: 10px;
+        background: {PURPLE_SOFT};
+        border: 1px solid {BORDER};
+        border-radius: 8px;
     }}
     QLabel#credentialMask {{
         color: #3E4350;
@@ -206,12 +273,12 @@ def build_stylesheet(theme: str = "light") -> str:
         border-radius: 5px;
         padding: 7px 11px;
         font-family: "Segoe UI";
-        letter-spacing: 2px;
+        letter-spacing: 0px;
     }}
     QFrame#heroCard {{
         background: #FFFFFF;
         border: 1px solid {BORDER};
-        border-radius: 10px;
+        border-radius: 8px;
     }}
     QFrame#overviewMetric {{
         background: #F8F9FC;
@@ -236,8 +303,8 @@ def build_stylesheet(theme: str = "light") -> str:
     QLabel#healthDetail {{ font-size: 10px; color: #565C6B; }}
     QLabel#healthChecked {{ font-size: 9px; color: {TEXT_MUTED}; }}
     QFrame#statPurple {{
-        background: #F5F2FF;
-        border: 1px solid #EEE9FF;
+        background: {PURPLE_SOFT};
+        border: 1px solid {BORDER};
         border-radius: 9px;
     }}
     QFrame#statGreen {{
@@ -259,12 +326,12 @@ def build_stylesheet(theme: str = "light") -> str:
         background: #FFFFFF;
         border: 1px solid #DDE0E8;
         border-radius: 6px;
-        padding: 7px 13px;
+        padding: 5px 10px;
         font-size: 12px;
     }}
     QPushButton:hover {{
-        border-color: #BDB4F8;
-        background: #FAF9FF;
+        border-color: {PURPLE};
+        background: {PURPLE_SOFT};
     }}
     QPushButton:pressed {{ background: {PURPLE_SOFT}; }}
     QPushButton:focus {{ border: 1px solid {PURPLE}; }}
@@ -275,8 +342,8 @@ def build_stylesheet(theme: str = "light") -> str:
     }}
     QPushButton[taskState="running"] {{
         color: #FFFFFF;
-        border-color: #6750E8;
-        background: #6750E8;
+        border-color: {PURPLE};
+        background: {PURPLE};
         font-weight: 700;
     }}
     QPushButton[taskState="success"] {{
@@ -298,34 +365,32 @@ def build_stylesheet(theme: str = "light") -> str:
         color: #FFFFFF;
         font-weight: 700;
         border: none;
-        background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 {PURPLE}, stop:1 #2E86DE);
+        background: {PURPLE};
     }}
     QPushButton#primaryButton:hover {{
-        background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 {PURPLE_DARK}, stop:1 #2478C8);
+        background: {PURPLE_DARK};
     }}
-    QPushButton#primaryButton:pressed {{ background: #4930D9; }}
+    QPushButton#primaryButton:pressed {{ background: {PURPLE_DARK}; }}
     QPushButton#outlinePurple {{
         color: {PURPLE};
         font-weight: 700;
-        border: 1px solid #8F7CF2;
+        border: 1px solid {PURPLE};
         background: #FFFFFF;
     }}
     QPushButton#accountChoice {{
         text-align: left;
         color: #353945;
-        border: 1px solid #DED9F8;
-        border-radius: 10px;
+        border: 1px solid {BORDER};
+        border-radius: 8px;
         background: #FFFFFF;
-        padding: 12px 16px;
+        padding: 9px 12px;
         font-size: 12px;
         font-weight: 700;
     }}
     QPushButton#accountChoice:hover {{
         color: {PURPLE};
-        border-color: #9E8EF5;
-        background: #FAF9FF;
+        border-color: {PURPLE};
+        background: {PURPLE_SOFT};
     }}
     QPushButton#accountChoice:checked {{
         color: {PURPLE};
@@ -335,23 +400,23 @@ def build_stylesheet(theme: str = "light") -> str:
     QPushButton#textButton {{
         color: {PURPLE};
         font-weight: 700;
-        border: 1px solid #E2DEFA;
+        border: 1px solid {BORDER};
         border-radius: 6px;
-        background: #F9F8FF;
+        background: {PURPLE_SOFT};
         padding: 5px 9px;
     }}
-    QPushButton#textButton:hover {{ border-color: #B8ADF5; background: {PURPLE_SOFT}; }}
+    QPushButton#textButton:hover {{ border-color: {PURPLE}; background: {PURPLE_SOFT}; }}
     QPushButton#compactButton {{
         min-height: 26px;
-        color: #4A3CB3;
-        background: #F5F3FF;
-        border: 1px solid #DDD7FA;
+        color: {PURPLE};
+        background: {PURPLE_SOFT};
+        border: 1px solid {BORDER};
         border-radius: 5px;
         padding: 3px 8px;
         font-size: 10px;
         font-weight: 700;
     }}
-    QPushButton#compactButton:hover {{ background: #EDE9FF; border-color: #A99AF2; }}
+    QPushButton#compactButton:hover {{ background: {PURPLE_SOFT}; border-color: {PURPLE}; }}
     QPushButton#titleButton {{
         border: none;
         border-radius: 4px;
@@ -359,7 +424,7 @@ def build_stylesheet(theme: str = "light") -> str:
         padding: 0;
         font-size: 15px;
     }}
-    QPushButton#titleButton:hover {{ background: #F0F1F5; }}
+    QPushButton#titleButton:hover {{ background: {PURPLE_SOFT}; }}
     QPushButton#closeButton {{
         border: none;
         border-radius: 4px;
@@ -372,12 +437,12 @@ def build_stylesheet(theme: str = "light") -> str:
         text-align: left;
         border: none;
         border-radius: 7px;
-        padding: 11px 14px;
+        padding: 8px 11px;
         background: transparent;
         color: #4F5360;
         font-size: 12px;
     }}
-    QPushButton#navButton:hover {{ background: #F5F3FF; color: {PURPLE}; }}
+    QPushButton#navButton:hover {{ background: {PURPLE_SOFT}; color: {PURPLE}; }}
     QPushButton#navButton:checked {{
         background: {PURPLE_SOFT};
         color: {PURPLE};
@@ -389,7 +454,7 @@ def build_stylesheet(theme: str = "light") -> str:
         border-bottom: 2px solid transparent;
         border-radius: 0;
         background: transparent;
-        padding: 15px 18px 12px 18px;
+        padding: 12px 15px 10px 15px;
         font-size: 12px;
         font-weight: 700;
     }}
@@ -400,21 +465,21 @@ def build_stylesheet(theme: str = "light") -> str:
         font-weight: 700;
     }}
     QLineEdit, QComboBox, QSpinBox, QTextEdit {{
-        min-height: 35px;
+        min-height: 32px;
         background: #FFFFFF;
         border: 1px solid #E1E3E9;
         border-radius: 5px;
-        padding: 0 10px;
+        padding: 0 8px;
         font-size: 12px;
         selection-background-color: {PURPLE};
     }}
     QTextEdit {{ padding: 8px; }}
     QTextEdit#mailDetailBody {{ min-height: 240px; }}
     QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{
-        border: 1px solid #8E7AF4;
+        border: 1px solid {PURPLE};
     }}
     QLineEdit#inboxSearch {{
-        min-height: 36px;
+        min-height: 32px;
         padding-left: 8px;
         border-radius: 7px;
         background: #FBFBFE;
@@ -449,7 +514,7 @@ def build_stylesheet(theme: str = "light") -> str:
         selection-background-color: {PURPLE_SOFT};
         selection-color: {TEXT};
     }}
-    QTableWidget::item {{ padding: 5px 6px; border-bottom: 1px solid #F0F1F4; }}
+    QTableWidget::item {{ padding: 4px 5px; border-bottom: 1px solid #F0F1F4; }}
     QTableWidget::item:hover {{ background: transparent; }}
     QTableWidget#mailRecordTable {{
         alternate-background-color: #FFFFFF;
@@ -509,13 +574,12 @@ def build_stylesheet(theme: str = "light") -> str:
     }}
     QProgressBar {{
         border: none;
-        background: #EEEAFD;
+        background: {PURPLE_SOFT};
         border-radius: 2px;
     }}
     QProgressBar::chunk {{
         border-radius: 2px;
-        background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 {PURPLE}, stop:1 #2EA7E0);
+        background: {PURPLE};
     }}
     QToolTip {{
         color: #FFFFFF;
@@ -526,7 +590,92 @@ def build_stylesheet(theme: str = "light") -> str:
     }}
     """
     if theme != "dark":
-        return base
+        if theme == "cloud_blue":
+            band = "rgba(230,244,255,156)"
+            page = "rgba(235,247,255,78)"
+            panel = "rgba(250,253,255,188)"
+            control = "rgba(253,254,255,220)"
+            subtle = "rgba(231,245,255,178)"
+            header = "rgba(220,239,255,210)"
+            popup = "#F5FAFF"
+            dialog_surface = "#EDF7FF"
+        else:
+            band = "rgba(255,235,238,158)"
+            page = "rgba(255,240,243,80)"
+            panel = "rgba(255,252,252,190)"
+            control = "rgba(255,253,253,220)"
+            subtle = "rgba(255,235,239,180)"
+            header = "rgba(255,225,231,212)"
+            popup = "#FFF7F8"
+            dialog_surface = "#FFF2F4"
+        return base + f"""
+    QDialog {{ background: {dialog_surface}; }}
+    QMainWindow, QWidget#windowRoot, QWidget#bodySurface,
+    QWidget#centralPanel {{ background: transparent; }}
+    QWidget#titleBar, QWidget#sidebar, QWidget#tabBar,
+    QWidget#rightPanelContent {{ background: {band}; }}
+    QScrollArea, QScrollArea#pageScroll, QScrollArea#rightPanel,
+    QScrollArea#accountListScroll, QWidget#accountList,
+    QScrollArea QWidget#qt_scrollarea_viewport {{
+        background: transparent;
+        border: none;
+    }}
+    QFrame#card, QFrame#heroCard, QFrame#accountPanel, QFrame#credentialCard,
+    QFrame#navCard, QFrame#healthItem, QFrame#overviewMetric {{
+        background: {panel};
+        border-color: {BORDER};
+    }}
+    QWidget#pageSurface {{ background: {page}; }}
+    QFrame#mailDetailResourcesPane, QWidget#mailDetailResourcesContent {{
+        background: {page};
+        border: none;
+    }}
+    QLabel#fieldLabel {{ color: {TEXT_MUTED}; }}
+    QPushButton#navButton:hover, QPushButton#navButton:checked,
+    QPushButton#tabButton:hover, QPushButton#tabButton:checked {{
+        color: {PURPLE}; background: {PURPLE_SOFT};
+    }}
+    QPushButton#primaryButton {{ background: {PURPLE}; border-color: {PURPLE}; }}
+    QPushButton#primaryButton:hover {{ background: {PURPLE_DARK}; border-color: {PURPLE_DARK}; }}
+    QPushButton {{ background: {control}; border-color: {BORDER}; }}
+    QPushButton#outlinePurple {{ color: {PURPLE}; border-color: {PURPLE}; background: {control}; }}
+    QPushButton:hover {{ border-color: {PURPLE}; background: {PURPLE_SOFT}; }}
+    QPushButton#textButton, QPushButton#compactButton {{
+        color: {PURPLE}; background: {control}; border-color: {BORDER};
+    }}
+    QPushButton#accountChoice {{ background: {control}; border-color: {BORDER}; }}
+    QPushButton#accountChoice:hover, QPushButton#accountChoice:checked {{
+        color: {PURPLE}; background: {PURPLE_SOFT}; border-color: {PURPLE};
+    }}
+    QLineEdit, QComboBox, QSpinBox, QTextEdit {{
+        background: {control}; border-color: {BORDER};
+    }}
+    QLineEdit#inboxSearch {{ background: {control}; border-color: {BORDER}; }}
+    QComboBox QAbstractItemView {{ background: {popup}; border-color: {BORDER}; }}
+    QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{ border-color: {PURPLE}; }}
+    QCheckBox::indicator:unchecked {{ background: {control}; border-color: {BORDER}; }}
+    QCheckBox::indicator:checked {{ border-color: {PURPLE}; background: {PURPLE}; }}
+    QLabel#oauthExpectedAccount {{
+        color: {PURPLE}; background: {PURPLE_SOFT}; border-color: {BORDER};
+    }}
+    QTableWidget {{
+        background: {panel};
+        alternate-background-color: {subtle};
+        border-color: {BORDER};
+        gridline-color: {BORDER};
+    }}
+    QTableWidget#mailRecordTable, QTableWidget#compactResourceTable {{
+        alternate-background-color: {panel};
+    }}
+    QHeaderView::section {{
+        color: {TEXT_MUTED};
+        background: {header};
+        border-bottom-color: {BORDER};
+    }}
+    QTableWidget::item:selected {{ background: {PURPLE_SOFT}; color: {TEXT}; }}
+    QScrollBar::handle:vertical, QScrollBar::handle:horizontal {{ background: {PURPLE}; }}
+    QProgressBar::chunk {{ background: {PURPLE}; }}
+    """
     return base + f"""
     * {{ color: #E8EAF2; }}
     QMainWindow, QDialog, QWidget#windowRoot, QWidget#titleBar, QWidget#sidebar,

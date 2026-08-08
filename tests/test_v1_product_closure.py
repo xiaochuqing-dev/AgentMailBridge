@@ -42,7 +42,7 @@ def _all_text(widget) -> str:
 def test_final_primary_navigation_is_unique(v1_window):
     assert [button.text() for button in v1_window.tab_buttons.values()] == ["收件", "发件"]
     assert [button.text() for button in v1_window.nav_buttons.values()] == [
-        "Agent 接入", "待确认发送", "历史记录", "文件与数据", "设置", "关于",
+        "Agent 接入", "传输与发送", "历史记录", "文件与数据", "设置", "关于",
     ]
     assert "advanced" not in v1_window.tab_buttons
     assert "agent" in v1_window.nav_buttons
@@ -160,7 +160,7 @@ def test_mcp_panel_explains_general_send_and_secret_boundary(v1_window):
     assert "合法地址" in text
     assert "不能读取任何邮箱凭据" in text
     assert "邮件读取" in text
-    assert "连接 Agent Client" in text
+    assert "连接与深度管理 Agent Client" in text
     assert v1_window.agent_client_table.horizontalHeaderItem(2).text() == "权限摘要"
 
 

@@ -9,19 +9,30 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtGui import QImage
+from PySide6.QtGui import QColor, QImage
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QDialogButtonBox,
+    QLabel,
     QPushButton,
 )
 
 from agent_mail_bridge.application_service import ApplicationService
 from agent_mail_bridge.models import OperationStatus, ReceiveResult, ServiceResult
-from agent_mail_bridge.ui.branding import BRAND_CANDIDATES, find_brand_asset
+from agent_mail_bridge.ui.branding import (
+    BRAND_CANDIDATES,
+    agent_icon,
+    find_brand_asset,
+)
 from agent_mail_bridge.ui.main_window import BridgeWindow
-from agent_mail_bridge.ui.theme import build_stylesheet, load_interface_font
+from agent_mail_bridge.ui.theme import (
+    THEME_TOKENS,
+    build_stylesheet,
+    load_interface_font,
+    theme_background_path,
+)
+from agent_mail_bridge.ui.widgets import ThemeBackground
 
 
 @pytest.fixture(scope="module")
@@ -40,6 +51,14 @@ def product_window(product_qt_app, tmp_cfg):
     yield window
     window.request_quit()
     product_qt_app.processEvents()
+
+
+def test_official_agent_brand_icons_are_packaged():
+    assert not agent_icon("codex").isNull()
+    assert not agent_icon("claude_code").isNull()
+    assert not agent_icon("claude_desktop").isNull()
+    assert not agent_icon("hermes").isNull()
+    assert agent_icon("custom").isNull()
 
 
 def _wait(window: BridgeWindow, app: QApplication) -> None:
@@ -122,6 +141,135 @@ def test_dark_theme_defines_neutral_text_and_card_surfaces(product_window):
     assert "QScrollArea#accountListScroll, QWidget#accountList" in stylesheet
     assert "color: #C6BEFF" in stylesheet
     assert "#242736" in stylesheet
+
+
+def test_blue_and_coral_theme_switch_refreshes_dynamic_controls(product_window):
+    product_window.message_bar.set_message("正在执行", "working")
+    product_window.apply_theme("cloud_blue")
+    blue = THEME_TOKENS["cloud_blue"]["accent"]
+    blue_icon_key = product_window.service_rows["core"].icon_label.pixmap().cacheKey()
+    assert blue in QApplication.instance().styleSheet()
+    assert blue in product_window.message_bar.styleSheet()
+    assert theme_background_path("cloud_blue").is_file()
+
+    product_window.apply_theme("coral")
+    coral = THEME_TOKENS["coral"]["accent"]
+    coral_icon_key = product_window.service_rows["core"].icon_label.pixmap().cacheKey()
+    assert coral in QApplication.instance().styleSheet()
+    assert coral in product_window.message_bar.styleSheet()
+    assert theme_background_path("coral").is_file()
+    assert coral_icon_key != blue_icon_key
+    assert product_window.theme_value_label.text() == "珊瑚霞"
+    assert product_window.window_background.theme == "coral"
+    assert product_window.window_background.background_path == theme_background_path("coral")
+
+    product_window.apply_theme("cloud_blue")
+
+
+def test_light_themes_do_not_keep_legacy_purple_component_colors():
+    legacy_component_colors = {
+        "#4A3E87",
+        "#F4F1FF",
+        "#D8D0FF",
+        "#FBFAFF",
+        "#E4DFFF",
+        "#F5F2FF",
+        "#EEE9FF",
+        "#BDB4F8",
+        "#FAF9FF",
+        "#EEEAFD",
+    }
+    for theme in ("cloud_blue", "coral"):
+        stylesheet = build_stylesheet(theme)
+        assert not legacy_component_colors.intersection(stylesheet)
+        assert "background-image" not in stylesheet
+        assert "QScrollArea QWidget#qt_scrollarea_viewport" in stylesheet
+        assert "rgba(" in stylesheet
+
+
+@pytest.mark.parametrize(
+    ("theme", "expected_surface"),
+    (("cloud_blue", "#EDF7FF"), ("coral", "#FFF2F4")),
+)
+def test_light_theme_dialog_surface_is_not_system_gray(
+    product_qt_app, theme, expected_surface
+):
+    previous = product_qt_app.styleSheet()
+    dialog = QDialog()
+    try:
+        product_qt_app.setStyleSheet(build_stylesheet(theme))
+        dialog.resize(260, 160)
+        dialog.show()
+        product_qt_app.processEvents()
+        actual = dialog.grab().toImage().pixelColor(4, 4)
+        assert actual == QColor(expected_surface)
+    finally:
+        dialog.close()
+        product_qt_app.setStyleSheet(previous)
+
+
+@pytest.mark.parametrize("theme", ("cloud_blue", "coral"))
+def test_theme_background_paints_visible_edge_to_edge_image(product_qt_app, theme):
+    background = ThemeBackground(theme)
+    background.resize(640, 360)
+    background.show()
+    product_qt_app.processEvents()
+    image = background.grab().toImage()
+    background.close()
+
+    assert background.background_path == theme_background_path(theme)
+    assert image.width() >= 640 and image.height() >= 360
+    colors = []
+    for x_ratio, y_ratio in (
+        (0.05, 0.05), (0.5, 0.05), (0.95, 0.05),
+        (0.05, 0.5), (0.5, 0.5), (0.95, 0.5),
+        (0.05, 0.95), (0.5, 0.95), (0.95, 0.95),
+    ):
+        color = image.pixelColor(
+            min(image.width() - 1, int(image.width() * x_ratio)),
+            min(image.height() - 1, int(image.height() * y_ratio)),
+        )
+        colors.append((color.red(), color.green(), color.blue()))
+    luminance = [sum(color) for color in colors]
+    assert max(luminance) - min(luminance) >= 20
+    assert min(luminance) < 720
+
+
+def test_compact_agent_overview_rows_do_not_expand_or_overlap(
+    product_window, product_qt_app
+):
+    product_window._refresh_agent_overview([
+        {"client_type": "codex", "display_name": "Codex", "enabled": True},
+        {
+            "client_type": "claude_code",
+            "display_name": "Claude Code",
+            "enabled": True,
+        },
+        {"client_type": "hermes", "display_name": "Hermes", "enabled": True},
+    ])
+    product_qt_app.processEvents()
+
+    assert len(product_window.agent_overview_rows) == 3
+    for row in product_window.agent_overview_rows:
+        assert row.height() == 46
+        tag = next(label for label in row.findChildren(QLabel) if label.objectName() == "tag")
+        manage = row.findChild(QPushButton)
+        assert manage is not None
+        assert tag.geometry().right() < manage.geometry().left()
+        assert tag.geometry().bottom() < row.height()
+
+    claude_row = next(
+        row
+        for row in product_window.agent_overview_rows
+        if row.property("clientType") == "claude_code"
+    )
+    claude_icon = next(
+        label
+        for label in claude_row.findChildren(QLabel)
+        if label.property("lineIconKind")
+    )
+    assert claude_icon.property("lineIconKind") == "terminal"
+    assert all("QA" not in label.text() for label in claude_row.findChildren(QLabel))
 
 
 def test_gui_fixture_never_reads_project_oauth_files(product_window, tmp_path):

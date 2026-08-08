@@ -6,6 +6,7 @@ from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
     QAbstractButton,
+    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import (
 
 from agent_mail_bridge.ui.theme import (
     BORDER,
+    BACKGROUND,
     DANGER,
     PURPLE,
     PURPLE_SOFT,
@@ -25,6 +27,9 @@ from agent_mail_bridge.ui.theme import (
     TEXT,
     TEXT_MUTED,
     WARNING,
+    THEME_TOKENS,
+    normalize_theme,
+    theme_background_path,
 )
 
 
@@ -45,6 +50,56 @@ def horizontal_line() -> QFrame:
     line.setObjectName("separator")
     line.setFixedHeight(1)
     return line
+
+
+class ThemeBackground(QWidget):
+    """Paint the selected theme image as a centered, edge-to-edge cover."""
+
+    def __init__(self, theme: str = "cloud_blue", parent: QWidget | None = None):
+        super().__init__(parent)
+        self._theme = ""
+        self._background_path = None
+        self._background = QPixmap()
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.set_theme(theme)
+
+    @property
+    def theme(self) -> str:
+        return self._theme
+
+    @property
+    def background_path(self):
+        return self._background_path
+
+    def set_theme(self, theme: str) -> None:
+        self._theme = normalize_theme(theme)
+        self._background_path = theme_background_path(self._theme)
+        self._background = (
+            QPixmap(str(self._background_path))
+            if self._background_path is not None
+            else QPixmap()
+        )
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.fillRect(self.rect(), QColor(THEME_TOKENS[self._theme]["background"]))
+        if self._background.isNull() or self.width() <= 0 or self.height() <= 0:
+            return
+
+        image_width = self._background.width()
+        image_height = self._background.height()
+        target_ratio = self.width() / self.height()
+        image_ratio = image_width / image_height
+        if image_ratio > target_ratio:
+            source_width = image_height * target_ratio
+            source = QRectF((image_width - source_width) / 2, 0, source_width, image_height)
+        else:
+            source_height = image_width / target_ratio
+            source = QRectF(0, (image_height - source_height) / 2, image_width, source_height)
+        painter.drawPixmap(QRectF(self.rect()), self._background, source)
 
 
 def format_size(size_bytes: int | str | None) -> str:
@@ -204,23 +259,27 @@ class ToggleSwitch(QAbstractButton):
         super().__init__(parent)
         self.setCheckable(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedSize(38, 22)
+        self.setFixedSize(36, 20)
 
     def sizeHint(self) -> QSize:
-        return QSize(38, 22)
+        return QSize(36, 20)
 
     def paintEvent(self, event) -> None:
         del event
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        active = QColor(PURPLE)
+        app = QApplication.instance()
+        theme = normalize_theme(
+            app.property("agentMailBridgeTheme") if app is not None else None
+        )
+        active = QColor(THEME_TOKENS[theme]["accent"])
         inactive = QColor("#CDD0D9")
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(active if self.isChecked() else inactive)
-        painter.drawRoundedRect(QRectF(0, 2, 38, 18), 9, 9)
-        center_x = 28 if self.isChecked() else 10
+        painter.drawRoundedRect(QRectF(0, 2, 36, 16), 8, 8)
+        center_x = 27 if self.isChecked() else 9
         painter.setBrush(QColor("#FFFFFF"))
-        painter.drawEllipse(QPointF(center_x, 11), 7, 7)
+        painter.drawEllipse(QPointF(center_x, 10), 6.5, 6.5)
 
 
 class AccountCard(QFrame):
@@ -232,55 +291,77 @@ class AccountCard(QFrame):
         super().__init__()
         self.setObjectName("card")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedHeight(122)
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(14, 13, 12, 12)
-        layout.setSpacing(10)
+        self.setFixedHeight(100)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(11, 9, 10, 9)
+        layout.setSpacing(2)
+
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.setSpacing(8)
 
         icon = QLabel(symbol if isinstance(symbol, str) else "")
         icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        icon.setFixedSize(40, 40)
+        icon.setFixedSize(34, 34)
         if isinstance(symbol, QIcon) and not symbol.isNull():
-            icon.setPixmap(symbol.pixmap(36, 36))
+            icon.setPixmap(symbol.pixmap(30, 30))
             icon.setStyleSheet("background: transparent; border: none;")
         else:
             icon.setStyleSheet(
                 f"color: {color}; background: #FFFFFF; border: 1px solid {BORDER};"
                 "border-radius: 8px; font-size: 17px; font-weight: 800;"
             )
-        layout.addWidget(icon, 0, Qt.AlignmentFlag.AlignTop)
-
-        text_area = QVBoxLayout()
-        text_area.setSpacing(2)
+        top_row.addWidget(icon)
         self.title_label = QLabel(title)
         self.title_label.setObjectName("minorTitle")
         self.title_label.setWordWrap(False)
+        top_row.addWidget(self.title_label, 1)
         self.status_tag = QLabel("未配置")
         self.status_tag.setObjectName("tag")
         self.status_tag.setProperty("configured", False)
+        top_row.addWidget(self.status_tag)
+        layout.addLayout(top_row)
+
         self.email_label = QLabel(email or "未配置")
         self.email_label.setObjectName("muted")
         self.email_label.setWordWrap(True)
+        self.email_label.setToolTip(email or "未配置")
         self.email_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
+        layout.addWidget(self.email_label)
         self.detail_label = QLabel(description)
         self.detail_label.setObjectName("hint")
-        bottom_row = QHBoxLayout()
-        bottom_row.setSpacing(5)
-        bottom_row.addWidget(self.detail_label)
-        bottom_row.addStretch(1)
-        bottom_row.addWidget(self.status_tag)
-        text_area.addWidget(self.title_label)
-        text_area.addWidget(self.email_label)
-        text_area.addLayout(bottom_row)
-        layout.addLayout(text_area, 1)
+        self.detail_label.setToolTip(description)
+        layout.addWidget(self.detail_label)
 
     def set_configured(self, configured: bool) -> None:
         self.status_tag.setText("已配置" if configured else "未配置")
         self.status_tag.setProperty("configured", configured)
         self.status_tag.style().unpolish(self.status_tag)
         self.status_tag.style().polish(self.status_tag)
+
+    def set_capability_status(
+        self,
+        receive_state: str | None,
+        send_state: str | None,
+    ) -> None:
+        """在紧凑卡片内显示真实收件/发件能力，不用笼统的已配置替代。"""
+        labels = {
+            "ready": "正常",
+            "authorized": "已授权",
+            "configured": "已配置",
+            "disabled": "未启用",
+            "authorization_required": "未授权",
+            "unsupported": "不支持",
+            "error": "错误",
+            "not_configured": "未配置",
+        }
+        receive = labels.get(str(receive_state or "not_configured"), "待检查")
+        send = labels.get(str(send_state or "not_configured"), "待检查")
+        text = f"收件：{receive}  ·  发件：{send}"
+        self.detail_label.setText(text)
+        self.detail_label.setToolTip(text)
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -300,7 +381,7 @@ class NavButton(QPushButton):
         self.setCheckable(True)
         self.setAutoExclusive(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedHeight(46)
+        self.setFixedHeight(40)
 
 
 class StatusRow(QWidget):
@@ -308,33 +389,34 @@ class StatusRow(QWidget):
 
     def __init__(self, icon: QIcon | QPixmap | str, label: str, value: str = "—"):
         super().__init__()
+        self.setFixedHeight(42)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 3, 0, 3)
-        layout.setSpacing(8)
-        icon_label = QLabel(icon if isinstance(icon, str) else "")
+        layout.setContentsMargins(0, 2, 0, 2)
+        layout.setSpacing(6)
+        self.icon_label = QLabel(icon if isinstance(icon, str) else "")
         if isinstance(icon, QPixmap) and not icon.isNull():
-            icon_label.setPixmap(icon)
+            self.icon_label.setPixmap(icon)
         elif isinstance(icon, QIcon) and not icon.isNull():
-            icon_label.setPixmap(tinted_icon_pixmap(icon, 16, PURPLE))
+            self.icon_label.setPixmap(tinted_icon_pixmap(icon, 16, PURPLE))
         else:
-            icon_label.setStyleSheet(f"color: {PURPLE}; font-size: 14px;")
-        icon_label.setFixedWidth(18)
+            self.icon_label.setStyleSheet(f"color: {PURPLE}; font-size: 14px;")
+        self.icon_label.setFixedWidth(18)
         name = QLabel(label)
         name.setObjectName("statusName")
         name.setStyleSheet("font-size: 10px;")
         self.value_label = QLabel(value)
-        # 126 像素可容纳完整日期和常见邮箱，避免高 DPI 下左侧截断。
-        self.value_label.setMinimumWidth(126)
+        self.value_label.setMinimumWidth(70)
         self.value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.value_label.setObjectName("statusValue")
         self.value_label.setStyleSheet("font-size: 10px;")
-        layout.addWidget(icon_label)
+        layout.addWidget(self.icon_label)
         layout.addWidget(name)
         layout.addStretch()
         layout.addWidget(self.value_label)
 
     def set_value(self, value: str, *, success: bool = False, danger: bool = False) -> None:
         self.value_label.setText(value)
+        self.value_label.setToolTip(value)
         state = "success" if success else "danger" if danger else "normal"
         self.value_label.setProperty("statusState", state)
         self.value_label.style().unpolish(self.value_label)
@@ -505,6 +587,7 @@ class MessageBar(QFrame):
 
     def __init__(self):
         super().__init__()
+        self._kind = "normal"
         self.setMinimumHeight(34)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(10, 0, 10, 0)
@@ -515,20 +598,32 @@ class MessageBar(QFrame):
         self.set_message("就绪")
 
     def set_message(self, text: str, kind: str = "normal") -> None:
+        self._kind = kind
+        app = QApplication.instance()
+        theme = normalize_theme(
+            app.property("agentMailBridgeTheme") if app is not None else None
+        )
+        tokens = THEME_TOKENS[theme]
         colors = {
-            "normal": ("#F7F8FB", TEXT_MUTED),
+            # Neutral feedback stays neutral across themes; semantic colors
+            # must remain distinguishable from the active accent palette.
+            "normal": (BACKGROUND, tokens["muted"]),
             "success": ("#EFFAF3", SUCCESS),
             "error": ("#FFF1F2", DANGER),
             "warning": ("#FFF8E8", "#A76500"),
-            "working": (PURPLE_SOFT, PURPLE),
+            "working": (tokens["accent_soft"], tokens["accent"]),
         }
         background, foreground = colors.get(kind, colors["normal"])
         self.setStyleSheet(
-            f"QFrame {{ background: {background}; border: 1px solid {BORDER}; border-radius: 5px; }}"
+            f"QFrame {{ background: {background}; color: {foreground}; "
+            f"border: 1px solid {tokens['border']}; border-radius: 5px; }}"
         )
         self.label.setStyleSheet(f"color: {foreground}; font-size: 10px; font-weight: 700;")
         self.label.setText(text)
         self.label.setToolTip(text)
+
+    def refresh_theme(self) -> None:
+        self.set_message(self.label.text(), self._kind)
 
 
 def paint_app_icon(widget: QLabel) -> None:
